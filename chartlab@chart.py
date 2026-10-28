@@ -19,7 +19,25 @@ STYLES = ["candles", "hollow", "line", "area"]
 INDICATOR_KEYS = ["sma20", "sma50", "sma200", "ema20", "ema50", "bb", "rsi"]
 
 
-class DateAxis(pg.AxisItem):
+class _DotGridMixin:
+    """pyqtgraph draws grid lines with the axis pen; give them a dotted style like TradingView."""
+
+    def generateDrawSpecs(self, p):
+        specs = super().generateDrawSpecs(p)
+        try:
+            axisSpec, tickSpecs, textSpecs = specs
+            out = []
+            for pen, a, b in tickSpecs:
+                if pen.style() == QtCore.Qt.PenStyle.SolidLine and pen.color().alpha() < 255 and pen.color().alpha() > 0:
+                    pen = QtGui.QPen(pen)
+                    pen.setStyle(QtCore.Qt.PenStyle.DotLine)
+                out.append((pen, a, b))
+            return axisSpec, out, textSpecs
+        except Exception:  # noqa: BLE001
+            return specs
+
+
+class DateAxis(_DotGridMixin, pg.AxisItem):
     """X axis that plots bar numbers (no weekend gaps, like TradingView) but shows dates."""
 
     def __init__(self, orientation="bottom", **kw):
@@ -56,7 +74,7 @@ class OverlayLabel(QtWidgets.QLabel):
         self.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("background: transparent; font-size: 12px;")
+        self.setStyleSheet("background: transparent; font-size: 14px;")
 
     def setText(self, t):
         super().setText(t)
@@ -141,6 +159,7 @@ class ChartWidget(QtWidgets.QWidget):
     activated = QtCore.Signal()
     toolChanged = QtCore.Signal(object)
     drawingsChanged = QtCore.Signal()
+    tradeRequested = QtCore.Signal(str, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -173,6 +192,21 @@ class ChartWidget(QtWidgets.QWidget):
         self.vol_label.hide()
         self.rsi_label.hide()
         self.header.raise_()
+        self.sell_btn = self._trade_button("SELL", theme.DOWN)
+        self.buy_btn = self._trade_button("BUY", "#2962ff")
+        self.spread_lbl = OverlayLabel(self.glw)
+        self.spread_lbl.hide()
+        self.collapse_btn = QtWidgets.QToolButton(self.glw)
+        self.collapse_btn.setText("\u2303")
+        self.collapse_btn.setFixedSize(38, 22)
+        self.collapse_btn.setCheckable(True)
+        self.collapse_btn.setToolTip("Hide / show the legend")
+        self.collapse_btn.setStyleSheet("QToolButton { background:#000; border:1px solid #2b2b2b; border-radius:4px; color:#d1d4dc; font-size:14px; } QToolButton:hover { background:#1a1a1a; }")
+        self.collapse_btn.toggled.connect(lambda _c: self._place_overlays())
+        self.collapse_btn.hide()
+        self.watermark = OverlayLabel(self.glw)
+        self.watermark.setText("<span style='font-size:26px;font-weight:800;color:#262626;font-style:italic'>ChartLab</span>")
+        self.watermark.hide()
 
         self.axes: list[DateAxis] = []
         self.price = self._make_plot(0)
@@ -233,6 +267,25 @@ class ChartWidget(QtWidgets.QWidget):
         self.glw.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.glw.viewport().setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
 
+    def _trade_button(self, text, color):
+        b = QtWidgets.QPushButton(text, self.glw)
+        b.setFixedSize(80, 40)
+        b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        b.setStyleSheet(f"QPushButton {{ background:#000; color:{color}; border:1px solid {color}; border-radius:5px; "
+                        f"font-size:11px; padding:0; }} QPushButton:hover {{ background:{color}33; }}")
+        b.clicked.connect(lambda _=False, side=text: self.tradeRequested.emit(side, float(self.df["Close"].iloc[-1]) if self.df is not None else 0.0))
+        b.hide()
+        return b
+
+    def _update_trade_buttons(self):
+        if self.df is None or self.replay.get("active"):
+            return
+        last = float(self.df["Close"].iloc[max(len(self.df) - 1 if self._limit is None else self._limit - 1, 0)])
+        sp = max(round(last * 0.0005, 2), 0.01)
+        for b, px, t in ((self.sell_btn, last - sp / 2, "SELL"), (self.buy_btn, last + sp / 2, "BUY")):
+            b.setText(f"{px:,.2f}\n{t}")
+        self.spread_lbl.setText(f"<span style='color:#b8b8b8;font-size:12px'>{sp:.2f}</span>")
+
     # ------------------------------------------------------------------ construction helpers
     def _make_plot(self, row: int) -> pg.PlotItem:
         axis = DateAxis("bottom")
@@ -244,14 +297,19 @@ class ChartWidget(QtWidgets.QWidget):
         p.hideAxis("left")
         p.getAxis("right").setWidth(72)
         f = QtGui.QFont()
-        f.setPixelSize(11)
+        f.setPixelSize(12)
+        f.setWeight(QtGui.QFont.Weight.DemiBold)
         for name in ("bottom", "right"):
             ax = p.getAxis(name)
-            ax.setPen(pg.mkPen(theme.BORDER))
-            ax.setTextPen(pg.mkPen("#b2b5be"))
-            ax.setStyle(tickFont=f, tickLength=-4)
-        p.showGrid(x=True, y=True, alpha=0.10)
-        dash = pg.mkPen(theme.MUTED, style=QtCore.Qt.PenStyle.DashLine)
+            gp = pg.mkPen("#262626", style=QtCore.Qt.PenStyle.DotLine)
+            ax.setPen(pg.mkPen("#1a1a1a"))
+            ax.setTextPen(pg.mkPen("#d1d4dc"))
+            ax.setStyle(tickFont=f, tickLength=0)
+            ax._chartlab_grid = gp
+        p.getAxis('right').setTickDensity(2.2)
+        p.getAxis('bottom').setTickDensity(1.2)
+        p.showGrid(x=True, y=True, alpha=0.35)
+        dash = pg.mkPen("#868993", width=1, style=QtCore.Qt.PenStyle.DashLine)
         p.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
         p.hline = pg.InfiniteLine(angle=0, movable=False, pen=dash)
         p.addItem(p.vline, ignoreBounds=True)
@@ -377,9 +435,25 @@ class ChartWidget(QtWidgets.QWidget):
         if hasattr(self, "replay_bar") and self.replay_bar.isVisible():
             self.replay_bar.place()
         if self.df is not None:                                  # volume legend sits under the OHLC header
-            self.vol_label.show()
-            self.vol_label.move(10, self.header.y() + self.header.height() + 2)
-            self.vol_label.raise_()
+            col = not self.collapse_btn.isChecked()
+            self.sell_btn.setVisible(col)
+            self.buy_btn.setVisible(col)
+            self.spread_lbl.setVisible(col)
+            self.collapse_btn.show()
+            self.watermark.show()
+            y = self.header.y() + self.header.height() + 4
+            if col:
+                self.sell_btn.move(10, y)
+                self.spread_lbl.move(96, y + 10)
+                self.buy_btn.move(96 + self.spread_lbl.width() + 6, y)
+                y += 46
+            self.vol_label.setVisible(col)
+            self.vol_label.move(10, y)
+            self.collapse_btn.move(10, y + (24 if col else 0))
+            gh = self.glw.height()
+            self.watermark.move(14, max(gh - 90, 0))
+            for w in (self.sell_btn, self.buy_btn, self.spread_lbl, self.vol_label, self.collapse_btn):
+                w.raise_()
         for plot, lab in ((self.rsi, self.rsi_label),):
             vis = plot.isVisible() and self.df is not None
             lab.setVisible(vis)
@@ -930,6 +1004,7 @@ class ChartWidget(QtWidgets.QWidget):
         return "NSE" if lab and not lab.endswith("=X") and "." not in lab else (lab.split(".")[-1] if "." in lab else "FX")
 
     def _update_header(self, i: int):
+        self._update_trade_buttons()
         df = self.df
         r = df.iloc[i]
         prev = df["Close"].iloc[i - 1] if i > 0 else r["Open"]
@@ -939,9 +1014,9 @@ class ChartWidget(QtWidgets.QWidget):
         fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
         ts = df.index[i].strftime(fmt)
         m = theme.MUTED
-        v = lambda k, x: (f"<span style='color:{m}'>{k}</span><span style='color:{col}'>{x:,.2f}</span>")  # noqa: E731
+        v = lambda k, x: (f"<span style='color:#ffffff'>{k}</span><span style='color:{col}'>{x:,.2f}</span>")  # noqa: E731
         self.header.setText(
-            f"<span style='font-size:14px;color:#ffffff;font-weight:600'>{self.label}</span>"
+            f"<span style='font-size:16px;color:#ffffff;font-weight:500'>{self.label}</span>"
             f" <span style='color:{m}'>· {self.interval_tag()} · {self.exchange_tag()}</span>"
             f" &nbsp;<span style='color:{m}'>{ts}</span><br>"
             f"{v('O', r['Open'])} &nbsp;{v('H', r['High'])} &nbsp;{v('L', r['Low'])} &nbsp;{v('C', r['Close'])}"

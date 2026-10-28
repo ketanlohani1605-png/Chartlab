@@ -249,10 +249,38 @@ def plus(p, r, c):
     p.drawLine(QtCore.QPointF(8, 12), QtCore.QPointF(16, 12))
 
 
+def eye(p, r, c):
+    path = QtGui.QPainterPath(QtCore.QPointF(3.5, 12))
+    path.quadTo(12, 3, 20.5, 12)
+    path.quadTo(12, 21, 3.5, 12)
+    p.drawPath(path)
+    p.drawEllipse(QtCore.QPointF(12, 12), 3, 3)
+
+
+def lock(p, r, c):
+    p.drawRoundedRect(QtCore.QRectF(6, 11, 12, 9), 2, 2)
+    path = QtGui.QPainterPath(QtCore.QPointF(8.5, 11))
+    path.lineTo(8.5, 8)
+    path.arcTo(QtCore.QRectF(8.5, 4, 7, 8), 180, -180)
+    path.lineTo(15.5, 11)
+    p.drawPath(path)
+
+
+def menu(p, r, c):
+    for y in (7, 12, 17):
+        p.drawLine(QtCore.QPointF(5, y), QtCore.QPointF(19, y))
+
+
+def compare(p, r, c):
+    p.drawEllipse(QtCore.QPointF(12, 12), 8, 8)
+    p.drawLine(QtCore.QPointF(12, 8), QtCore.QPointF(12, 16))
+    p.drawLine(QtCore.QPointF(8, 12), QtCore.QPointF(16, 12))
+
+
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
-    "undo", "redo", "camera", "fullscreen", "zoom", "plus")}
+    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare")}
 
 
 def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:

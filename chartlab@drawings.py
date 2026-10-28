@@ -82,8 +82,17 @@ class DrawingLayer(QtCore.QObject):
         return True
 
     # ------------------------------------------------------------------ drag to move / resize
+    locked = False
+    hidden = False
+
+    def set_hidden(self, on: bool):
+        self.hidden = on
+        for items in self._items.values():
+            for it in items:
+                it.setVisible(not on)
+
     def begin_drag(self, x: float, y: float) -> bool:
-        if self.tool or not self.chart.has_data():
+        if self.tool or self.locked or not self.chart.has_data():
             return False
         vb = self.chart.price.vb
         click = vb.mapViewToScene(QtCore.QPointF(x, y))

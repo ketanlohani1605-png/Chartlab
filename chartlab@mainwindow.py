@@ -109,6 +109,7 @@ class MainWindow(QtWidgets.QMainWindow):
             p.toolChanged.connect(lambda panel, tool: self._tool_changed(tool))
             p.chart.replayChanged.connect(lambda: self.replay_btn.setChecked(self.active.chart.replay['active']))
             p.chart.alertRequested.connect(lambda price, pp=p: self.create_alert(price, pp))
+            p.chart.tradeRequested.connect(self._on_trade)
             self.panels.append(p)
         self.active = self.panels[0]
         self.active.set_active(True)
@@ -145,6 +146,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clock_timer.start(1000)
         self._tick_clock()
         return bar
+
+    def _zoom_x(self, f):
+        vb = self.active.chart.price.vb
+        a, b = vb.viewRange()[0]
+        c = b - (b - a) * 0.15
+        vb.setXRange(c - (c - a) * f, c + (b - c) * f, padding=0)
+
+    def _on_trade(self, side, price):
+        sym = self.active.chart.label or "?"
+        self.statusBar().showMessage(f"PAPER {side} {sym} @ {price:,.2f}  (paper trade, no broker order sent)", 6000)
 
     def _goto_date(self):
         ch = self.active.chart
@@ -380,6 +391,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.magnet_action.setChecked(True)
         self.magnet_action.setToolTip("Magnet: snap drawings to candle open/high/low/close")
         self.magnet_action.toggled.connect(self._magnet_toggled)
+        zi = tb.addAction(icons.get("zoom"), "")
+        zi.setToolTip("Zoom in")
+        zi.triggered.connect(lambda: self._zoom_x(0.7))
+        lk = tb.addAction(icons.get("lock"), "")
+        lk.setCheckable(True)
+        lk.setToolTip("Lock all drawings")
+        lk.toggled.connect(lambda on: [setattr(p.chart.layer, "locked", on) for p in self.panels])
+        hd = tb.addAction(icons.get("eye"), "")
+        hd.setCheckable(True)
+        hd.setToolTip("Hide all drawings")
+        hd.toggled.connect(lambda on: [p.chart.layer.set_hidden(on) for p in self.panels])
         d = tb.addAction(icons.get("eraser"), "")
         d.setToolTip("Delete selected drawing  (Delete)")
         d.triggered.connect(lambda: self.active.chart.layer.delete_selected())
