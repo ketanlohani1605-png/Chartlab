@@ -14,6 +14,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import alerts as alertmod
 from . import backtest as bt
 from . import data as datamod
 from . import icons
@@ -62,11 +63,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.api = None
         self._syncing = False
 
+        self.alerts = alertmod.AlertManager(self.settings)
+        self.poller = alertmod.Poller(self.alerts)
+        self.alerts.triggered.connect(self._alert_fired)
+        self.alerts.changed.connect(self._refresh_alert_lines)
         self._build_central()
         self._build_toolbar()
         self._build_draw_toolbar()
         self._build_watchlist_dock()
         self._build_strategy_dock()
+        self._build_alerts_dock()
         self._build_results_dock()
         self._build_right_rail()
         self._build_menu()
@@ -97,6 +103,8 @@ class MainWindow(QtWidgets.QMainWindow):
             p.loadFailed.connect(self._on_load_failed)
             p.drawingsChanged.connect(self._save_drawings)
             p.toolChanged.connect(lambda panel, tool: self._tool_changed(tool))
+            p.chart.replayChanged.connect(lambda: self.replay_btn.setChecked(self.active.chart.replay['active']))
+            p.chart.alertRequested.connect(lambda price, pp=p: self.create_alert(price, pp))
             self.panels.append(p)
         self.active = self.panels[0]
         self.active.set_active(True)
@@ -217,6 +225,23 @@ class MainWindow(QtWidgets.QMainWindow):
         latest.clicked.connect(lambda: self.active.chart.go_latest())
         tb.addWidget(latest)
 
+        self.replay_btn = QtWidgets.QToolButton()
+        self.replay_btn.setIcon(icons.get("replay_icon"))
+        self.replay_btn.setText(" Replay")
+        self.replay_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.replay_btn.setCheckable(True)
+        self.replay_btn.setToolTip("Bar replay: pick a start bar, then play the market bar by bar")
+        self.replay_btn.clicked.connect(self.toggle_replay)
+        tb.addWidget(self.replay_btn)
+
+        self.alert_btn = QtWidgets.QToolButton()
+        self.alert_btn.setIcon(icons.get("bell"))
+        self.alert_btn.setText(" Alert")
+        self.alert_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.alert_btn.setToolTip("Create alert  (Alt+A)")
+        self.alert_btn.clicked.connect(lambda: self.create_alert())
+        tb.addWidget(self.alert_btn)
+
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
@@ -314,11 +339,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addToolBar(QtCore.Qt.ToolBarArea.RightToolBarArea, tb)
         for dock, ico, tip in ((self.watch_dock, "watchlist", "Watchlist"),
                                (self.strategy_dock, "code", "Python strategy editor"),
-                               (self.results_dock, "table", "Backtest results")):
+                               (self.results_dock, "table", "Backtest results"),
+                               (self.alerts_dock, "bell", "Alerts")):
             act = dock.toggleViewAction()
             act.setIcon(icons.get(ico))
             act.setToolTip(tip)
             tb.addAction(act)
+
+    def _build_alerts_dock(self):
+        self.alerts_panel = alertmod.AlertsPanel(self.alerts)
+        self.alerts_panel.newRequested.connect(lambda: self.create_alert())
+        self.alerts_dock = QtWidgets.QDockWidget("Alerts", self)
+        self.alerts_dock.setObjectName("alerts_dock")
+        self.alerts_dock.setWidget(self.alerts_panel)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.alerts_dock)
+
+    @staticmethod
+    def _alert_key(panel) -> str:
+        return panel.symbol_key
+
+    def create_alert(self, price: float | None = None, panel=None):
+        panel = panel or self.active
+        ch = panel.chart
+        if ch.df is None:
+            self.statusBar().showMessage("Load a symbol first")
+            return
+        last = float(ch.df["Close"].iloc[-1])
+        dlg = alertmod.AlertDialog(self, ch.label or panel.label, last, price)
+        if dlg.exec():
+            v = dlg.result_values()
+            a = self.alerts.add(self._alert_key(panel), ch.label or panel.label, v["cond"], v["value"], last,
+                                v["message"], v["once"], v["expires"])
+            self.statusBar().showMessage("Alert created: " + alertmod.describe(a))
+            self.alerts_dock.show()
+            self.poller.poll()
+
+    def _refresh_alert_lines(self):
+        for p in self.panels:
+            if p.chart.df is None:
+                continue
+            key = self._alert_key(p)
+            p.chart.set_alert_lines([(a["value"], f"{alertmod.COND_TEXT[a['cond']]} {a['value']:,.2f}")
+                                     for a in self.alerts.for_symbol(key)])
+
+    def _alert_fired(self, a, price):
+        for p in self.panels:   # alerts stay silent during bar replay, like TradingView
+            if p.chart.replay["active"] and self._alert_key(p) == a["symbol"]:
+                return
+        msg = alertmod.describe(a) + f"  (price {price:,.2f})" + (f"\n{a['message']}" if a["message"] else "")
+        alertmod.Toast(self, "Alert triggered", msg.replace("\n", "<br>"))
+        QtWidgets.QApplication.beep()
+        alertmod.notify_os("ChartLab alert", msg.replace("\n", " - "))
+        self.add_log("[alert] " + msg.replace("\n", " - "))
 
     def _build_watchlist_dock(self):
         self.watchlist = WatchlistWidget()
@@ -412,13 +484,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results_dock.setWidget(self.tabs)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
         self.tabifyDockWidget(self.watch_dock, self.strategy_dock)
-        for d in (self.watch_dock, self.strategy_dock):
+        self.tabifyDockWidget(self.watch_dock, self.alerts_dock)
+        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock):
             d.setTitleBarWidget(QtWidgets.QWidget())      # tabs already name them; the rail toggles them
         self.results_dock.hide()
         self.watch_dock.raise_()
         self.setTabPosition(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, QtWidgets.QTabWidget.TabPosition.North)
         self.watch_dock.setObjectName("dock_watchlist")
         self.strategy_dock.setObjectName("dock_strategy")
+        self.alerts_dock.setObjectName("dock_alerts")
         self.results_dock.setObjectName("dock_results")
         for tb_ in self.findChildren(QtWidgets.QToolBar):
             tb_.setObjectName("tb_" + (tb_.windowTitle() or "main").replace(" ", "_"))
@@ -462,9 +536,22 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self, activated=lambda: self.active.chart.layer.undo())
         for k in ("Ctrl+Shift+Z", "Ctrl+Y"):
             QtGui.QShortcut(QtGui.QKeySequence(k), self, activated=lambda: self.active.chart.layer.redo())
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+A"), self, activated=lambda: self.create_alert())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+R"), self, activated=lambda: self.active.chart.go_latest())
 
+    def toggle_replay(self):
+        ch = self.active.chart
+        if ch.replay["active"]:
+            ch.replay_exit()
+        else:
+            ch.replay_begin()
+        self.replay_btn.setChecked(ch.replay["active"])
+
     def _escape(self):
+        if self.active.chart.replay["active"]:
+            self.active.chart.replay_exit()
+            self.replay_btn.setChecked(False)
+            return
         self.active.chart.layer.cancel()
         self._tool_changed(None)
 
@@ -495,7 +582,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def reset_layout(self):
         self.restoreState(self._default_state, 3)
-        for d in (self.watch_dock, self.strategy_dock, self.results_dock):
+        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock, self.results_dock):
             d.show()
         self.watch_dock.raise_()
 
@@ -692,6 +779,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_btn.setEnabled(True)
         self._load_drawings(panel)
         df = panel.df
+        self._refresh_alert_lines()
+        if len(df):   # catch moves since last session; crossing alerts only arm on this first look
+            last = float(df["Close"].iloc[-1])
+            self.alerts.check(self._alert_key(panel), last, last, last)
         self.statusBar().showMessage(
             f"{panel.label}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} → {df.index[-1]:%d %b %Y}")
         if panel is self.active:
@@ -777,7 +868,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:  # noqa: BLE001
             self.add_log(str(e))
             return {"ok": False, "error": str(e), "log": ""}
-        work = scriptmode.prepare(panel.df)
+        data = panel.chart.effective_df()
+        work = scriptmode.prepare(data)
         link = getattr(self, "script_path", "") or ""
         if link and Path(link).parent.exists():
             tmp = Path(link).parent / f".chartlab_run_{Path(link).name}"
@@ -788,7 +880,7 @@ class MainWindow(QtWidgets.QMainWindow):
         proc = QtCore.QProcess(self)
         proc.setProcessEnvironment(QtCore.QProcessEnvironment.systemEnvironment())
         env = QtCore.QProcessEnvironment.systemEnvironment()
-        for k, v in scriptmode.environment(work, panel.df).items():
+        for k, v in scriptmode.environment(work, data).items():
             env.insert(k, v)
         proc.setProcessEnvironment(env)
         proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
@@ -810,7 +902,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Script failed (see Log)")
             return
         try:
-            res, plots = scriptmode.load_results(work, panel.df, capital)
+            res, plots = scriptmode.load_results(work, panel.chart.effective_df(), capital)
         except Exception:  # noqa: BLE001
             self.add_log(traceback.format_exc())
             self.statusBar().showMessage("Could not read the script's results (see Log)")
@@ -892,12 +984,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return {"ok": False, "error": "No data loaded in this chart yet", "log": ""}
         if not re.search(r"^def\s+strategy\s*\(", self.strategy_code(), re.M):
             return self.run_script_mode(panel, capital)
+        data = panel.chart.effective_df()
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                sig = bt.run_user_strategy(self.strategy_code(), panel.df)
+                sig = bt.run_user_strategy(self.strategy_code(), data)
             cfg = self.bt_config(capital, fee)
-            res = bt.run_backtest(panel.df, sig, cfg)
+            res = bt.run_backtest(data, sig, cfg)
         except Exception:  # noqa: BLE001 - show user-code errors in the Log tab
             err = traceback.format_exc()
             self.add_log(buf.getvalue() + err)
@@ -999,7 +1092,14 @@ def main():
     win = MainWindow()
     geo = app.primaryScreen().availableGeometry()
     win.resize(min(1680, int(geo.width() * 0.96)), min(980, int(geo.height() * 0.94)))
+    win.setWindowOpacity(0.0)
     win.show()
+    fade = QtCore.QPropertyAnimation(win, b"windowOpacity", win)
+    fade.setDuration(450)
+    fade.setStartValue(0.0)
+    fade.setEndValue(1.0)
+    fade.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+    fade.start()
     try:
         from .api import ApiServer
         win.api = ApiServer(win)

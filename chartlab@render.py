@@ -12,6 +12,7 @@ MIN_BAR_PX = 3.0
 
 
 def _visible(item, n: int):
+    n = n if getattr(item, 'limit', None) is None else min(n, item.limit)
     """(i0, i1, group) -> visible slice [i0, i1) and how many bars to merge into one drawn bar."""
     vb = item.getViewBox()
     if vb is None or n == 0:
@@ -30,6 +31,7 @@ class CandleItem(pg.GraphicsObject):
     def __init__(self, df=None, style="candles"):
         super().__init__()
         self.style = style
+        self.limit = None
         self.o = self.h = self.l = self.c = np.zeros(0)
         if df is not None:
             self.set_data(df, style)
@@ -86,6 +88,7 @@ class CandleItem(pg.GraphicsObject):
 class VolumeItem(pg.GraphicsObject):
     def __init__(self, df=None):
         super().__init__()
+        self.limit = None
         self.v = np.zeros(0)
         self.up = np.zeros(0, bool)
         if df is not None:

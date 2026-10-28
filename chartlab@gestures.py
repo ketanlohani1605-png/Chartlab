@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import math
+import os
+import time
 
 import pyqtgraph as pg
 from PySide6 import QtCore
+
+# Smooth motion is on for the real app; headless tests need instant results.
+ANIMATE = os.environ.get("QT_QPA_PLATFORM") != "offscreen" or os.environ.get("CHARTLAB_ANIM") == "1"
 
 
 class TVViewBox(pg.ViewBox):
@@ -17,17 +22,52 @@ class TVViewBox(pg.ViewBox):
         self.chart, self.is_price = chart, price
         self.setMouseEnabled(x=False, y=False)
         self._moved_y = 0.0
+        self._anim = None
+        self._vel = 0.0            # bars / second, for kinetic pan
+        self._last_t = 0.0
+
+    # --- smooth motion
+    def _stop_anim(self):
+        if self._anim is not None:
+            self._anim.stop()
+            self._anim = None
+
+    def _animate_x(self, nx0, nx1, ms=150, curve=QtCore.QEasingCurve.Type.OutCubic):
+        if not ANIMATE:
+            self.setXRange(nx0, nx1, padding=0)
+            return
+        x0, x1, _, _ = self._span()
+        self._stop_anim()
+        a = QtCore.QVariantAnimation(self)
+        a.setDuration(ms)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setEasingCurve(curve)
+        a.valueChanged.connect(lambda t: self.setXRange(x0 + (nx0 - x0) * t, x1 + (nx1 - x1) * t, padding=0))
+        a.start()
+        self._anim = a
+
+    def _target_x(self):
+        a = self._anim
+        if a is not None and a.state() == QtCore.QAbstractAnimation.State.Running:
+            return self._goal
+        return self._span()[:2]
 
     # --- helpers
     def _span(self):
         (x0, x1), (y0, y1) = self.viewRange()
         return x0, x1, y0, y1
 
-    def zoom_x(self, factor: float, cx: float | None = None):
-        x0, x1, _, _ = self._span()
+    def zoom_x(self, factor: float, cx: float | None = None, smooth: bool = False):
+        x0, x1 = self._target_x() if smooth else self._span()[:2]
         cx = (x0 + x1) / 2 if cx is None else cx
         nx0, nx1 = cx - (cx - x0) * factor, cx + (x1 - cx) * factor
-        self.setXRange(nx0, nx1, padding=0)
+        if smooth:
+            self._goal = (nx0, nx1)
+            self._animate_x(nx0, nx1)
+        else:
+            self._stop_anim()
+            self.setXRange(nx0, nx1, padding=0)
 
     def pan_x(self, dbars: float):
         x0, x1, _, _ = self._span()
@@ -47,6 +87,7 @@ class TVViewBox(pg.ViewBox):
     # --- events
     def wheelEvent(self, ev, axis=None):
         d = ev.delta()
+        self._vel = 0.0
         if d == 0:
             ev.ignore()
             return
@@ -60,7 +101,7 @@ class TVViewBox(pg.ViewBox):
             if axis == 1 and self.is_price:
                 self.zoom_y(factor, pos.y())
             else:
-                self.zoom_x(factor, pos.x())
+                self.zoom_x(factor, pos.x(), smooth=True)
         ev.accept()
 
     def mouseDragEvent(self, ev, axis=None):
@@ -68,6 +109,9 @@ class TVViewBox(pg.ViewBox):
             ev.ignore()
             return
         ev.accept()
+        if ev.isStart():
+            self._stop_anim()
+            self._vel, self._last_t = 0.0, time.monotonic()
         if self.is_price and axis is None:
             layer = self.chart.layer
             if ev.isStart():
@@ -90,10 +134,24 @@ class TVViewBox(pg.ViewBox):
         if axis == 0:                                    # time axis: drag right/left scales time
             self.zoom_x(math.exp(-dp.x() / 200.0), x1)
             return
-        self.pan_x(-dp.x() * (x1 - x0) / w)
+        dbars = -dp.x() * (x1 - x0) / w
+        self.pan_x(dbars)
+        now = time.monotonic()
+        dt_ = max(now - self._last_t, 1e-3)
+        self._vel = 0.6 * self._vel + 0.4 * (dbars / dt_)
+        self._last_t = now
         if self.is_price:
             self._moved_y += abs(dp.y())
             if self._moved_y > 6 or not self.chart.auto_y:
                 self.pan_y(dp.y() * (y1 - y0) / h)
         if ev.isFinish():
             self._moved_y = 0.0
+            self._coast()
+
+    def _coast(self):
+        """Kinetic pan: keep gliding after a quick flick, decelerating smoothly."""
+        if not ANIMATE or time.monotonic() - self._last_t > 0.08 or abs(self._vel) < 8:
+            return
+        x0, x1, _, _ = self._span()
+        dist = max(-(x1 - x0), min(x1 - x0, self._vel * 0.35))
+        self._animate_x(x0 + dist, x1 + dist, ms=650, curve=QtCore.QEasingCurve.Type.OutQuart)

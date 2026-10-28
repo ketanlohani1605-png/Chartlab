@@ -7,6 +7,7 @@ import pandas as pd
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import icons
 from . import indicators as ta
 from . import theme
 from .drawings import DrawingLayer
@@ -62,6 +63,72 @@ class OverlayLabel(QtWidgets.QLabel):
         self.adjustSize()
 
 
+class ReplayBar(QtWidgets.QFrame):
+    """Floating pill at the top of the chart: select bar / play / step / speed / exit."""
+
+    SPEEDS = [("10x", 10.0), ("5x", 5.0), ("3x", 3.0), ("1x", 1.0), ("0.5x", 0.5), ("0.2x", 0.2)]
+
+    def __init__(self, chart):
+        super().__init__(chart.glw)
+        self.chart = chart
+        self.setObjectName("replaybar")
+        self.setStyleSheet("QFrame#replaybar { background: rgba(24,26,33,235); border: 1px solid #363a45; "
+                           "border-radius: 18px; } QToolButton { padding: 4px 8px; border-radius: 12px; } "
+                           "QLabel { background: transparent; }")
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(10, 4, 8, 4)
+        h.setSpacing(2)
+        self.info = QtWidgets.QLabel("")
+        self.btn_play = QtWidgets.QToolButton()
+        self.btn_play.clicked.connect(self._toggle)
+        self.btn_step = QtWidgets.QToolButton()
+        self.btn_step.setIcon(icons.get("step"))
+        self.btn_step.setToolTip("Step forward one bar  (Right arrow)")
+        self.btn_step.clicked.connect(lambda: chart.replay_step(1))
+        self.speed = QtWidgets.QComboBox()
+        for label, v in self.SPEEDS:
+            self.speed.addItem(label, v)
+        self.speed.setCurrentIndex(3)
+        self.speed.setToolTip("Bars per second")
+        self.speed.activated.connect(lambda _i: chart.replay_set_speed(self.speed.currentData()))
+        self.btn_close = QtWidgets.QToolButton()
+        self.btn_close.setIcon(icons.get("close"))
+        self.btn_close.setToolTip("Exit replay  (Esc)")
+        self.btn_close.clicked.connect(chart.replay_exit)
+        for w in (self.info, self.btn_play, self.btn_step, self.speed, self.btn_close):
+            h.addWidget(w)
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 200))
+        self.setGraphicsEffect(shadow)
+        self.hide()
+
+    def _toggle(self):
+        if self.chart.replay["playing"]:
+            self.chart.replay_pause()
+        else:
+            self.chart.replay_play()
+
+    def show_state(self):
+        r = self.chart.replay
+        picking = r["picking"]
+        self.btn_play.setVisible(not picking)
+        self.btn_step.setVisible(not picking)
+        self.speed.setVisible(not picking)
+        self.info.setText("<b>Replay</b> &nbsp;<span style='color:#b2b5be'>click a bar on the chart to start from there</span>"
+                          if picking else "<b>Replay</b>")
+        self.btn_play.setIcon(icons.get("pause" if r["playing"] else "play"))
+        self.btn_play.setToolTip("Pause  (Space)" if r["playing"] else "Play  (Space)")
+        self.show()
+        self.adjustSize()
+        self.place()
+        self.raise_()
+
+    def place(self):
+        self.move(int((self.chart.glw.width() - self.width()) / 2) - 30, 8)
+
+
 def _tag(anchor, fill: str) -> pg.TextItem:
     t = pg.TextItem(anchor=anchor, color="#ffffff", fill=pg.mkBrush(fill))
     t.setZValue(100)
@@ -69,6 +136,8 @@ def _tag(anchor, fill: str) -> pg.TextItem:
 
 
 class ChartWidget(QtWidgets.QWidget):
+    replayChanged = QtCore.Signal()
+    alertRequested = QtCore.Signal(float)
     activated = QtCore.Signal()
     toolChanged = QtCore.Signal(object)
     drawingsChanged = QtCore.Signal()
@@ -80,6 +149,8 @@ class ChartWidget(QtWidgets.QWidget):
         self.style = "candles"
         self.magnet = True
         self.auto_y = True
+        self._limit = None            # replay: only bars [0, _limit) exist yet
+        self.replay = {"active": False, "picking": False, "playing": False, "speed": 1.0}
         self._enabled: set[str] = set()
         self._ind_items: dict[str, list] = {}
         self._strategy_items: list = []
@@ -194,7 +265,108 @@ class ChartWidget(QtWidgets.QWidget):
                 return True
         return super().eventFilter(obj, ev)
 
+    # ------------------------------------------------------------------ replay (TradingView "Bar Replay")
+    def _apply_limit(self):
+        n = self._n()
+        for it in (self.candles, self.volbars):
+            if it is not None:
+                it.limit = self._limit
+                it.update()
+        if self.line_item is not None:
+            c = self.df["Close"].to_numpy(float)
+            self.line_item.setData(np.arange(n), c[:n])
+        for items in self._ind_items.values():
+            for _, it, _n in items:
+                f = getattr(it, "_full", None)
+                if f is not None:
+                    it.setData(f[0][:n], f[1][:n])
+        for it, _name in self._strategy_items:
+            f = getattr(it, "_full", None)
+            if f is not None:
+                it.setData(f[0][:n], f[1][:n])
+        lim = len(self._lows) + 80 if self._limit is None else n + 60
+        for p in (self.price, self.vol, self.rsi):
+            p.vb.setLimits(xMin=-5, xMax=lim, minXRange=8)
+        self._update_last_tag()
+        self._update_header(max(n - 1, 0))
+        self._autoscale()
+
+    def replay_begin(self):
+        """Step 1: the user picks the start bar by clicking on the chart."""
+        if self.df is None or len(self.df) < 20:
+            return
+        self.replay.update(active=True, picking=True, playing=False)
+        self._ensure_replay_bar()
+        self.replay_bar.show_state()
+        self.replayChanged.emit()
+
+    def replay_start(self, k: int):
+        k = int(max(5, min(k, len(self.df) - 1)))
+        self._limit = k + 1
+        self.replay.update(picking=False, playing=False)
+        self._apply_limit()
+        self.price.setXRange(max(-2, k - 120), k + 25, padding=0)
+        self._autoscale()
+        self.replay_bar.show_state()
+        self.replayChanged.emit()
+
+    def replay_step(self, n: int = 1) -> bool:
+        if not self.replay["active"] or self._limit is None:
+            return False
+        if self._limit >= len(self.df):
+            self.replay_pause()
+            return False
+        self._limit = min(self._limit + n, len(self.df))
+        self._apply_limit()
+        k = self._limit - 1
+        x0, x1 = self.price.vb.viewRange()[0]
+        if k > x1 - 6:                                     # keep the newest bar in view
+            self.price.vb.pan_x(k - (x1 - 6))
+        self.replayChanged.emit()
+        return True
+
+    def replay_play(self):
+        if self._limit is None:
+            return
+        self.replay["playing"] = True
+        if not hasattr(self, "_replay_timer"):
+            self._replay_timer = QtCore.QTimer(self)
+            self._replay_timer.timeout.connect(self.replay_step)
+        self._replay_timer.start(int(1000 / self.replay["speed"]))
+        self.replay_bar.show_state()
+        self.replayChanged.emit()
+
+    def replay_pause(self):
+        self.replay["playing"] = False
+        if hasattr(self, "_replay_timer"):
+            self._replay_timer.stop()
+        if hasattr(self, "replay_bar"):
+            self.replay_bar.show_state()
+        self.replayChanged.emit()
+
+    def replay_set_speed(self, per_second: float):
+        self.replay["speed"] = per_second
+        if self.replay["playing"]:
+            self._replay_timer.start(int(1000 / per_second))
+
+    def replay_exit(self):
+        self.replay_pause()
+        self.replay.update(active=False, picking=False)
+        self._limit = None
+        if self.df is not None:
+            self._apply_limit()
+            self.go_latest()
+        if hasattr(self, "replay_bar"):
+            self.replay_bar.hide()
+        self.replayChanged.emit()
+
+    def _ensure_replay_bar(self):
+        if not hasattr(self, "replay_bar"):
+            self.replay_bar = ReplayBar(self)
+
     def _place_overlays(self):
+        if hasattr(self, "replay_bar") and self.replay_bar.isVisible():
+            self.replay_bar.place()
         for plot, lab in ((self.vol, self.vol_label), (self.rsi, self.rsi_label)):
             vis = plot.isVisible() and self.df is not None
             lab.setVisible(vis)
@@ -227,6 +399,16 @@ class ChartWidget(QtWidgets.QWidget):
         vb, K = self.price.vb, QtCore.Qt.Key
         x0, x1 = vb.viewRange()[0]
         step, k = (x1 - x0) * 0.1, ev.key()
+        if self.replay["active"] and not self.replay["picking"]:
+            if k == K.Key_Space:
+                self.replay_bar._toggle()
+                return True
+            if k == K.Key_Right:
+                self.replay_step(1)
+                return True
+        if self.replay["active"] and k == K.Key_Escape:
+            self.replay_exit()
+            return True
         if k == K.Key_Left:
             vb.pan_x(-step)
         elif k == K.Key_Right:
@@ -257,6 +439,9 @@ class ChartWidget(QtWidgets.QWidget):
         return self.rsi if self.rsi.isVisible() else self.vol
 
     # ------------------------------------------------------------------ coordinate helpers (used by drawings)
+    def _n(self) -> int:
+        return len(self._lows) if self._limit is None else min(self._limit, len(self._lows))
+
     def has_data(self) -> bool:
         return self.df is not None and len(self._times) > 1
 
@@ -293,7 +478,7 @@ class ChartWidget(QtWidgets.QWidget):
 
     def snap(self, x: float, y: float):
         """Magnet: snap to the nearest O/H/L/C of the bar under the cursor if close enough."""
-        n = len(self._lows)
+        n = self._n()
         if not self.magnet or n == 0:
             return x, y
         i = int(min(max(round(x), 0), n - 1))
@@ -309,6 +494,10 @@ class ChartWidget(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ data
     def set_data(self, df: pd.DataFrame, label: str = ""):
+        if self.replay["active"]:
+            self.replay_exit()
+        self._limit = None
+        self._alert_lines = []
         self._wipe()
         self.df, self.label = df, label
         n = len(df)
@@ -344,7 +533,7 @@ class ChartWidget(QtWidgets.QWidget):
         self._update_header(n - 1)
 
     def go_latest(self):
-        n = len(self._lows)
+        n = self._n()
         self.auto_y = True
         if n:
             self.price.setXRange(max(-2, n - 160), n + 6, padding=0)
@@ -425,7 +614,10 @@ class ChartWidget(QtWidgets.QWidget):
         x = np.arange(len(c))
         for plot, y, color, name in lines:
             item = pg.PlotDataItem(x=x, y=y.to_numpy(float), pen=pg.mkPen(color, width=1.3), connect="finite")
+            item._full = (x, y.to_numpy(float))
             plot.addItem(item)
+            if self._limit is not None:
+                item.setData(x[:self._limit], item._full[1][:self._limit])
             items.append((plot, item, name))
         if key == "rsi":
             for lvl in (30, 70):
@@ -471,7 +663,10 @@ class ChartWidget(QtWidgets.QWidget):
         for i, (name, series) in enumerate(overlays.items()):
             color = theme.LINE_COLORS[(i + 2) % len(theme.LINE_COLORS)]
             item = pg.PlotDataItem(x=x, y=series.to_numpy(float), pen=pg.mkPen(color, width=1.4), connect="finite")
+            item._full = (x, series.to_numpy(float))
             self.price.addItem(item)
+            if self._limit is not None:
+                item.setData(x[:self._limit], item._full[1][:self._limit])
             self._strategy_items.append((item, name))
         self._rebuild_legend()
 
@@ -506,7 +701,7 @@ class ChartWidget(QtWidgets.QWidget):
     def _autoscale(self, *_):
         if self.df is None:
             return
-        n = len(self._lows)
+        n = self._n()
         if not self.auto_y:
             x0, x1 = self.price.vb.viewRange()[0]
             lo, hi = max(0, int(x0)), min(n, int(x1) + 1)
@@ -516,7 +711,6 @@ class ChartWidget(QtWidgets.QWidget):
             self._place_last_tag()
             return
         x0, x1 = self.price.vb.viewRange()[0]
-        n = len(self._lows)
         lo, hi = max(0, int(np.floor(x0))), min(n, int(np.ceil(x1)) + 1)
         if hi <= lo:
             return
@@ -529,9 +723,9 @@ class ChartWidget(QtWidgets.QWidget):
         self._place_last_tag()
 
     def _update_last_tag(self):
-        if self.df is None or len(self.df) == 0:
+        if self.df is None or self._n() == 0:
             return
-        last, prev = float(self.df["Close"].iloc[-1]), float(self.df["Open"].iloc[-1])
+        last, prev = float(self.df["Close"].iloc[self._n() - 1]), float(self.df["Open"].iloc[self._n() - 1])
         color = theme.UP if last >= prev else theme.DOWN
         self.last_tag.fill = pg.mkBrush(color)
         self.last_tag.setText(f" {last:,.2f} ")
@@ -545,7 +739,7 @@ class ChartWidget(QtWidgets.QWidget):
         if self.df is None or not self.last_tag.isVisible():
             return
         xr = self.price.vb.viewRange()[0][1]
-        self.last_tag.setPos(xr, float(self.df["Close"].iloc[-1]))
+        self.last_tag.setPos(xr, float(self.df["Close"].iloc[self._n() - 1]))
 
     def _mouse_moved(self, pos):
         if self.df is None:
@@ -572,7 +766,7 @@ class ChartWidget(QtWidgets.QWidget):
         xr = hovered.vb.viewRange()[0][1]
         hovered.ytag.setText(f" {mp.y():,.2f} ")
         hovered.ytag.setPos(xr, mp.y())
-        if 0 <= i < len(self.df):
+        if 0 <= i < self._n():
             self._update_header(i)
             fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
             bp = self._bottom_plot()
@@ -587,6 +781,24 @@ class ChartWidget(QtWidgets.QWidget):
         if hovered is self.price:
             x, y = (self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y()))
             self.layer.handle_move(x, y)
+
+    def set_alert_lines(self, items):
+        """items: [(price, text)] drawn as dashed orange lines with a bell label."""
+        for ln in getattr(self, "_alert_lines", []):
+            self.price.removeItem(ln)
+        self._alert_lines = []
+        for price, text in items:
+            ln = pg.InfiniteLine(pos=price, angle=0, movable=False, pen=pg.mkPen("#ff9800", width=1,
+                                 style=QtCore.Qt.PenStyle.DashLine),
+                                 label=f"\U0001F514 {text}", labelOpts={"position": 0.04, "color": "#ff9800",
+                                                                        "fill": (24, 26, 33, 230)})
+            ln.setZValue(20)
+            self.price.addItem(ln, ignoreBounds=True)
+            self._alert_lines.append(ln)
+
+    def effective_df(self):
+        """Data a strategy is allowed to see: everything, or only the bars revealed so far in replay."""
+        return self.df if (self._limit is None or self.df is None) else self.df.iloc[: self._limit]
 
     def _panning(self) -> bool:
         return bool(QtWidgets.QApplication.mouseButtons() & QtCore.Qt.MouseButton.LeftButton)
@@ -606,6 +818,7 @@ class ChartWidget(QtWidgets.QWidget):
             menu.addAction("Delete", self.layer.delete_selected)
             menu.addSeparator()
         price = mp.y()
+        menu.addAction(f"Add alert at {price:,.2f}\tAlt+A", lambda: self.alertRequested.emit(float(price)))
         menu.addAction(f"Add horizontal line at {price:,.2f}",
                        lambda: self.layer.add("hline", [[self.x_to_time(mp.x()), price]]))
         menu.addSeparator()
@@ -638,6 +851,9 @@ class ChartWidget(QtWidgets.QWidget):
         if not self.price.sceneBoundingRect().contains(ev.scenePos()):
             return
         mp = self.price.vb.mapSceneToView(ev.scenePos())
+        if self.replay["picking"]:
+            self.replay_start(int(round(mp.x())))
+            return
         x, y = self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y())
         self.layer.handle_click(x, y)
 

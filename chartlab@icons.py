@@ -124,6 +124,40 @@ def text(p, r, c):
     p.drawLine(QtCore.QPointF(9, 19), QtCore.QPointF(15, 19))
 
 
+def pause(p, r, c):
+    p.setBrush(p.pen().color())
+    p.drawRect(QtCore.QRectF(7, 6, 3.5, 12))
+    p.drawRect(QtCore.QRectF(13.5, 6, 3.5, 12))
+
+
+def step(p, r, c):
+    p.setBrush(p.pen().color())
+    p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(6, 6), QtCore.QPointF(15, 12), QtCore.QPointF(6, 18)]))
+    p.drawLine(QtCore.QPointF(18, 6), QtCore.QPointF(18, 18))
+
+
+def close(p, r, c):
+    p.drawLine(QtCore.QPointF(7, 7), QtCore.QPointF(17, 17))
+    p.drawLine(QtCore.QPointF(17, 7), QtCore.QPointF(7, 17))
+
+
+def replay_icon(p, r, c):
+    p.drawArc(QtCore.QRectF(5, 5, 14, 14), 40 * 16, 280 * 16)
+    p.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(4, 6), QtCore.QPointF(6.5, 9.5), QtCore.QPointF(10, 7.5)]))
+    p.setBrush(p.pen().color())
+    p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(10.5, 9), QtCore.QPointF(15, 12), QtCore.QPointF(10.5, 15)]))
+
+
+def bell(p, r, c):
+    path = QtGui.QPainterPath(QtCore.QPointF(6, 16))
+    path.cubicTo(8, 15, 8, 12, 8, 10)
+    path.cubicTo(8, 6.5, 16, 6.5, 16, 10)
+    path.cubicTo(16, 12, 16, 15, 18, 16)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.drawArc(QtCore.QRectF(10, 16, 4, 4), 200 * 16, 140 * 16)
+
+
 def watchlist(p, r, c):
     for y in (7, 12, 17):
         p.drawLine(QtCore.QPointF(10, y), QtCore.QPointF(20, y))
@@ -172,7 +206,7 @@ def latest(p, r, c):
 
 
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
-    "cross", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
+    "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest")}
 
 

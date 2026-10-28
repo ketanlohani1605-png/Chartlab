@@ -37,6 +37,51 @@ class QuoteWorker(QtCore.QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class QuoteDelegate(QtWidgets.QStyledItemDelegate):
+    """Symbol on the left, last price + coloured change badge on the right (TradingView style)."""
+
+    def sizeHint(self, option, index):
+        return QtCore.QSize(option.rect.width(), 46)
+
+    def paint(self, p, option, index):
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        r = option.rect.adjusted(6, 3, -6, -3)
+        if option.state & QtWidgets.QStyle.StateFlag.State_Selected:
+            p.setBrush(QtGui.QColor("#1e2a55"))
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.drawRoundedRect(r, 8, 8)
+        elif option.state & QtWidgets.QStyle.StateFlag.State_MouseOver:
+            p.setBrush(QtGui.QColor(theme.HOVER))
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.drawRoundedRect(r, 8, 8)
+        sym = index.data(QtCore.Qt.ItemDataRole.UserRole)
+        q = index.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        f = QtGui.QFont(option.font)
+        f.setBold(True)
+        f.setPointSize(12)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("white"))
+        p.drawText(r.adjusted(10, 0, 0, 0), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft, sym)
+        if q:
+            col = QtGui.QColor(theme.UP if q[1] >= 0 else theme.DOWN)
+            f.setBold(False)
+            f.setPointSize(11)
+            p.setFont(f)
+            badge = QtCore.QRect(r.right() - 74, r.center().y() - 11, 66, 22)
+            c2 = QtGui.QColor(col)
+            c2.setAlpha(45)
+            p.setBrush(c2)
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.drawRoundedRect(badge, 6, 6)
+            p.setPen(col)
+            p.drawText(badge, QtCore.Qt.AlignmentFlag.AlignCenter, f"{q[1] * 100:+.2f}%")
+            p.setPen(QtGui.QColor(theme.TEXT))
+            p.drawText(r.adjusted(0, 0, -82, 0), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignRight,
+                       f"{q[0]:,.2f}")
+        p.restore()
+
+
 class WatchlistWidget(QtWidgets.QWidget):
     symbolChosen = QtCore.Signal(str)
     changed = QtCore.Signal()
@@ -62,8 +107,9 @@ class WatchlistWidget(QtWidgets.QWidget):
         self.list.setUniformItemSizes(True)
         self.list.setStyleSheet(
             f"QListWidget {{ background:{theme.BG}; border:1px solid {theme.GRID}; }}"
-            f"QListWidget::item {{ padding:6px 8px; border-bottom:1px solid {theme.GRID}; }}"
-            f"QListWidget::item:selected {{ background:#2a3150; }}")
+            f"QListWidget {{ border:0; outline:0; }}")
+        self.list.setItemDelegate(QuoteDelegate(self.list))
+        self.list.setMouseTracking(True)
         self.list.itemClicked.connect(lambda it: self.symbolChosen.emit(it.data(QtCore.Qt.ItemDataRole.UserRole)))
         self.list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
@@ -121,6 +167,7 @@ class WatchlistWidget(QtWidgets.QWidget):
     def _paint(self, it):
         sym = it.data(QtCore.Qt.ItemDataRole.UserRole)
         q = self.quotes.get(sym)
+        it.setData(QtCore.Qt.ItemDataRole.UserRole + 1, q)
         if q:
             it.setText(f"{sym:<14}{q[0]:>12,.2f}   {q[1] * 100:+.2f}%")
             it.setForeground(QtGui.QColor(theme.UP if q[1] >= 0 else theme.DOWN))
