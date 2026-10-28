@@ -90,11 +90,12 @@ class MainWindow(QtWidgets.QMainWindow):
         outer = QtWidgets.QVBoxLayout(self.central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        area = QtWidgets.QWidget()
-        self.grid = QtWidgets.QGridLayout(area)
-        self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setSpacing(2)
-        outer.addWidget(area, 1)
+        self.area = QtWidgets.QWidget()
+        self.area_lay = QtWidgets.QVBoxLayout(self.area)
+        self.area_lay.setContentsMargins(0, 0, 0, 0)
+        self.area_lay.setSpacing(0)
+        self.split_root = None
+        outer.addWidget(self.area, 1)
         outer.addWidget(self._build_strip())
         self.setCentralWidget(self.central)
         for i in range(4):
@@ -641,17 +642,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.layout_name = name
         self.layout_actions[name].setChecked(True)
         n = LAYOUT_COUNT[name]
-        pos = {"1": [(0, 0)], "2h": [(0, 0), (0, 1)], "2v": [(0, 0), (1, 0)],
-               "4": [(0, 0), (0, 1), (1, 0), (1, 1)]}[name]
+        H, V = QtCore.Qt.Orientation.Horizontal, QtCore.Qt.Orientation.Vertical
+        sizes = getattr(self, "_split_sizes", {})
+        if self.split_root is not None:                       # remember where the user dragged the dividers
+            sizes[self._split_key] = [sp.sizes() for sp in [self.split_root] + self.split_root.findChildren(QtWidgets.QSplitter)]
+        for p in self.panels:
+            p.setParent(None)
+        if self.split_root is not None:
+            self.area_lay.removeWidget(self.split_root)
+            self.split_root.deleteLater()
+
+        def mk(orient, widgets):
+            sp = QtWidgets.QSplitter(orient)
+            sp.setChildrenCollapsible(False)
+            sp.setHandleWidth(3)
+            for w_ in widgets:
+                sp.addWidget(w_)
+                sp.setStretchFactor(sp.count() - 1, 1)
+            return sp
+        P = self.panels
+        if name == "1":
+            root = mk(H, [P[0]])
+        elif name == "2h":
+            root = mk(H, [P[0], P[1]])
+        elif name == "2v":
+            root = mk(V, [P[0], P[1]])
+        else:
+            root = mk(V, [mk(H, [P[0], P[1]]), mk(H, [P[2], P[3]])])
+        root.setStyleSheet(f"QSplitter::handle {{ background: {theme.BORDER}; }} "
+                           f"QSplitter::handle:hover {{ background: {theme.ACCENT}; }}")
+        self.split_root, self._split_key, self._split_sizes = root, name, sizes
+        self.area_lay.addWidget(root)
         for i, p in enumerate(self.panels):
-            self.grid.removeWidget(p)
             if i < n:
-                self.grid.addWidget(p, *pos[i])
                 p.show()
                 if p.df is None and not p.loading and i > 0 and self.isVisible():
                     self._autoload_extra(p, i)
             else:
                 p.hide()
+        saved = sizes.get(name)
+        if saved:
+            for sp, sz in zip([root] + root.findChildren(QtWidgets.QSplitter), saved):
+                if sum(sz) > 0 and len(sz) == sp.count():
+                    sp.setSizes(sz)
         for p in self.panels:
             p.multi = n > 1
             p.set_active(p is self.active)

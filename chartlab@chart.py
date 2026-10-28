@@ -200,6 +200,12 @@ class ChartWidget(QtWidgets.QWidget):
         self.last_tag = _tag((1, 0.5), theme.UP)
         self.price.addItem(self.last_tag, ignoreBounds=True)
         self.last_tag.hide()
+        self.cd_tag = _tag((1, -0.55), "#2a2e39")
+        self.price.addItem(self.cd_tag, ignoreBounds=True)
+        self.cd_tag.hide()
+        self._cd_timer = QtCore.QTimer(self)
+        self._cd_timer.timeout.connect(self._update_countdown)
+        self._cd_timer.start(1000)
         self.last_line = pg.InfiniteLine(angle=0, movable=False,
                                          pen=pg.mkPen(theme.UP, style=QtCore.Qt.PenStyle.DotLine))
         self.price.addItem(self.last_line, ignoreBounds=True)
@@ -739,7 +745,39 @@ class ChartWidget(QtWidgets.QWidget):
         if self.df is None or not self.last_tag.isVisible():
             return
         xr = self.price.vb.viewRange()[0][1]
-        self.last_tag.setPos(xr, float(self.df["Close"].iloc[self._n() - 1]))
+        y = float(self.df["Close"].iloc[self._n() - 1])
+        self.last_tag.setPos(xr, y)
+        self.cd_tag.setPos(xr, y)
+
+    def bar_seconds(self) -> float:
+        if self.df is None or len(self.df) < 3:
+            return 0.0
+        d = np.diff(self._times[-30:])
+        d = d[d > 0]
+        return float(np.median(d)) if len(d) else 0.0
+
+    def _update_countdown(self):
+        """TradingView's 'time left in this bar' under the last-price label (only while the bar is live)."""
+        if self.df is None or self._limit is not None or not self.isVisible():
+            self.cd_tag.hide()
+            return
+        step = self.bar_seconds()
+        if step <= 0 or step > 86400 * 2:
+            self.cd_tag.hide()
+            return
+        import datetime as _dt
+        last = self.df.index[-1]
+        end = last + _dt.timedelta(seconds=step)
+        now = _dt.datetime.now(tz=end.tzinfo) if getattr(end, "tzinfo", None) else _dt.datetime.now()
+        left = (end - now).total_seconds()
+        if not 0 <= left <= step:
+            self.cd_tag.hide()
+            return
+        h, rem = divmod(int(left), 3600)
+        m, sec = divmod(rem, 60)
+        self.cd_tag.setText(f" {h:d}:{m:02d}:{sec:02d} " if h else f" {m:02d}:{sec:02d} ")
+        self.cd_tag.show()
+        self._place_last_tag()
 
     def _mouse_moved(self, pos):
         if self.df is None:
