@@ -33,9 +33,13 @@ jobs:
           pyinstaller --noconfirm --windowed --name ChartLab \
             --add-data "strategies:strategies" \
             --add-data "providers:providers" \
+            --collect-submodules chartlab \
             --collect-submodules yfinance \
             --collect-submodules pyqtgraph --collect-data pyqtgraph \
             main.py
+      - name: Check the built app starts in MCP mode
+        run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}' | dist/ChartLab.app/Contents/MacOS/ChartLab --mcp | head -c 300
       - name: Zip app
         run: ditto -c -k --keepParent dist/ChartLab.app ChartLab-mac.zip
       - uses: actions/upload-artifact@v4
