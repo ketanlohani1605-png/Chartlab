@@ -57,6 +57,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, settings: QtCore.QSettings | None = None):
         super().__init__()
         self.setWindowTitle("ChartLab")
+        self.setUnifiedTitleAndToolBarOnMac(True)
         self.settings = settings or QtCore.QSettings("ChartLab", "ChartLab")
         self.layout_name = "1"
         self.panels: list[ChartPanel] = []

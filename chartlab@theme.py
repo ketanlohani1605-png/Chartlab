@@ -1,9 +1,9 @@
 """Dark, TradingView-like colours and Qt stylesheet."""
 import pyqtgraph as pg
 
-BG = "#000000"
-PANEL = "#0c0d10"
-GRID = "#1c1f27"
+BG = "#131722"
+PANEL = "#131722"
+GRID = "#1e222d"
 BORDER = "#2a2e39"
 HOVER = "#2a2e39"
 TEXT = "#d1d4dc"
@@ -49,8 +49,8 @@ QPushButton#primary:hover {{ background: #4a7bff; }}
 QPushButton#pill {{ background: white; color: black; font-weight: 700; border-radius: 16px; padding: 6px 18px; }}
 QPushButton#pill:hover {{ background: #e0e3eb; }}
 QPushButton:disabled {{ color: {MUTED}; }}
-QPlainTextEdit {{ background: #060709; border: 1px solid {GRID}; selection-background-color: {ACCENT}; }}
-QTableWidget {{ background: {BG}; gridline-color: {GRID}; border: 0; alternate-background-color: #08090c; selection-background-color: #1e2a55; }}
+QPlainTextEdit {{ background: #0f121a; border: 1px solid {GRID}; selection-background-color: {ACCENT}; }}
+QTableWidget {{ background: {BG}; gridline-color: {GRID}; border: 0; alternate-background-color: #171b27; selection-background-color: #1e2a55; }}
 QHeaderView::section {{ background: {BG}; color: {MUTED}; border: 0; border-bottom: 1px solid {BORDER}; padding: 6px; font-weight: 500; }}
 QDockWidget::title {{ background: {BG}; padding: 8px 12px; border-bottom: 1px solid {BORDER}; font-weight: 600; }}
 QTabWidget::pane {{ border: 0; border-top: 1px solid {BORDER}; }}
@@ -62,9 +62,25 @@ QMenu {{ background: #1e222d; border: 1px solid {BORDER}; padding: 4px; }}
 QMenu::item {{ padding: 6px 22px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {HOVER}; }}
 QStatusBar {{ background: {BG}; color: {MUTED}; border-top: 1px solid {BORDER}; }}
-QScrollBar:vertical {{ background: {BG}; width: 10px; }}
-QScrollBar::handle:vertical {{ background: #2a2e39; border-radius: 4px; min-height: 24px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QSplitter::handle {{ background: {BORDER}; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+QScrollBar::handle:horizontal {{ background: #363a45; border-radius: 4px; min-width: 24px; margin: 1px; }}
+QScrollBar::handle:horizontal:hover, QScrollBar::handle:vertical:hover {{ background: #4c525e; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+QScrollBar::handle:vertical {{ margin: 1px; background: #363a45; border-radius: 4px; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 0; border: 0; }}
+QDockWidget {{ border: 0; }}
+QMainWindow::separator {{ background: {BORDER}; width: 1px; height: 1px; }}
+QMainWindow::separator:hover {{ background: {ACCENT}; }}
+QStatusBar::item {{ border: 0; }}
+QCheckBox::indicator, QRadioButton::indicator {{ width: 14px; height: 14px; }}
+QCheckBox::indicator {{ border: 1px solid #50535e; border-radius: 3px; background: {BG}; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QDialog {{ background: #1e222d; }}
+QDialog QLineEdit, QDialog QComboBox, QDialog QDoubleSpinBox, QDialog QDateTimeEdit {{ background: {BG}; border: 1px solid {BORDER}; }}
+QListWidget {{ outline: 0; }}
+QPushButton#primary:pressed {{ background: #1e53e5; }}
 QToolTip {{ background: #1e222d; color: {TEXT}; border: 1px solid {BORDER}; padding: 4px 6px; }}
 """

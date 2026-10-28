@@ -184,7 +184,7 @@ class ChartWidget(QtWidgets.QWidget):
 
         grid = self.glw.ci.layout
         grid.setSpacing(2)
-        grid.setRowStretchFactor(0, 10)
+        grid.setRowStretchFactor(0, 14)
         grid.setRowStretchFactor(1, 2)
         grid.setRowStretchFactor(2, 3)
         self._set_rsi_visible(False)
@@ -241,7 +241,7 @@ class ChartWidget(QtWidgets.QWidget):
             ax.setPen(pg.mkPen(theme.BORDER))
             ax.setTextPen(pg.mkPen("#b2b5be"))
             ax.setStyle(tickFont=f, tickLength=-4)
-        p.showGrid(x=True, y=True, alpha=0.06)
+        p.showGrid(x=True, y=True, alpha=0.12)
         dash = pg.mkPen(theme.MUTED, style=QtCore.Qt.PenStyle.DashLine)
         p.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
         p.hline = pg.InfiniteLine(angle=0, movable=False, pen=dash)
@@ -536,7 +536,7 @@ class ChartWidget(QtWidgets.QWidget):
         n = self._n()
         self.auto_y = True
         if n:
-            self.price.setXRange(max(-2, n - 160), n + 6, padding=0)
+            self.price.setXRange(max(-2, n - 150), n + 12, padding=0)
             self._autoscale()
 
     def _wipe(self):

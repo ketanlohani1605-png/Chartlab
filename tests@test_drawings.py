@@ -20,6 +20,7 @@ def px(x, y):
     sp = vb.mapViewToScene(QtCore.QPointF(x, y)); return w.glw.mapFromScene(sp)
 vp = w.glw.viewport()
 def drag(a, b):
+    QtTest.QTest.qWait(500)
     QtTest.QTest.mousePress(vp, QtCore.Qt.MouseButton.LeftButton, pos=a)
     for i in range(1, 11):
         QtTest.QTest.mouseMove(vp, a + (b - a) * (i / 10)); app.processEvents()
