@@ -40,4 +40,6 @@ QTabBar::tab:selected {{ background: {BG}; color: white; }}
 QMenuBar, QMenu {{ background: {PANEL}; }}
 QMenu::item:selected {{ background: {ACCENT}; }}
 QStatusBar {{ background: {PANEL}; color: {MUTED}; }}
+
+QToolButton::menu-indicator {{ image: none; width: 0px; }}
 """

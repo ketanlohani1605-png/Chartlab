@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PySide6 import QtCore, QtWidgets  # noqa: E402
 
+from chartlab import backtest as bt  # noqa: E402
 from chartlab import data as dm  # noqa: E402
 from chartlab import theme  # noqa: E402
 from chartlab.mainwindow import MainWindow  # noqa: E402
@@ -63,7 +64,7 @@ assert len(lay.drawings) == 4
 
 w.run_backtest()
 app.processEvents()
-assert p.result is not None and w.summary.rowCount() == 7
+assert p.result is not None and w.summary.rowCount() == (len(bt.format_metrics(p.result.metrics)) + 1) // 2
 assert w.trades_tbl.rowCount() == len(p.result.trades)
 w.grab().save(prefix + "_1chart.png")
 

@@ -73,7 +73,7 @@ class ChartPanel(QtWidgets.QFrame):
         self._prev_params = dict(self.params)
         self.params = {"source": source, "symbol": symbol, "interval": interval, "range": rng, "path": path}
         if source == "file":
-            fn = lambda: datamod.load_file(path)  # noqa: E731
+            fn = lambda: self._load_local(path, interval)  # noqa: E731
         elif source == "yahoo":
             fn = lambda: datamod.load_yahoo(symbol, interval, rng)  # noqa: E731
         elif source.startswith("provider:"):
@@ -91,6 +91,21 @@ class ChartPanel(QtWidgets.QFrame):
         self._worker.done.connect(self._on_done)
         self._worker.failed.connect(self._fail)
         self._worker.start()
+
+    _raw_cache: dict = {}
+
+    @classmethod
+    def _load_local(cls, path, interval):
+        import os
+        key = (path, os.path.getmtime(path))
+        if key not in cls._raw_cache:
+            cls._raw_cache.clear()
+            cls._raw_cache[key] = datamod.load_file(path)
+        raw, label = cls._raw_cache[key]
+        if interval in ("auto", "", None):
+            return raw, label
+        df, note = datamod.to_timeframe(raw, interval)
+        return df, label + (f"  [{interval}]" if not note else f"  [{note}]")
 
     def set_dataframe(self, df, label: str):
         """Synchronously show an already-loaded DataFrame (tests, API, demo data)."""

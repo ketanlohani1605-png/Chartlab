@@ -16,6 +16,7 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
@@ -88,22 +89,125 @@ def standardise(raw: pd.DataFrame) -> pd.DataFrame:
     return df.astype(float)
 
 
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """Aggregate to a bigger timeframe, e.g. '15min', '1h', 'D', 'W-FRI', 'ME'."""
-    out = df.resample(rule).agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    )
-    return out.dropna(subset=["Open", "Close"])
+# --------------------------------------------------------------------------- timeframes
+# Timeframe codes used everywhere in the app:  1m 2m 3m 5m 10m 15m 30m 1h 2h 4h  1d  1wk  1mo
+_TF_RE = re.compile(r"^(\d+)\s*(m|min|h|d|w|wk|mo)$", re.I)
+
+
+def parse_timeframe(tf: str) -> tuple[str, int]:
+    """'3m' -> ('min', 3); '4h' -> ('min', 240); '1d' -> ('day', 1); '1wk' -> ('week', 1); '1mo' -> ('month', 1)."""
+    t = str(tf).strip().lower()
+    t = {"d": "1d", "w": "1wk", "m": "1mo", "day": "1d", "week": "1wk", "month": "1mo"}.get(t, t)
+    m = _TF_RE.match(t)
+    if not m:
+        raise ValueError(f"Bad timeframe '{tf}'. Use e.g. 1m, 3m, 15m, 1h, 4h, 1d, 1wk, 1mo")
+    n, unit = int(m.group(1)), m.group(2).lower()
+    if n < 1:
+        raise ValueError(f"Bad timeframe '{tf}'")
+    if unit in ("m", "min"):
+        return "min", n
+    if unit == "h":
+        return "min", n * 60
+    if unit == "d":
+        return "day", n
+    if unit in ("w", "wk"):
+        return "week", n
+    return "month", n
+
+
+def timeframe_minutes(tf: str) -> float:
+    kind, n = parse_timeframe(tf)
+    return {"min": n, "day": n * 1440, "week": n * 10080, "month": n * 43200}[kind]
+
+
+def normalize_tf(tf: str) -> str:
+    kind, n = parse_timeframe(tf)
+    if kind == "min":
+        return f"{n // 60}h" if n % 60 == 0 and n >= 60 else f"{n}m"
+    return {"day": f"{n}d", "week": f"{n}wk", "month": f"{n}mo"}[kind]
+
+
+def detect_base_minutes(df: pd.DataFrame) -> float:
+    """Typical bar length of a dataset in minutes (1440 = daily)."""
+    idx = df.index
+    if len(idx) < 3:
+        return 1440.0
+    sample = idx[: min(len(idx), 5000)]
+    d = np.diff(sample.values.astype("datetime64[s]").astype("int64"))
+    d = d[d > 0]
+    if len(d) == 0:
+        return 1440.0
+    return float(max(np.median(d) / 60.0, 1.0 / 60))
+
+
+def resample_ohlcv(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    """Aggregate to a bigger timeframe. Intraday bars are aligned to the session open (09:15 for NSE, ...)."""
+    kind, n = parse_timeframe(tf)
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    if kind == "min":
+        tod = (df.index - df.index.normalize())
+        offset = tod.min()
+        out = df.resample(f"{n}min", origin="start_day", offset=offset).agg(agg)
+    else:
+        rule = {"day": f"{n}D", "week": f"W-FRI" if n == 1 else f"{n}W-FRI", "month": f"{n}ME"}[kind]
+        out = df.resample(rule).agg(agg)
+    out = out.dropna(subset=["Open", "Close"])
+    out["Volume"] = out["Volume"].fillna(0.0)
+    out.index.name = "Date"
+    return out
+
+
+def to_timeframe(df: pd.DataFrame, tf: str) -> tuple[pd.DataFrame, str]:
+    """Convert data to timeframe ``tf`` if it is coarser than the data. Returns (data, note)."""
+    base = detect_base_minutes(df)
+    want = timeframe_minutes(tf)
+    if want <= base * 1.01:
+        if want < base * 0.99:
+            return df, f"data is {base:g}-minute, cannot show {tf}"
+        return df, ""
+    return resample_ohlcv(df, tf), ""
 
 
 # --------------------------------------------------------------------------- local files
-def load_file(path: str | Path) -> tuple[pd.DataFrame, str]:
-    p = Path(path)
+DATA_SUFFIXES = (".parquet", ".pq", ".csv", ".tsv", ".txt")
+
+
+def _read_one(p: Path) -> pd.DataFrame:
     if p.suffix.lower() in (".parquet", ".pq"):
         raw = pd.read_parquet(p)
     else:
         raw = pd.read_csv(p, sep=None, engine="python")
-    return standardise(raw), p.name
+    return standardise(raw)
+
+
+def list_data_files(folder: str | Path) -> list[Path]:
+    files = [f for f in Path(folder).rglob("*") if f.is_file() and f.suffix.lower() in DATA_SUFFIXES
+             and not f.name.startswith(".")]
+    return sorted(files)
+
+
+def load_file(path: str | Path, progress=None) -> tuple[pd.DataFrame, str]:
+    """Load one CSV/Parquet file, or every data file inside a folder (e.g. one parquet per day) as one series."""
+    p = Path(path).expanduser()
+    if p.is_dir():
+        files = list_data_files(p)
+        if not files:
+            raise ValueError(f"No .parquet / .csv files found in {p}")
+        parts, bad = [], []
+        for i, f in enumerate(files):
+            try:
+                parts.append(_read_one(f))
+            except Exception as e:  # noqa: BLE001 - skip unreadable files but report how many
+                bad.append(f"{f.name}: {e}")
+            if progress and (i % 25 == 0 or i == len(files) - 1):
+                progress(i + 1, len(files))
+        if not parts:
+            raise ValueError("None of the files could be read. First error: " + (bad[0] if bad else "?"))
+        df = pd.concat(parts)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        note = f"{p.name} ({len(parts)} files" + (f", {len(bad)} skipped" if bad else "") + ")"
+        return df, note
+    return _read_one(p), p.name
 
 
 # --------------------------------------------------------------------------- Yahoo Finance

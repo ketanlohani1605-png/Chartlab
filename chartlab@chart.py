@@ -10,44 +10,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import indicators as ta
 from . import theme
 from .drawings import DrawingLayer
+from .gestures import TVViewBox
+from .render import CandleItem, VolumeItem
 
 _QWIDGETSIZE_MAX = 16777215
 STYLES = ["candles", "hollow", "line", "area"]
 INDICATOR_KEYS = ["sma20", "sma50", "sma200", "ema20", "ema50", "bb", "rsi"]
-
-
-class CandlestickItem(pg.GraphicsObject):
-    def __init__(self, df: pd.DataFrame, style: str = "candles"):
-        super().__init__()
-        self.picture = QtGui.QPicture()
-        self.set_data(df, style)
-
-    def set_data(self, df: pd.DataFrame, style: str = "candles"):
-        o, h, l, c = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
-        pic = QtGui.QPicture()
-        p = QtGui.QPainter(pic)
-        w = 0.36
-        hollow = style == "hollow"
-        pens = {True: pg.mkPen(theme.UP), False: pg.mkPen(theme.DOWN)}
-        brushes = {True: QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush) if hollow else pg.mkBrush(theme.UP),
-                   False: pg.mkBrush(theme.DOWN)}
-        for i in range(len(o)):
-            up = c[i] >= o[i]
-            p.setPen(pens[up])
-            p.setBrush(brushes[up])
-            p.drawLine(QtCore.QPointF(i, l[i]), QtCore.QPointF(i, h[i]))
-            p.drawRect(QtCore.QRectF(i - w, o[i], 2 * w, c[i] - o[i]))
-        p.end()
-        self.prepareGeometryChange()
-        self.picture = pic
-        self.informViewBoundsChanged()
-        self.update()
-
-    def paint(self, p, *args):
-        p.drawPicture(0, 0, self.picture)
-
-    def boundingRect(self):
-        return QtCore.QRectF(self.picture.boundingRect())
 
 
 class DateAxis(pg.AxisItem):
@@ -96,6 +64,7 @@ class ChartWidget(QtWidgets.QWidget):
         self.label = ""
         self.style = "candles"
         self.magnet = True
+        self.auto_y = True
         self._enabled: set[str] = set()
         self._ind_items: dict[str, list] = {}
         self._strategy_items: list = []
@@ -161,12 +130,14 @@ class ChartWidget(QtWidgets.QWidget):
         self.glw.scene().sigMouseMoved.connect(self._mouse_moved)
         self.glw.scene().sigMouseClicked.connect(self._mouse_clicked)
         self.glw.viewport().installEventFilter(self)
+        self.glw.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.glw.viewport().setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
 
     # ------------------------------------------------------------------ construction helpers
     def _make_plot(self, row: int) -> pg.PlotItem:
         axis = DateAxis("bottom")
         self.axes.append(axis)
-        p = self.glw.addPlot(row=row, col=0, axisItems={"bottom": axis})
+        p = self.glw.addPlot(row=row, col=0, axisItems={"bottom": axis}, viewBox=TVViewBox(self, price=(row == 0)))
         p.setMenuEnabled(False)
         p.hideButtons()
         p.showAxis("right")
@@ -176,7 +147,6 @@ class ChartWidget(QtWidgets.QWidget):
             p.getAxis(name).setPen(pg.mkPen(theme.GRID))
             p.getAxis(name).setTextPen(pg.mkPen(theme.TEXT))
         p.showGrid(x=True, y=True, alpha=0.10)
-        p.vb.setMouseEnabled(x=True, y=False)
         dash = pg.mkPen(theme.MUTED, style=QtCore.Qt.PenStyle.DashLine)
         p.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
         p.hline = pg.InfiniteLine(angle=0, movable=False, pen=dash)
@@ -188,7 +158,35 @@ class ChartWidget(QtWidgets.QWidget):
     def eventFilter(self, obj, ev):
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.MouseButtonPress:
             self.activated.emit()
+        if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.NativeGesture:
+            if ev.gestureType() == QtCore.Qt.NativeGestureType.ZoomNativeGesture:
+                pos = self.price.vb.mapSceneToView(self.glw.mapToScene(ev.position().toPoint()))
+                self.price.vb.zoom_x(max(0.2, 1.0 - ev.value() * 1.5), pos.x())
+                return True
+        if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.KeyPress:
+            if self.handle_key(ev):
+                return True
         return super().eventFilter(obj, ev)
+
+    def handle_key(self, ev) -> bool:
+        vb, K = self.price.vb, QtCore.Qt.Key
+        x0, x1 = vb.viewRange()[0]
+        step, k = (x1 - x0) * 0.1, ev.key()
+        if k == K.Key_Left:
+            vb.pan_x(-step)
+        elif k == K.Key_Right:
+            vb.pan_x(step)
+        elif k in (K.Key_Plus, K.Key_Equal, K.Key_Up):
+            vb.zoom_x(0.8)
+        elif k in (K.Key_Minus, K.Key_Down):
+            vb.zoom_x(1.25)
+        elif k in (K.Key_Home,):
+            vb.pan_x(-x0 - 2)
+        elif k in (K.Key_End,):
+            self.go_latest()
+        else:
+            return False
+        return True
 
     def _set_rsi_visible(self, on: bool):
         grid = self.glw.ci.layout
@@ -264,17 +262,15 @@ class ChartWidget(QtWidgets.QWidget):
             a.set_index(df.index)
         self._times = df.index.to_numpy().astype("datetime64[s]").astype("int64").astype(float)
 
-        self.candles = CandlestickItem(df, self.style)
+        self.candles = CandleItem(df, self.style)
         self.price.addItem(self.candles)
         close = df["Close"].to_numpy(float)
         self.line_item = pg.PlotDataItem(x=np.arange(n), y=close, pen=pg.mkPen(theme.ACCENT, width=2))
         self.price.addItem(self.line_item)
+        self.line_item.setClipToView(True)
+        self.line_item.setDownsampling(auto=True, method='peak')
 
-        up = (df["Close"] >= df["Open"]).to_numpy()
-        b_up, b_dn = pg.mkBrush(38, 166, 154, 140), pg.mkBrush(239, 83, 80, 140)
-        self.volbars = pg.BarGraphItem(
-            x=np.arange(n), height=df["Volume"].to_numpy(float), width=0.7,
-            brushes=[b_up if u else b_dn for u in up], pen=pg.mkPen(None))
+        self.volbars = VolumeItem(df)
         self.vol.addItem(self.volbars)
 
         self._lows = df["Low"].to_numpy(float)
@@ -295,6 +291,7 @@ class ChartWidget(QtWidgets.QWidget):
 
     def go_latest(self):
         n = len(self._lows)
+        self.auto_y = True
         if n:
             self.price.setXRange(max(-2, n - 160), n + 6, padding=0)
             self._autoscale()
@@ -442,8 +439,24 @@ class ChartWidget(QtWidgets.QWidget):
         self.price.setXRange(x0, x1, padding=0)
 
     # ------------------------------------------------------------------ view / tags
+    def set_auto_y(self, on: bool):
+        if on == self.auto_y:
+            return
+        self.auto_y = on
+        if on:
+            self._autoscale()
+
     def _autoscale(self, *_):
         if self.df is None:
+            return
+        n = len(self._lows)
+        if not self.auto_y:
+            x0, x1 = self.price.vb.viewRange()[0]
+            lo, hi = max(0, int(x0)), min(n, int(x1) + 1)
+            if hi > lo:
+                self.vol.vb.setYRange(0, max(float(np.nanmax(self._vols[lo:hi])) * 1.15, 1.0), padding=0)
+            self.rsi.vb.setYRange(0, 100, padding=0)
+            self._place_last_tag()
             return
         x0, x1 = self.price.vb.viewRange()[0]
         n = len(self._lows)
@@ -517,6 +530,15 @@ class ChartWidget(QtWidgets.QWidget):
     def _mouse_clicked(self, ev):
         if self.df is None or ev.button() != QtCore.Qt.MouseButton.LeftButton:
             return
+        if ev.double():                                  # double-click an axis = reset that scale
+            ax = self.price.getAxis("right").sceneBoundingRect()
+            if ax.contains(ev.scenePos()):
+                self.set_auto_y(True)
+                self._autoscale()
+                return
+            if any(a.sceneBoundingRect().contains(ev.scenePos()) for a in self.axes):
+                self.go_latest()
+                return
         if not self.price.sceneBoundingRect().contains(ev.scenePos()):
             return
         mp = self.price.vb.mapSceneToView(ev.scenePos())

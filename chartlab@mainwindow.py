@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import backtest as bt
 from . import data as datamod
+from . import scriptmode
 from . import theme
 from .chart import INDICATOR_KEYS, STYLES, DateAxis
 from .drawings import TOOL_LABELS
@@ -32,7 +33,7 @@ FALLBACK_STRATEGY = '''def strategy(df):
             "plot_SMA 20": fast, "plot_SMA 50": slow}
 '''
 
-INTERVALS = [("1m", "1m"), ("5m", "5m"), ("15m", "15m"), ("30m", "30m"), ("1h", "1h"),
+INTERVALS = [("1m", "1m"), ("3m", "3m"), ("5m", "5m"), ("15m", "15m"), ("30m", "30m"), ("1h", "1h"),
              ("1d", "1D"), ("1wk", "1W"), ("1mo", "1M")]
 RANGES = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
 INDICATORS = {"sma20": "SMA 20", "sma50": "SMA 50", "sma200": "SMA 200", "ema20": "EMA 20", "ema50": "EMA 50",
@@ -220,7 +221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.watchlist.changed.connect(self._save_watchlist)
         self.watch_dock = QtWidgets.QDockWidget("Watchlist", self)
         self.watch_dock.setWidget(self.watchlist)
-        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.watch_dock)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.watch_dock)
 
     def _build_strategy_dock(self):
         w = QtWidgets.QWidget()
@@ -305,6 +306,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results_dock = QtWidgets.QDockWidget("Backtest results", self)
         self.results_dock.setWidget(self.tabs)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
+        self.tabifyDockWidget(self.watch_dock, self.strategy_dock)
+        self.watch_dock.raise_()
+        self.setTabPosition(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, QtWidgets.QTabWidget.TabPosition.North)
+        self._default_state = self.saveState(3)
         self.resizeDocks([self.strategy_dock], [480], QtCore.Qt.Orientation.Horizontal)
         self.resizeDocks([self.watch_dock], [250], QtCore.Qt.Orientation.Horizontal)
         self.resizeDocks([self.results_dock], [260], QtCore.Qt.Orientation.Vertical)
@@ -313,6 +318,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mb = self.menuBar()
         f = mb.addMenu("File")
         f.addAction("Open data file…", self.open_data_file, QtGui.QKeySequence("Ctrl+O"))
+        f.addAction("Open data folder…", self.open_data_folder)
         f.addAction("Open strategy…", self.open_strategy)
         f.addAction("Save strategy…", self.save_strategy, QtGui.QKeySequence("Ctrl+S"))
         f.addAction("Export trades to CSV…", self.export_trades)
@@ -324,7 +330,11 @@ class MainWindow(QtWidgets.QMainWindow):
         run.setShortcuts([QtGui.QKeySequence("Ctrl+R"), QtGui.QKeySequence("Ctrl+Return")])
         run.triggered.connect(self.run_backtest)
         s.addAction(run)
+        s.addAction("Backtest settings…", self.show_bt_settings)
+        s.addAction("Stop script", self.stop_script, QtGui.QKeySequence("Ctrl+."))
+        s.addAction("Choose Python for scripts…", self.choose_python)
         v = mb.addMenu("View")
+        v.addAction("Reset layout", self.reset_layout)
         v.addAction(self.watch_dock.toggleViewAction())
         v.addAction(self.strategy_dock.toggleViewAction())
         v.addAction(self.results_dock.toggleViewAction())
@@ -361,7 +371,16 @@ class MainWindow(QtWidgets.QMainWindow):
         geo = st.value("geometry")
         if geo:
             self.restoreGeometry(geo)
+        state = st.value("dock_state_v3")
+        if state:
+            self.restoreState(state, 3)
         self._source_changed()
+
+    def reset_layout(self):
+        self.restoreState(self._default_state, 3)
+        for d in (self.watch_dock, self.strategy_dock, self.results_dock):
+            d.show()
+        self.watch_dock.raise_()
 
     def closeEvent(self, e):
         st = self.settings
@@ -372,6 +391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         st.setValue("strategy", self.editor.toPlainText())
         st.setValue("layout", self.layout_name)
         st.setValue("geometry", self.saveGeometry())
+        st.setValue("dock_state_v3", self.saveState(3))
         self._save_watchlist()
         if self.api is not None:
             self.api.stop()
@@ -463,8 +483,10 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------ toolbar handlers
     def _source_changed(self, *_):
         is_file = self.source.currentData() == "file"
-        for w in [self.symbol, self.range, *self.interval_btns.values()]:
+        for w in [self.symbol, self.range]:
             w.setEnabled(not is_file)
+        for w in self.interval_btns.values():
+            w.setEnabled(True)
         self.load_btn.setText("Open file…" if is_file else "Load")
 
     def _interval_clicked(self, val: str):
@@ -472,6 +494,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.source.currentData() != "file":
             self.on_load()
+        else:                                           # local data: resample what is already loaded
+            path = self.active.params.get("path", "")
+            if path:
+                self.load_into(self.active, "file", self.active.params.get("symbol", ""), val, "max", path)
 
     def _indicator_toggled(self, key, on):
         if not self._syncing:
@@ -527,7 +553,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         self.source.setCurrentIndex(self.source.findData("file"))
-        self.load_into(self.active, "file", Path(path).stem, "1d", "max", path)
+        self.load_into(self.active, "file", Path(path).stem, "auto", "max", path)
+
+    def open_data_folder(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Open a folder of price files (e.g. one parquet per day)", str(Path.home()))
+        if not path:
+            return
+        self.source.setCurrentIndex(self.source.findData("file"))
+        self.load_into(self.active, "file", Path(path).name, "auto", "max", path)
 
     def _on_load_started(self, panel):
         if panel is self.active:
@@ -560,7 +594,9 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Open strategy", str(Path.home()), "Python (*.py);;All files (*)")
         if path:
+            self.script_path = path
             self.editor.setPlainText(Path(path).read_text())
+            self.statusBar().showMessage(f"Opened {path}")
 
     def save_strategy(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -597,6 +633,132 @@ class MainWindow(QtWidgets.QMainWindow):
         if text:
             self.log_view.appendPlainText(text.rstrip())
 
+    # ---- script mode: run the user's own script with their own Python
+    def choose_python(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Choose the python you run your scripts with", "/usr/local/bin", "All files (*)")
+        if path:
+            self.settings.setValue("script_python", path)
+            self.statusBar().showMessage(f"Scripts will run with {path}")
+
+    def stop_script(self):
+        proc = getattr(self, "_proc", None)
+        if proc is not None and proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            proc.kill()
+            self.add_log("[stopped by you]")
+
+    def run_script_mode(self, panel, capital=None) -> dict:
+        import os
+        import tempfile
+        if getattr(self, "_proc", None) is not None and self._proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            return {"ok": False, "error": "A script is already running (Strategy -> Stop script)", "log": ""}
+        try:
+            py, _ = scriptmode.find_python(str(self.settings.value("script_python", "") or ""))
+        except Exception as e:  # noqa: BLE001
+            self.add_log(str(e))
+            return {"ok": False, "error": str(e), "log": ""}
+        work = scriptmode.prepare(panel.df)
+        link = getattr(self, "script_path", "") or ""
+        if link and Path(link).parent.exists():
+            tmp = Path(link).parent / f".chartlab_run_{Path(link).name}"
+        else:
+            tmp = work / "user_script.py"
+        tmp.write_text(self.strategy_code())
+        self._script_ctx = (panel, work, tmp, capital if capital is not None else self.capital.value(), tmp != work / "user_script.py")
+        proc = QtCore.QProcess(self)
+        proc.setProcessEnvironment(QtCore.QProcessEnvironment.systemEnvironment())
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        for k, v in scriptmode.environment(work, panel.df).items():
+            env.insert(k, v)
+        proc.setProcessEnvironment(env)
+        proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self.add_log(bytes(proc.readAllStandardOutput()).decode("utf8", "replace")))
+        proc.finished.connect(self._script_finished)
+        self._proc = proc
+        self.add_log(f"--- running script with {py}")
+        self.statusBar().showMessage("Running script… (Cmd+. to stop)")
+        self.tabs.setCurrentWidget(self.log_view)
+        proc.start(py, [str(work / "_runner.py"), str(tmp)])
+        return {"ok": True, "async": True, "log": ""}
+
+    def _script_finished(self, code, _status):
+        panel, work, tmp, capital, linked = self._script_ctx
+        if linked:
+            tmp.unlink(missing_ok=True)
+        if code != 0:
+            self.statusBar().showMessage("Script failed (see Log)")
+            return
+        try:
+            res, plots = scriptmode.load_results(work, panel.df, capital)
+        except Exception:  # noqa: BLE001
+            self.add_log(traceback.format_exc())
+            self.statusBar().showMessage("Could not read the script's results (see Log)")
+            return
+        if res is None:
+            self.add_log("Script finished but reported nothing. Call chartlab.report(trades=..., equity=...) or "
+                         "keep a trades DataFrame (entry_time, exit_time, pnl) / 'equity' Series in a variable.")
+            self.statusBar().showMessage("Script finished - no trades reported")
+            return
+        panel.result, panel.signals = res, None
+        panel.chart.set_strategy_overlays(plots)
+        panel.chart.set_trades(res.trades)
+        if panel is self.active:
+            self._show_result(panel)
+            self.tabs.setCurrentWidget(self.summary)
+        m = res.metrics
+        self.statusBar().showMessage(f"Script done: {m['trades']} trades, net {m['total_return'] * 100:+.2f}%")
+
+    def bt_config(self, capital=None, fee=None) -> "bt.Config":
+        cfg = bt.Config(**getattr(self, "bt_extra", {}))
+        cfg.capital = capital if capital is not None else self.capital.value()
+        cfg.fee_pct = fee if fee is not None else self.fee.value()
+        return cfg
+
+    def show_bt_settings(self):
+        cur = bt.Config(**getattr(self, "bt_extra", {}))
+        d = QtWidgets.QDialog(self)
+        d.setWindowTitle("Backtest settings")
+        f = QtWidgets.QFormLayout(d)
+        direction = QtWidgets.QComboBox()
+        direction.addItems(["long", "short", "both"])
+        direction.setCurrentText(cur.direction)
+        fill = QtWidgets.QComboBox()
+        fill.addItems(["next_open", "close"])
+        fill.setCurrentText(cur.fill)
+
+        def spin(v, hi=1000.0, dec=2):
+            w = QtWidgets.QDoubleSpinBox()
+            w.setRange(0, hi)
+            w.setDecimals(dec)
+            w.setValue(v)
+            return w
+        size, slip = spin(cur.size_pct, 1000), spin(cur.slippage_pct, 10, 3)
+        sl, tp, tr = spin(cur.sl_pct, 100), spin(cur.tp_pct, 1000), spin(cur.trail_pct, 100)
+        sq = QtWidgets.QLineEdit(cur.square_off)
+        sq.setPlaceholderText("HH:MM, e.g. 15:15 (empty = off)")
+        f.addRow("Direction", direction)
+        f.addRow("Fill price", fill)
+        f.addRow("Position size (% of equity)", size)
+        f.addRow("Slippage % per fill", slip)
+        f.addRow("Stop loss % (0 = off)", sl)
+        f.addRow("Take profit % (0 = off)", tp)
+        f.addRow("Trailing stop % (0 = off)", tr)
+        f.addRow("Square-off time", sq)
+        note = QtWidgets.QLabel("Signals fill at the next bar's open (or this bar's close). If a stop and a target are both "
+                                "inside one candle the stop is assumed first. Gaps fill at the open.")
+        note.setWordWrap(True)
+        f.addRow(note)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                        QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        f.addRow(bb)
+        if d.exec():
+            self.bt_extra = dict(direction=direction.currentText(), fill=fill.currentText(), size_pct=size.value(),
+                                 slippage_pct=slip.value(), sl_pct=sl.value(), tp_pct=tp.value(),
+                                 trail_pct=tr.value(), square_off=sq.text().strip())
+            self.run_backtest()
+
     def run_backtest(self):
         r = self.run_backtest_on(self.active)
         if not r["ok"]:
@@ -606,13 +768,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def run_backtest_on(self, panel, capital: float | None = None, fee: float | None = None) -> dict:
         if panel.df is None:
             return {"ok": False, "error": "No data loaded in this chart yet", "log": ""}
+        if not re.search(r"^def\s+strategy\s*\(", self.strategy_code(), re.M):
+            return self.run_script_mode(panel, capital)
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
                 sig = bt.run_user_strategy(self.strategy_code(), panel.df)
-            res = bt.backtest(panel.df, sig.buy, sig.sell,
-                              capital if capital is not None else self.capital.value(),
-                              fee if fee is not None else self.fee.value())
+            cfg = self.bt_config(capital, fee)
+            res = bt.run_backtest(panel.df, sig, cfg)
         except Exception:  # noqa: BLE001 - show user-code errors in the Log tab
             err = traceback.format_exc()
             self.add_log(buf.getvalue() + err)
@@ -707,10 +870,12 @@ def main():
     _setup_logging()
     theme.apply_pg_config()
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("ChartLab")
     app.setStyleSheet(theme.STYLESHEET)
     win = MainWindow()
-    win.resize(1680, 980)
+    geo = app.primaryScreen().availableGeometry()
+    win.resize(min(1680, int(geo.width() * 0.96)), min(980, int(geo.height() * 0.94)))
     win.show()
     try:
         from .api import ApiServer

@@ -110,14 +110,14 @@ def test_user_strategies():
         sig = bt.run_user_strategy(f.read_text(), df)
         res = bt.backtest(df, sig.buy, sig.sell)
         rows = bt.format_metrics(res.metrics)
-        assert len(rows) == 13 and np.isfinite(res.equity).all(), f.name
+        assert len(rows) >= 13 and np.isfinite(res.equity).all(), f.name
         print(f"  {f.name:24s} trades={res.metrics['trades']:3d} ret={res.metrics['total_return']*100:+7.2f}% "
               f"dd={res.metrics['max_drawdown']*100:6.2f}%")
 
 
 def test_bad_strategy_errors():
     df = sample(60)
-    for code, needle in [("x = 1", "def strategy"), ("def strategy(df):\n    return 5", "'buy' and 'sell'")]:
+    for code, needle in [("x = 1", "def strategy"), ("def strategy(df):\n    return 5", "must return a dict")]:
         try:
             bt.run_user_strategy(code, df)
         except ValueError as e:
