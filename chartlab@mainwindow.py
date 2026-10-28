@@ -309,6 +309,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabifyDockWidget(self.watch_dock, self.strategy_dock)
         self.watch_dock.raise_()
         self.setTabPosition(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, QtWidgets.QTabWidget.TabPosition.North)
+        self.watch_dock.setObjectName("dock_watchlist")
+        self.strategy_dock.setObjectName("dock_strategy")
+        self.results_dock.setObjectName("dock_results")
+        for tb_ in self.findChildren(QtWidgets.QToolBar):
+            tb_.setObjectName("tb_" + (tb_.windowTitle() or "main").replace(" ", "_"))
         self._default_state = self.saveState(3)
         self.resizeDocks([self.strategy_dock], [480], QtCore.Qt.Orientation.Horizontal)
         self.resizeDocks([self.watch_dock], [250], QtCore.Qt.Orientation.Horizontal)
@@ -679,6 +684,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Running script… (Cmd+. to stop)")
         self.tabs.setCurrentWidget(self.log_view)
         proc.start(py, [str(work / "_runner.py"), str(tmp)])
+        proc.closeWriteChannel()      # scripts that call input() get EOF instead of hanging
         return {"ok": True, "async": True, "log": ""}
 
     def _script_finished(self, code, _status):

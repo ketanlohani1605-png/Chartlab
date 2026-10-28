@@ -298,7 +298,7 @@ def _metrics(df, eq, bh, trades, capital) -> dict:
     n = len(df)
     years = max((df.index[-1] - df.index[0]).days, 1) / 365.25
     final = float(eq.iloc[-1])
-    cagr = (final / capital) ** (1 / years) - 1 if years > 0.05 and final > 0 else np.nan
+    cagr = (final / capital) ** (1 / years) - 1 if years >= 1.0 and final > 0 else np.nan
     dd_series = eq / eq.cummax() - 1
     dd = float(dd_series.min())
     daily = eq.resample("1D").last().dropna() if n > 2 else eq
