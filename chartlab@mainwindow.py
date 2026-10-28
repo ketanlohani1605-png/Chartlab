@@ -14,6 +14,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import accounts as acctmod
 from . import alerts as alertmod
 from . import backtest as bt
 from . import data as datamod
@@ -167,6 +168,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source.addItem("Local file", "file")
         for name in datamod.list_providers():
             self.source.addItem(f"Provider: {name}", f"provider:{name}")
+        self._fill_api_sources()
         self.source.setToolTip("Data source")
         self.source.currentIndexChanged.connect(self._source_changed)
         tb.addWidget(self.source)
@@ -241,6 +243,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alert_btn.setToolTip("Create alert  (Alt+A)")
         self.alert_btn.clicked.connect(lambda: self.create_alert())
         tb.addWidget(self.alert_btn)
+
+        self.acct_btn = QtWidgets.QToolButton()
+        self.acct_btn.setText("Accounts")
+        self.acct_btn.setToolTip("Broker accounts: API data + run one script on many accounts")
+        m_ = QtWidgets.QMenu(self.acct_btn)
+        m_.addAction("Manage broker accounts…", self.manage_accounts)
+        m_.addAction("Run script on multiple accounts…", self.run_on_accounts)
+        m_.addAction("Stop all runs", self.stop_script)
+        self.acct_btn.setMenu(m_)
+        self.acct_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(self.acct_btn)
 
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
@@ -520,6 +533,9 @@ class MainWindow(QtWidgets.QMainWindow):
         s.addAction("Backtest settings…", self.show_bt_settings)
         s.addAction("Stop script", self.stop_script, QtGui.QKeySequence("Ctrl+."))
         s.addAction("Choose Python for scripts…", self.choose_python)
+        s.addSeparator()
+        s.addAction("Manage broker accounts…", self.manage_accounts)
+        s.addAction("Run script on multiple accounts…", self.run_on_accounts)
         v = mb.addMenu("View")
         v.addAction("Reset layout", self.reset_layout)
         v.addAction(self.watch_dock.toggleViewAction())
@@ -688,6 +704,80 @@ class MainWindow(QtWidgets.QMainWindow):
         self._source_changed()
 
     # ------------------------------------------------------------------ toolbar handlers
+    def _fill_api_sources(self):
+        cur = self.source.currentData()
+        for i in reversed(range(self.source.count())):
+            if str(self.source.itemData(i)).startswith("api:"):
+                self.source.removeItem(i)
+        for a in acctmod.load_accounts():
+            self.source.addItem(f"API: {a['name']}", f"api:{a['name']}")
+        if cur is not None and self.source.findData(cur) >= 0:
+            self.source.setCurrentIndex(self.source.findData(cur))
+
+    def manage_accounts(self):
+        acctmod.AccountsDialog(self).exec()
+        self._fill_api_sources()
+
+    def run_on_accounts(self):
+        """Run the editor's script once per chosen account, all at the same time."""
+        accts = acctmod.load_accounts()
+        if not accts:
+            self.statusBar().showMessage("Add accounts first (Strategy -> Manage broker accounts)")
+            self.manage_accounts()
+            return
+        dlg = acctmod.PickAccountsDialog(self, accts)
+        if dlg.exec():
+            names = dlg.chosen()
+            if names:
+                self.run_multi(names)
+
+    def run_multi(self, names: list[str]) -> dict:
+        self.stop_script()
+        self.stop_multi()
+        try:
+            py, _ = scriptmode.find_python(str(self.settings.value("script_python", "") or ""))
+            by = {a["name"]: a for a in acctmod.load_accounts()}
+            chosen = [by[n] for n in names]
+        except Exception as e:  # noqa: BLE001
+            self.add_log(str(e))
+            return {"ok": False, "error": str(e)}
+        data = self.active.chart.effective_df()
+        code = self.strategy_code()
+        self._multi = []
+        self.tabs.setCurrentWidget(self.log_view)
+        self.add_log(f"--- running on {len(chosen)} accounts at once: " + ", ".join(names))
+        for a in chosen:
+            work = scriptmode.prepare(data)
+            script = work / "user_script.py"
+            script.write_text(code)
+            env = QtCore.QProcessEnvironment.systemEnvironment()
+            for k, v in {**scriptmode.environment(work, data), **acctmod.account_env(a)}.items():
+                env.insert(k, v)
+            proc = QtCore.QProcess(self)
+            proc.setProcessEnvironment(env)
+            proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+            tag = a["name"]
+            proc.readyReadStandardOutput.connect(
+                lambda p=proc, t=tag: [self.add_log(f"[{t}] {ln}") for ln in
+                                       bytes(p.readAllStandardOutput()).decode("utf8", "replace").splitlines()])
+            proc.finished.connect(lambda code_, _s, t=tag: self._multi_done(t, code_))
+            self._multi.append(proc)
+            proc.start(py, [str(work / "_runner.py"), str(script)])
+            proc.closeWriteChannel()
+        self.statusBar().showMessage(f"Running on {len(chosen)} accounts… (Strategy -> Stop script to stop all)")
+        return {"ok": True, "accounts": names}
+
+    def _multi_done(self, tag, code):
+        self.add_log(f"[{tag}] finished" + ("" if code == 0 else f" with errors (exit {code})"))
+        if all(p.state() == QtCore.QProcess.ProcessState.NotRunning for p in getattr(self, "_multi", [])):
+            self.statusBar().showMessage("All account runs finished")
+
+    def stop_multi(self):
+        for p in getattr(self, "_multi", []):
+            if p.state() != QtCore.QProcess.ProcessState.NotRunning:
+                p.kill()
+                self.add_log("[stopped by you]")
+
     def _source_changed(self, *_):
         is_file = self.source.currentData() == "file"
         for w in [self.symbol, self.range]:
@@ -853,6 +943,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Scripts will run with {path}")
 
     def stop_script(self):
+        self.stop_multi()
         proc = getattr(self, "_proc", None)
         if proc is not None and proc.state() != QtCore.QProcess.ProcessState.NotRunning:
             proc.kill()

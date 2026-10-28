@@ -85,6 +85,10 @@ class ChartPanel(QtWidgets.QFrame):
         elif source.startswith("provider:"):
             name = source.split(":", 1)[1]
             fn = lambda: datamod.load_provider(name, symbol, interval, rng)  # noqa: E731
+        elif source.startswith("api:"):
+            from . import accounts
+            acct = source.split(":", 1)[1]
+            fn = lambda: accounts.load_api(acct, symbol, interval, rng)  # noqa: E731
         else:
             self._fail(f"Unknown data source '{source}'")
             return

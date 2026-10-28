@@ -31,6 +31,13 @@ def data():
         raise RuntimeError("No chart data is loaded in ChartLab")
     return pd.read_parquet(_DATA)
 
+def account():
+    """Credentials of the broker account this copy of the script runs on (multi-account mode), or {}."""
+    if not os.environ.get("CHARTLAB_ACCOUNT"):
+        return {}
+    return {k[len("CHARTLAB_"):].lower(): v for k, v in os.environ.items()
+            if k.startswith("CHARTLAB_") and k not in ("CHARTLAB_OUT", "CHARTLAB_DATA", "CHARTLAB_PYTHON")}
+
 def report(trades=None, equity=None, plots=None):
     import pandas as pd
     if trades is not None:

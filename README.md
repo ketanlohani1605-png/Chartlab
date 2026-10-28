@@ -80,3 +80,8 @@ QT_QPA_PLATFORM=offscreen python tests/smoke_ui.py out.png # headless UI render
 ## Security note
 
 Strategies are executed with Python `exec` on your machine - only run strategy code you trust.
+
+## Broker accounts (v0.7)
+- Accounts menu -> Manage broker accounts: add Dhan client id + access token (saved only in ~/ChartLab/accounts.json, mode 600).
+- Source dropdown shows "API: <name>"; type a symbol (RELIANCE, NSE:TCS, NIFTY) and Load - the app fetches candles itself.
+- Accounts -> Run script on multiple accounts: your script runs once per ticked account, all at the same time; inside it call chartlab.account() for that account credentials.
