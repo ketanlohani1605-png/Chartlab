@@ -5,12 +5,8 @@ except to the broker's own API host when you load data or test a connection."""
 from __future__ import annotations
 
 import datetime as dt
-import io
 import json
 import os
-import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -52,68 +48,18 @@ def get_account(name: str, path: Path | None = None) -> dict:
 
 def account_env(a: dict) -> dict:
     """Environment variables handed to a script that runs on this account."""
-    env = {"CHARTLAB_ACCOUNT": a["name"], "CHARTLAB_BROKER": a["broker"]}
+    env = {"CHARTLAB_ACCOUNT": a["name"], "CHARTLAB_BROKER": a["broker"],
+           "CHARTLAB_LIVE": "1" if a.get("live") else "0"}
     for k, _ in FIELDS.get(a["broker"], []):
         env["CHARTLAB_" + k.upper()] = str(a.get(k, ""))
     return env
 
 
 # ---------------------------------------------------------------------- Dhan
-DHAN = "https://api.dhan.co/v2"
-MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
-INDEX_IDS = {"NIFTY": "13", "NIFTY50": "13", "BANKNIFTY": "25", "NIFTYBANK": "25", "FINNIFTY": "27",
-             "SENSEX": "51", "MIDCPNIFTY": "442"}
 _EPOCH_1980 = 315532800
 
 
-def _http(url: str, body: dict | None, headers: dict, timeout=30) -> bytes:
-    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json", **headers},
-                                 method="POST" if body is not None else "GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Dhan API error {e.code}: {e.read().decode('utf8', 'replace')[:300]}") from None
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Could not reach Dhan ({e.reason}). Check your internet.") from None
-
-
-def _master() -> pd.DataFrame:
-    cache = datamod.USER_DIR / "cache" / "dhan_master.csv"
-    if not cache.exists() or time.time() - cache.stat().st_mtime > 7 * 86400:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_bytes(_http(MASTER_URL, None, {}, timeout=120))
-    return pd.read_csv(cache, low_memory=False)
-
-
-def resolve_symbol(symbol: str) -> tuple[str, str, str, str]:
-    """-> (securityId, exchangeSegment, instrument, display). Accepts RELIANCE, NSE:RELIANCE, BSE:SBIN, NIFTY."""
-    s = symbol.strip().upper()
-    exch = "NSE"
-    if ":" in s:
-        exch, s = s.split(":", 1)
-    if s in INDEX_IDS:
-        return INDEX_IDS[s], "IDX_I", "INDEX", s
-    m = _master()
-    col = {c.upper(): c for c in m.columns}
-    ex, seg = col.get("EXCH_ID"), col.get("SEGMENT")
-    sid, sym = col.get("SECURITY_ID"), col.get("SYMBOL_NAME") or col.get("UNDERLYING_SYMBOL")
-    tsym, inst = col.get("DISPLAY_NAME"), col.get("INSTRUMENT")
-    ser = col.get("SERIES")
-    if not (ex and sid and inst):
-        raise RuntimeError("Dhan instrument list has an unexpected format; update ChartLab.")
-    q = m[(m[ex] == exch) & (m[inst] == "EQUITY")]
-    if seg:
-        q = q[q[seg] == "E"]
-    if ser:
-        q = q[q[ser].isin(["EQ", "BE", "SM"]) | q[ser].isna()]
-    hit = q[q[sym].astype(str).str.upper() == s] if sym else q.iloc[0:0]
-    if hit.empty and tsym:
-        hit = q[q[tsym].astype(str).str.upper() == s]
-    if hit.empty:
-        raise RuntimeError(f"'{symbol}' not found on Dhan {exch} equity. Try NSE:RELIANCE or BSE:SBIN.")
-    return str(int(hit.iloc[0][sid])), f"{exch}_EQ", "EQUITY", s
+from .dhan_core import DHAN, INDEX_IDS, MASTER_URL, _http, _master, place_order, resolve_symbol  # noqa: F401
 
 
 _DAYS = {"5d": 5, "1mo": 31, "3mo": 93, "6mo": 186, "1y": 366, "2y": 731, "5y": 1827, "10y": 3653, "max": 3653}
@@ -208,6 +154,9 @@ class AccountsDialog(QtWidgets.QDialog):
         form.addRow("Broker", self.broker)
         form.addRow("Client ID", self.client)
         form.addRow("Access token", self.token)
+        self.live = QtWidgets.QCheckBox("Live orders (REAL money)")
+        self.live.setToolTip("Off = paper: chartlab.order() only prints what it would send")
+        form.addRow(self.live)
         self.msg = QtWidgets.QLabel("")
         self.msg.setWordWrap(True)
         form.addRow(self.msg)
@@ -244,6 +193,7 @@ class AccountsDialog(QtWidgets.QDialog):
             self.broker.setCurrentIndex(max(0, self.broker.findData(a["broker"])))
             self.client.setText(a.get("client_id", ""))
             self.token.setText(a.get("access_token", ""))
+            self.live.setChecked(bool(a.get("live")))
 
     def _new(self):
         self.list.clearSelection()
@@ -254,7 +204,7 @@ class AccountsDialog(QtWidgets.QDialog):
 
     def _current(self) -> dict:
         return {"name": self.name.text().strip(), "broker": self.broker.currentData(),
-                "client_id": self.client.text().strip(), "access_token": self.token.text().strip()}
+                "client_id": self.client.text().strip(), "access_token": self.token.text().strip(), "live": self.live.isChecked()}
 
     def save(self):
         a = self._current()
@@ -304,7 +254,8 @@ class PickAccountsDialog(QtWidgets.QDialog):
             "ticked account.</span>"))
         self.list = QtWidgets.QListWidget()
         for a in accts:
-            it = QtWidgets.QListWidgetItem(f"{a['name']}  ({BROKERS.get(a['broker'], a['broker'])})")
+            it = QtWidgets.QListWidgetItem(f"{a['name']}  ({BROKERS.get(a['broker'], a['broker'])})  -  "
+                                        + ("LIVE orders" if a.get("live") else "paper"))
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
             it.setData(QtCore.Qt.ItemDataRole.UserRole, a["name"])

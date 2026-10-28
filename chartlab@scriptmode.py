@@ -38,6 +38,15 @@ def account():
     return {k[len("CHARTLAB_"):].lower(): v for k, v in os.environ.items()
             if k.startswith("CHARTLAB_") and k not in ("CHARTLAB_OUT", "CHARTLAB_DATA", "CHARTLAB_PYTHON")}
 
+def order(symbol, side, qty, order_type="MARKET", price=None, product="INTRADAY", exchange="NSE"):
+    """Place an order on THIS account (multi-account mode). Paper unless the account is set to Live orders."""
+    a = account()
+    if not a:
+        raise RuntimeError("chartlab.order() needs an account: use Accounts -> Run script on multiple accounts")
+    import chartlab_dhan
+    return chartlab_dhan.place_order(a["client_id"], a["access_token"], symbol, side, qty, order_type, price,
+                                     product, exchange, live=a.get("live") == "1", tag=a["account"])
+
 def report(trades=None, equity=None, plots=None):
     import pandas as pd
     if trades is not None:
@@ -125,6 +134,7 @@ def prepare(df: pd.DataFrame | None) -> Path:
     d = Path(tempfile.mkdtemp(prefix="chartlab_run_"))
     (d / "chartlab.py").write_text(HELPER)
     (d / "_runner.py").write_text(RUNNER)
+    (d / "chartlab_dhan.py").write_text((Path(__file__).parent / "dhan_core.py").read_text())
     if df is not None:
         df.to_parquet(d / "data.parquet")
     return d
