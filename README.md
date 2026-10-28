@@ -2,6 +2,18 @@
 
 A native desktop (Qt) charting + backtesting app for Mac, TradingView-style, where **strategies are plain Python**.
 
+**Features:** candle / hollow / line / area charts with crosshair + price/date tags, drawing tools (trend line, ray,
+horizontal/vertical line, rectangle, Fib retracement, magnet snapping, saved per symbol), watchlist with live prices,
+1 / 2 / 4 chart layouts, Yahoo Finance + local CSV/Parquet + custom API providers, Python strategy editor with
+backtester, and a **Claude connector** (Claude can load symbols, write/run strategies, draw, take screenshots).
+
+## Let Claude control the app
+
+In ChartLab: menu **Claude -> Connect to Claude...** -> **Add to Claude Desktop**, then restart Claude Desktop.
+Claude then has tools such as `load_data`, `set_strategy`, `run_backtest`, `add_drawing`, `screenshot`.
+(The app starts automatically when Claude needs it. Only this computer can reach the link; a private token is
+created on every run; Claude can edit/run the strategy but cannot run arbitrary code.)
+
 ## Easiest: one Python file
 
 ```bash

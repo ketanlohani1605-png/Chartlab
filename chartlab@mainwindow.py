@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import logging
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -14,8 +17,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import backtest as bt
 from . import data as datamod
 from . import theme
-from .chart import ChartWidget, DateAxis
+from .chart import INDICATOR_KEYS, STYLES, DateAxis
+from .drawings import TOOL_LABELS
 from .editor import CodeEditor
+from .panel import ChartPanel
+from .watchlist import DEFAULT_WATCHLIST, WatchlistWidget
+
+log = logging.getLogger("chartlab")
 
 FALLBACK_STRATEGY = '''def strategy(df):
     fast = ta.sma(df["Close"], 20)
@@ -24,96 +32,200 @@ FALLBACK_STRATEGY = '''def strategy(df):
             "plot_SMA 20": fast, "plot_SMA 50": slow}
 '''
 
-INTERVALS = ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]
+INTERVALS = [("1m", "1m"), ("5m", "5m"), ("15m", "15m"), ("30m", "30m"), ("1h", "1h"),
+             ("1d", "1D"), ("1wk", "1W"), ("1mo", "1M")]
 RANGES = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
-INDICATORS = [("sma20", "SMA 20"), ("sma50", "SMA 50"), ("sma200", "SMA 200"),
-              ("ema20", "EMA 20"), ("ema50", "EMA 50"),
-              ("bb", "Bollinger Bands (20, 2)"), ("rsi", "RSI (14)  —  separate pane")]
+INDICATORS = {"sma20": "SMA 20", "sma50": "SMA 50", "sma200": "SMA 200", "ema20": "EMA 20", "ema50": "EMA 50",
+              "bb": "Bollinger Bands (20, 2)", "rsi": "RSI (14)  —  separate pane"}
+LAYOUTS = {"1": "Single chart", "2h": "Two charts — side by side", "2v": "Two charts — stacked",
+           "4": "Four charts"}
+LAYOUT_COUNT = {"1": 1, "2h": 2, "2v": 2, "4": 4}
+DRAW_BUTTONS = [("trend", "╱"), ("ray", "↗"), ("hline", "—"), ("vline", "|"),
+                ("rect", "▭"), ("fib", "φ")]
+STYLE_NAMES = {"candles": "Candles", "hollow": "Hollow candles", "line": "Line", "area": "Area"}
 
 
-class LoadWorker(QtCore.QThread):
-    done = QtCore.Signal(object, str)
-    failed = QtCore.Signal(str)
-
-    def __init__(self, fn, parent=None):
-        super().__init__(parent)
-        self.fn = fn
-
-    def run(self):
-        try:
-            df, label = self.fn()
-            self.done.emit(df, label)
-        except Exception as e:  # noqa: BLE001 - report anything to the UI
-            self.failed.emit(f"{type(e).__name__}: {e}")
+def _safe_key(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", text)
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, settings: QtCore.QSettings | None = None):
         super().__init__()
         self.setWindowTitle("ChartLab")
-        self.df = None
-        self.label = ""
-        self.result = None
-        self._worker = None
-        self.settings = QtCore.QSettings("ChartLab", "ChartLab")
+        self.settings = settings or QtCore.QSettings("ChartLab", "ChartLab")
+        self.layout_name = "1"
+        self.panels: list[ChartPanel] = []
+        self.active: ChartPanel | None = None
+        self.api = None
+        self._syncing = False
 
-        self.chart = ChartWidget()
-        self.setCentralWidget(self.chart)
+        self._build_central()
         self._build_toolbar()
+        self._build_draw_toolbar()
+        self._build_watchlist_dock()
         self._build_strategy_dock()
         self._build_results_dock()
         self._build_menu()
         self.setStatusBar(QtWidgets.QStatusBar())
+        self.api_label = QtWidgets.QLabel("")
+        self.statusBar().addPermanentWidget(self.api_label)
+        self._shortcuts()
         self._restore()
 
-    # ------------------------------------------------------------------ UI construction
+    # ------------------------------------------------------------------ construction
+    def _build_central(self):
+        self.central = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(self.central)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(2)
+        self.setCentralWidget(self.central)
+        for i in range(4):
+            p = ChartPanel(i)
+            p.activated.connect(self.set_active)
+            p.loadStarted.connect(self._on_load_started)
+            p.loadFinished.connect(self._on_loaded)
+            p.loadFailed.connect(self._on_load_failed)
+            p.drawingsChanged.connect(self._save_drawings)
+            p.toolChanged.connect(lambda panel, tool: self._tool_changed(tool))
+            self.panels.append(p)
+        self.active = self.panels[0]
+        self.active.set_active(True)
+
     def _build_toolbar(self):
         tb = self.addToolBar("Data")
         tb.setMovable(False)
-
         self.source = QtWidgets.QComboBox()
-        self.source.addItem("Yahoo Finance  —  NSE / BSE / US / crypto", "yahoo")
-        self.source.addItem("Local file  —  CSV / Parquet", "file")
+        self.source.addItem("Yahoo Finance", "yahoo")
+        self.source.addItem("Local file (CSV / Parquet)", "file")
         for name in datamod.list_providers():
-            self.source.addItem(f"Provider  —  {name}", f"provider:{name}")
+            self.source.addItem(f"Provider — {name}", f"provider:{name}")
         self.source.currentIndexChanged.connect(self._source_changed)
         tb.addWidget(self.source)
 
         self.symbol = QtWidgets.QLineEdit()
-        self.symbol.setPlaceholderText("RELIANCE, TCS, NIFTY, BSE:SBIN, US:AAPL, BTC-USD")
-        self.symbol.setFixedWidth(300)
+        self.symbol.setPlaceholderText("RELIANCE, NIFTY, BSE:SBIN, US:AAPL, BTC-USD")
+        self.symbol.setFixedWidth(250)
         self.symbol.returnPressed.connect(self.on_load)
         tb.addWidget(self.symbol)
 
-        self.interval = QtWidgets.QComboBox()
-        self.interval.addItems(INTERVALS)
+        self.interval_group = QtWidgets.QButtonGroup(self)
+        self.interval_btns = {}
+        for val, text in INTERVALS:
+            b = QtWidgets.QToolButton()
+            b.setText(text)
+            b.setCheckable(True)
+            b.setAutoRaise(True)
+            self.interval_group.addButton(b)
+            self.interval_btns[val] = b
+            b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
+            tb.addWidget(b)
+        self.interval_btns["1d"].setChecked(True)
+
         self.range = QtWidgets.QComboBox()
         self.range.addItems(RANGES)
-        tb.addWidget(self.interval)
+        self.range.setToolTip("How much history to load")
+        self.range.activated.connect(lambda *_: self.on_load())
         tb.addWidget(self.range)
 
         self.load_btn = QtWidgets.QPushButton("Load")
         self.load_btn.setObjectName("primary")
         self.load_btn.clicked.connect(self.on_load)
         tb.addWidget(self.load_btn)
-
         tb.addSeparator()
-        menu = QtWidgets.QMenu(self)
-        for key, text in INDICATORS:
-            act = menu.addAction(text)
-            act.setCheckable(True)
-            act.toggled.connect(lambda on, k=key: self.chart.set_indicator(k, on))
-        btn = QtWidgets.QToolButton()
-        btn.setText("Indicators")
-        btn.setMenu(menu)
-        btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-        tb.addWidget(btn)
+
+        ind_menu = QtWidgets.QMenu(self)
+        self.ind_actions = {}
+        for key, text in INDICATORS.items():
+            a = ind_menu.addAction(text)
+            a.setCheckable(True)
+            a.toggled.connect(lambda on, k=key: self._indicator_toggled(k, on))
+            self.ind_actions[key] = a
+        self._menu_button(tb, "Indicators", ind_menu)
+
+        style_menu = QtWidgets.QMenu(self)
+        self.style_group = QtGui.QActionGroup(self)
+        self.style_actions = {}
+        for key in STYLES:
+            a = style_menu.addAction(STYLE_NAMES[key])
+            a.setCheckable(True)
+            self.style_group.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: self._style_chosen(k))
+            self.style_actions[key] = a
+        self.style_actions["candles"].setChecked(True)
+        self._menu_button(tb, "Style", style_menu)
+
+        layout_menu = QtWidgets.QMenu(self)
+        self.layout_group = QtGui.QActionGroup(self)
+        self.layout_actions = {}
+        for key, text in LAYOUTS.items():
+            a = layout_menu.addAction(text)
+            a.setCheckable(True)
+            self.layout_group.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: self.set_layout(k))
+            self.layout_actions[key] = a
+        self.layout_actions["1"].setChecked(True)
+        self._menu_button(tb, "Layout", layout_menu)
+
+        latest = QtWidgets.QToolButton()
+        latest.setText("Latest ⇥")
+        latest.setToolTip("Scroll to the most recent bar")
+        latest.clicked.connect(lambda: self.active.chart.go_latest())
+        tb.addWidget(latest)
+
+    def _menu_button(self, tb, text, menu):
+        b = QtWidgets.QToolButton()
+        b.setText(text + " ▾")
+        b.setMenu(menu)
+        b.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(b)
+
+    def _build_draw_toolbar(self):
+        tb = QtWidgets.QToolBar("Drawing tools")
+        tb.setOrientation(QtCore.Qt.Orientation.Vertical)
+        tb.setMovable(False)
+        self.addToolBar(QtCore.Qt.ToolBarArea.LeftToolBarArea, tb)
+        self.draw_group = QtGui.QActionGroup(self)
+        self.draw_actions = {}
+        cur = tb.addAction("↖")
+        cur.setCheckable(True)
+        cur.setChecked(True)
+        cur.setToolTip("Cursor / select  (Esc)")
+        self.draw_group.addAction(cur)
+        cur.triggered.connect(lambda: self._tool_clicked(None))
+        self.draw_actions[None] = cur
+        for key, glyph in DRAW_BUTTONS:
+            a = tb.addAction(glyph)
+            a.setCheckable(True)
+            a.setToolTip(TOOL_LABELS[key])
+            self.draw_group.addAction(a)
+            a.triggered.connect(lambda _=False, k=key: self._tool_clicked(k))
+            self.draw_actions[key] = a
+        tb.addSeparator()
+        self.magnet_action = tb.addAction("\U0001f9f2")
+        self.magnet_action.setCheckable(True)
+        self.magnet_action.setChecked(True)
+        self.magnet_action.setToolTip("Magnet: snap drawings to candle open/high/low/close")
+        self.magnet_action.toggled.connect(self._magnet_toggled)
+        d = tb.addAction("⌫")
+        d.setToolTip("Delete selected drawing  (Delete)")
+        d.triggered.connect(lambda: self.active.chart.layer.delete_selected())
+        c = tb.addAction("\U0001f5d1")
+        c.setToolTip("Remove all drawings on this chart")
+        c.triggered.connect(lambda: self.active.chart.layer.clear())
+
+    def _build_watchlist_dock(self):
+        self.watchlist = WatchlistWidget()
+        self.watchlist.symbolChosen.connect(self._watchlist_chosen)
+        self.watchlist.changed.connect(self._save_watchlist)
+        self.watch_dock = QtWidgets.QDockWidget("Watchlist", self)
+        self.watch_dock.setWidget(self.watchlist)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.watch_dock)
 
     def _build_strategy_dock(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
         v.setContentsMargins(8, 8, 8, 8)
-
         row = QtWidgets.QHBoxLayout()
         self.templates = QtWidgets.QComboBox()
         self.templates.addItem("Load a template…", None)
@@ -160,8 +272,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_results_dock(self):
         self.tabs = QtWidgets.QTabWidget()
-
-        self.summary = QtWidgets.QTableWidget(0, 4)  # two metric columns side by side
+        self.summary = QtWidgets.QTableWidget(0, 4)
         self.summary.horizontalHeader().setVisible(False)
         self.summary.verticalHeader().setVisible(False)
         self.summary.verticalHeader().setDefaultSectionSize(30)
@@ -187,15 +298,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.equity_plot.addLegend(offset=(10, 10))
         self.tabs.addTab(self.equity_plot, "Equity curve")
 
-        self.log = QtWidgets.QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.tabs.addTab(self.log, "Log")
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.tabs.addTab(self.log_view, "Log")
 
         self.results_dock = QtWidgets.QDockWidget("Backtest results", self)
         self.results_dock.setWidget(self.tabs)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
-        self.resizeDocks([self.strategy_dock], [520], QtCore.Qt.Orientation.Horizontal)
-        self.resizeDocks([self.results_dock], [290], QtCore.Qt.Orientation.Vertical)
+        self.resizeDocks([self.strategy_dock], [480], QtCore.Qt.Orientation.Horizontal)
+        self.resizeDocks([self.watch_dock], [250], QtCore.Qt.Orientation.Horizontal)
+        self.resizeDocks([self.results_dock], [260], QtCore.Qt.Orientation.Vertical)
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -203,6 +315,8 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addAction("Open data file…", self.open_data_file, QtGui.QKeySequence("Ctrl+O"))
         f.addAction("Open strategy…", self.open_strategy)
         f.addAction("Save strategy…", self.save_strategy, QtGui.QKeySequence("Ctrl+S"))
+        f.addAction("Export trades to CSV…", self.export_trades)
+        f.addAction("Save chart image…", self.save_chart_image)
         f.addSeparator()
         f.addAction("Quit", self.close, QtGui.QKeySequence("Ctrl+Q"))
         s = mb.addMenu("Strategy")
@@ -211,15 +325,31 @@ class MainWindow(QtWidgets.QMainWindow):
         run.triggered.connect(self.run_backtest)
         s.addAction(run)
         v = mb.addMenu("View")
+        v.addAction(self.watch_dock.toggleViewAction())
         v.addAction(self.strategy_dock.toggleViewAction())
         v.addAction(self.results_dock.toggleViewAction())
+        c = mb.addMenu("Claude")
+        c.addAction("Connect to Claude…", self.show_connect_dialog)
+
+    def _shortcuts(self):
+        for key in ("Delete", "Backspace"):
+            QtGui.QShortcut(QtGui.QKeySequence(key), self,
+                            activated=lambda: self.active.chart.layer.delete_selected())
+        QtGui.QShortcut(QtGui.QKeySequence("Escape"), self, activated=self._escape)
+
+    def _escape(self):
+        self.active.chart.layer.cancel()
+        self._tool_changed(None)
 
     # ------------------------------------------------------------------ settings
     def _restore(self):
         st = self.settings
+        self.watchlist.set_symbols(WatchlistWidget.loads(st.value("watchlist", "")))
         self.symbol.setText(st.value("symbol", "RELIANCE"))
-        self.interval.setCurrentText(st.value("interval", "1d"))
         self.range.setCurrentText(st.value("range", "2y"))
+        iv = st.value("interval", "1d")
+        if iv in self.interval_btns:
+            self.interval_btns[iv].setChecked(True)
         i = self.source.findData(st.value("source", "yahoo"))
         self.source.setCurrentIndex(max(i, 0))
         code = st.value("strategy", "")
@@ -227,6 +357,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f = datamod.ROOT / "strategies" / "sma_cross.py"
             code = f.read_text() if f.exists() else FALLBACK_STRATEGY
         self.editor.setPlainText(code)
+        self.set_layout(st.value("layout", "1"))
         geo = st.value("geometry")
         if geo:
             self.restoreGeometry(geo)
@@ -235,21 +366,148 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, e):
         st = self.settings
         st.setValue("symbol", self.symbol.text())
-        st.setValue("interval", self.interval.currentText())
+        st.setValue("interval", self._current_interval())
         st.setValue("range", self.range.currentText())
         st.setValue("source", self.source.currentData())
         st.setValue("strategy", self.editor.toPlainText())
+        st.setValue("layout", self.layout_name)
         st.setValue("geometry", self.saveGeometry())
+        self._save_watchlist()
+        if self.api is not None:
+            self.api.stop()
         super().closeEvent(e)
 
-    # ------------------------------------------------------------------ data loading
+    def _save_watchlist(self):
+        self.settings.setValue("watchlist", WatchlistWidget.dumps(self.watchlist.symbols()))
+
+    def _drawings_key(self, panel):
+        return "drawings/" + _safe_key(panel.symbol_key)
+
+    def _save_drawings(self, panel):
+        self.settings.setValue(self._drawings_key(panel), json.dumps(panel.chart.layer.to_json()))
+
+    def _load_drawings(self, panel):
+        raw = self.settings.value(self._drawings_key(panel), "")
+        try:
+            panel.chart.layer.load_json(json.loads(raw) if raw else [])
+        except Exception:  # noqa: BLE001
+            panel.chart.layer.load_json([])
+
+    # ------------------------------------------------------------------ layout & active panel
+    def set_layout(self, name: str):
+        if name not in LAYOUTS:
+            name = "1"
+        self.layout_name = name
+        self.layout_actions[name].setChecked(True)
+        n = LAYOUT_COUNT[name]
+        pos = {"1": [(0, 0)], "2h": [(0, 0), (0, 1)], "2v": [(0, 0), (1, 0)],
+               "4": [(0, 0), (0, 1), (1, 0), (1, 1)]}[name]
+        for i, p in enumerate(self.panels):
+            self.grid.removeWidget(p)
+            if i < n:
+                self.grid.addWidget(p, *pos[i])
+                p.show()
+                if p.df is None and not p.loading and i > 0 and self.isVisible():
+                    self._autoload_extra(p, i)
+            else:
+                p.hide()
+        if self.active not in self.panels[:n]:
+            self.set_active(self.panels[0])
+
+    def _autoload_extra(self, panel, idx):
+        syms = self.watchlist.symbols()
+        sym = syms[idx % len(syms)] if syms else "NIFTY"
+        a = self.active.params
+        src = a["source"] if a["source"] != "file" else "yahoo"
+        panel.load(src, sym, a["interval"], a["range"])
+
+    def set_active(self, panel):
+        if panel is self.active and panel.isVisible():
+            self._sync_toolbar()
+            return
+        if self.active is not None:
+            self.active.set_active(False)
+        self.active = panel
+        panel.set_active(True)
+        self._sync_toolbar()
+        self._show_result(panel)
+
+    def _current_interval(self) -> str:
+        for v, b in self.interval_btns.items():
+            if b.isChecked():
+                return v
+        return "1d"
+
+    def _sync_toolbar(self):
+        p = self.active
+        self._syncing = True
+        try:
+            prm = p.params
+            self.symbol.setText(prm["symbol"] if prm["source"] != "file" else self.symbol.text())
+            i = self.source.findData(prm["source"])
+            if i >= 0:
+                self.source.setCurrentIndex(i)
+            self.range.setCurrentText(prm["range"])
+            if prm["interval"] in self.interval_btns:
+                self.interval_btns[prm["interval"]].setChecked(True)
+            for k, a in self.ind_actions.items():
+                a.setChecked(k in p.chart._enabled)
+            self.style_actions[p.chart.style].setChecked(True)
+            self.magnet_action.setChecked(p.chart.magnet)
+            tool = p.chart.layer.tool
+            self.draw_actions.get(tool, self.draw_actions[None]).setChecked(True)
+        finally:
+            self._syncing = False
+        self._source_changed()
+
+    # ------------------------------------------------------------------ toolbar handlers
     def _source_changed(self, *_):
         is_file = self.source.currentData() == "file"
-        for w in (self.symbol, self.interval, self.range):
+        for w in [self.symbol, self.range, *self.interval_btns.values()]:
             w.setEnabled(not is_file)
         self.load_btn.setText("Open file…" if is_file else "Load")
 
-    def on_load(self, silent=False):
+    def _interval_clicked(self, val: str):
+        if self._syncing:
+            return
+        if self.source.currentData() != "file":
+            self.on_load()
+
+    def _indicator_toggled(self, key, on):
+        if not self._syncing:
+            self.active.chart.set_indicator(key, on)
+
+    def _style_chosen(self, key):
+        if not self._syncing:
+            self.active.chart.set_style(key)
+
+    def _magnet_toggled(self, on):
+        for p in self.panels:
+            p.chart.magnet = on
+
+    def _tool_clicked(self, tool):
+        if self._syncing:
+            return
+        for p in self.panels:
+            if p is not self.active:
+                p.chart.layer.set_tool(None)
+        self.active.chart.layer.set_tool(tool)
+
+    def _tool_changed(self, tool):
+        self._syncing = True
+        try:
+            self.draw_actions.get(tool, self.draw_actions[None]).setChecked(True)
+        finally:
+            self._syncing = False
+
+    def _watchlist_chosen(self, sym: str):
+        self.symbol.setText(sym)
+        if self.source.currentData() == "file":
+            self.source.setCurrentIndex(self.source.findData("yahoo"))
+        self.on_load()
+
+    # ------------------------------------------------------------------ data loading
+    def on_load(self):
         src = self.source.currentData()
         if src == "file":
             self.open_data_file()
@@ -258,13 +516,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not sym:
             self.statusBar().showMessage("Type a symbol first")
             return
-        interval, rng = self.interval.currentText(), self.range.currentText()
-        if src == "yahoo":
-            fn = lambda: datamod.load_yahoo(sym, interval, rng)  # noqa: E731
-        else:
-            name = src.split(":", 1)[1]
-            fn = lambda: datamod.load_provider(name, sym, interval, rng)  # noqa: E731
-        self._start_load(fn, silent)
+        self.load_into(self.active, src, sym, self._current_interval(), self.range.currentText())
+
+    def load_into(self, panel, source, symbol, interval, rng, path=""):
+        panel.load(source, symbol, interval, rng, path)
 
     def open_data_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -272,32 +527,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         self.source.setCurrentIndex(self.source.findData("file"))
-        self._start_load(lambda: datamod.load_file(path), False)
+        self.load_into(self.active, "file", Path(path).stem, "1d", "max", path)
 
-    def _start_load(self, fn, silent=False):
-        self.load_btn.setEnabled(False)
-        self.statusBar().showMessage("Loading…")
-        self._worker = LoadWorker(fn, self)
-        self._worker.done.connect(self._on_loaded)
-        self._worker.failed.connect(lambda msg: self._on_load_failed(msg, silent))
-        self._worker.start()
+    def _on_load_started(self, panel):
+        if panel is self.active:
+            self.load_btn.setEnabled(False)
+        self.statusBar().showMessage(f"Loading {panel.params['symbol']}…")
 
-    def _on_loaded(self, df, label):
+    def _on_loaded(self, panel):
         self.load_btn.setEnabled(True)
-        self.df, self.label, self.result = df, label, None
-        self.chart.set_data(df, label)
-        self.summary.setRowCount(0)
-        self.trades_tbl.setRowCount(0)
-        self.equity_plot.clear()
+        self._load_drawings(panel)
+        df = panel.df
         self.statusBar().showMessage(
-            f"{label}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} → {df.index[-1]:%d %b %Y}")
+            f"{panel.label}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} → {df.index[-1]:%d %b %Y}")
+        if panel is self.active:
+            self._sync_toolbar()
+            self._show_result(panel)
 
-    def _on_load_failed(self, msg, silent):
+    def _on_load_failed(self, panel, msg):
         self.load_btn.setEnabled(True)
         self.statusBar().showMessage(msg)
-        self._log(msg)
-        if not silent:
-            QtWidgets.QMessageBox.warning(self, "Could not load data", msg)
+        self.add_log(f"[load {panel.params['symbol']}] {msg}")  # never a modal dialog: it would freeze the app
 
     # ------------------------------------------------------------------ strategy files
     def _template_chosen(self, idx):
@@ -319,43 +569,84 @@ class MainWindow(QtWidgets.QMainWindow):
             Path(path).write_text(self.editor.toPlainText())
             self.statusBar().showMessage(f"Saved {path}")
 
+    def export_trades(self):
+        res = self.active.result
+        if res is None or res.trades.empty:
+            self.statusBar().showMessage("Run a backtest with at least one trade first")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export trades", str(Path.home() / "trades.csv"), "CSV (*.csv)")
+        if path:
+            res.trades.drop(columns=["entry_idx", "exit_idx"]).to_csv(path, index=False)
+            self.statusBar().showMessage(f"Exported {len(res.trades)} trades to {path}")
+
+    def save_chart_image(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save chart image", str(Path.home() / "chart.png"), "PNG (*.png)")
+        if path:
+            self.active.grab().save(path)
+
+    def strategy_code(self) -> str:
+        return self.editor.toPlainText()
+
+    def set_strategy_code(self, code: str):
+        self.editor.setPlainText(code)
+
     # ------------------------------------------------------------------ backtest
-    def _log(self, text):
-        self.log.appendPlainText(text.rstrip())
+    def add_log(self, text: str):
+        if text:
+            self.log_view.appendPlainText(text.rstrip())
 
     def run_backtest(self):
-        if self.df is None:
-            self.statusBar().showMessage("Load some data first")
-            return
+        r = self.run_backtest_on(self.active)
+        if not r["ok"]:
+            self.statusBar().showMessage(r["error"].splitlines()[-1] if r["error"] else "Backtest failed")
+            self.tabs.setCurrentWidget(self.log_view)
+
+    def run_backtest_on(self, panel, capital: float | None = None, fee: float | None = None) -> dict:
+        if panel.df is None:
+            return {"ok": False, "error": "No data loaded in this chart yet", "log": ""}
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                sig = bt.run_user_strategy(self.editor.toPlainText(), self.df)
-            res = bt.backtest(self.df, sig.buy, sig.sell, self.capital.value(), self.fee.value())
+                sig = bt.run_user_strategy(self.strategy_code(), panel.df)
+            res = bt.backtest(panel.df, sig.buy, sig.sell,
+                              capital if capital is not None else self.capital.value(),
+                              fee if fee is not None else self.fee.value())
         except Exception:  # noqa: BLE001 - show user-code errors in the Log tab
-            self._log(buf.getvalue() + traceback.format_exc())
-            self.tabs.setCurrentWidget(self.log)
-            self.statusBar().showMessage("Strategy error — see the Log tab")
-            return
-
+            err = traceback.format_exc()
+            self.add_log(buf.getvalue() + err)
+            return {"ok": False, "error": err, "log": buf.getvalue()}
         if buf.getvalue():
-            self._log(buf.getvalue())
-        self.result = res
-        self.chart.set_strategy_overlays(sig.overlays)
-        self.chart.set_trades(res.trades)
-        self._fill_summary(res)
-        self._fill_trades(res.trades)
-        self._fill_equity(res)
-        self.tabs.setCurrentWidget(self.summary)
+            self.add_log(buf.getvalue())
+        panel.result, panel.signals = res, sig
+        panel.chart.set_strategy_overlays(sig.overlays)
+        panel.chart.set_trades(res.trades)
+        if panel is self.active:
+            self._show_result(panel)
+            self.tabs.setCurrentWidget(self.summary)
         m = res.metrics
         self.statusBar().showMessage(
-            f"Backtest: {m['trades']} trades, net {m['total_return'] * 100:+.2f}% "
+            f"Backtest ({panel.params['symbol']}): {m['trades']} trades, net {m['total_return'] * 100:+.2f}% "
             f"(buy & hold {m['buy_hold'] * 100:+.2f}%), max drawdown {m['max_drawdown'] * 100:.2f}%")
+        return {"ok": True, "result": res, "log": buf.getvalue()}
+
+    def _show_result(self, panel):
+        res = panel.result
+        if res is None:
+            self.summary.setRowCount(0)
+            self.trades_tbl.setRowCount(0)
+            self.equity_plot.clear()
+            return
+        self._fill_summary(res)
+        self._fill_trades(res.trades, panel)
+        self._fill_equity(res, panel)
 
     def _fill_summary(self, res):
         rows = bt.format_metrics(res.metrics)
         half = (len(rows) + 1) // 2
         self.summary.setRowCount(half)
+        self.summary.clearContents()
         for n, (k, v) in enumerate(rows):
             r, c = n % half, 0 if n < half else 2
             ki, vi = QtWidgets.QTableWidgetItem(k), QtWidgets.QTableWidgetItem(v)
@@ -365,8 +656,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.summary.setItem(r, c, ki)
             self.summary.setItem(r, c + 1, vi)
 
-    def _fill_trades(self, trades):
-        intraday = self.chart.axes[0].intraday
+    def _fill_trades(self, trades, panel):
+        intraday = panel.chart.axes[0].intraday
         tf = "%d %b %y %H:%M" if intraday else "%d %b %Y"
         self.trades_tbl.setRowCount(len(trades))
         for r, t in enumerate(trades.itertuples(index=False)):
@@ -379,27 +670,58 @@ class MainWindow(QtWidgets.QMainWindow):
                     item.setForeground(QtGui.QColor(theme.UP if t.pnl >= 0 else theme.DOWN))
                 self.trades_tbl.setItem(r, c, item)
 
-    def _fill_equity(self, res):
-        self.equity_axis.set_index(self.df.index)
+    def _fill_equity(self, res, panel):
+        self.equity_axis.set_index(panel.df.index)
         self.equity_plot.clear()
         x = np.arange(len(res.equity))
         self.equity_plot.plot(x, res.buy_hold.to_numpy(), pen=pg.mkPen(theme.MUTED, width=1.2), name="Buy & hold")
         self.equity_plot.plot(x, res.equity.to_numpy(), pen=pg.mkPen(theme.ACCENT, width=2), name="Strategy")
 
     def _trade_clicked(self, row, _col):
-        if self.result is None or row >= len(self.result.trades):
+        res = self.active.result
+        if res is None or row >= len(res.trades):
             return
-        t = self.result.trades.iloc[row]
-        self.chart.focus_range(t.entry_idx - 25, t.exit_idx + 25)
+        t = res.trades.iloc[row]
+        self.active.chart.focus_range(t.entry_idx - 25, t.exit_idx + 25)
+
+    # ------------------------------------------------------------------ Claude connection
+    def show_connect_dialog(self):
+        from .connect_dialog import ConnectDialog
+        ConnectDialog(self).exec()
+
+
+def _setup_logging():
+    d = datamod.USER_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(filename=str(d / "chartlab.log"), level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    def hook(exc_type, exc, tb):
+        logging.error("Uncaught exception", exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
 
 
 def main():
+    _setup_logging()
     theme.apply_pg_config()
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("ChartLab")
     app.setStyleSheet(theme.STYLESHEET)
     win = MainWindow()
-    win.resize(1560, 940)
+    win.resize(1680, 980)
     win.show()
-    QtCore.QTimer.singleShot(300, lambda: win.on_load(silent=True))
+    try:
+        from .api import ApiServer
+        win.api = ApiServer(win)
+        win.api.start()
+        win.api_label.setText(f"Claude link: ON (port {win.api.port})  ")
+    except Exception as e:  # noqa: BLE001 - the app must still work without the API
+        logging.exception("API server failed")
+        win.api_label.setText("Claude link: off  ")
+        win.add_log(f"Claude link could not start: {e}")
+    QtCore.QTimer.singleShot(300, win.on_load)
+    if win.source.currentData() == "yahoo":
+        QtCore.QTimer.singleShot(2500, win.watchlist.refresh)
     sys.exit(app.exec())

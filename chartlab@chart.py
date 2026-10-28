@@ -1,4 +1,5 @@
-"""TradingView-style chart: candlesticks, volume, RSI pane, overlays, crosshair, trade markers."""
+"""TradingView-style chart: candles / hollow / line / area, volume, RSI pane, overlays,
+crosshair with price+date tags, last-price tag, drawing tools and trade markers."""
 from __future__ import annotations
 
 import numpy as np
@@ -8,23 +9,28 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import indicators as ta
 from . import theme
+from .drawings import DrawingLayer
 
 _QWIDGETSIZE_MAX = 16777215
+STYLES = ["candles", "hollow", "line", "area"]
+INDICATOR_KEYS = ["sma20", "sma50", "sma200", "ema20", "ema50", "bb", "rsi"]
 
 
 class CandlestickItem(pg.GraphicsObject):
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, style: str = "candles"):
         super().__init__()
         self.picture = QtGui.QPicture()
-        self.set_data(df)
+        self.set_data(df, style)
 
-    def set_data(self, df: pd.DataFrame):
+    def set_data(self, df: pd.DataFrame, style: str = "candles"):
         o, h, l, c = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
         pic = QtGui.QPicture()
         p = QtGui.QPainter(pic)
         w = 0.36
+        hollow = style == "hollow"
         pens = {True: pg.mkPen(theme.UP), False: pg.mkPen(theme.DOWN)}
-        brushes = {True: pg.mkBrush(theme.UP), False: pg.mkBrush(theme.DOWN)}
+        brushes = {True: QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush) if hollow else pg.mkBrush(theme.UP),
+                   False: pg.mkBrush(theme.DOWN)}
         for i in range(len(o)):
             up = c[i] >= o[i]
             p.setPen(pens[up])
@@ -73,17 +79,30 @@ class DateAxis(pg.AxisItem):
         return out
 
 
+def _tag(anchor, fill: str) -> pg.TextItem:
+    t = pg.TextItem(anchor=anchor, color="#ffffff", fill=pg.mkBrush(fill))
+    t.setZValue(100)
+    return t
+
+
 class ChartWidget(QtWidgets.QWidget):
+    activated = QtCore.Signal()
+    toolChanged = QtCore.Signal(object)
+    drawingsChanged = QtCore.Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.df: pd.DataFrame | None = None
         self.label = ""
+        self.style = "candles"
+        self.magnet = True
         self._enabled: set[str] = set()
-        self._ind_items: dict[str, list] = {}      # key -> [(plot, item, legend_name|None)]
-        self._strategy_items: list = []             # [(item, name)]
+        self._ind_items: dict[str, list] = {}
+        self._strategy_items: list = []
         self._marker_items: list = []
-        self.candles = None
-        self.volbars = None
+        self.candles = self.volbars = self.line_item = None
+        self._times = np.array([])
+        self._lows = self._highs = self._vols = np.array([])
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -117,8 +136,31 @@ class ChartWidget(QtWidgets.QWidget):
         except TypeError:  # older pyqtgraph
             self.legend = self.price.addLegend(offset=(10, 10))
 
+        # tags: last price, crosshair price (per pane) and crosshair date
+        self.last_tag = _tag((1, 0.5), theme.UP)
+        self.price.addItem(self.last_tag, ignoreBounds=True)
+        self.last_tag.hide()
+        self.last_line = pg.InfiniteLine(angle=0, movable=False,
+                                         pen=pg.mkPen(theme.UP, style=QtCore.Qt.PenStyle.DotLine))
+        self.price.addItem(self.last_line, ignoreBounds=True)
+        self.last_line.hide()
+        for p in (self.price, self.vol, self.rsi):
+            p.ytag = _tag((1, 0.5), "#363a45")
+            p.addItem(p.ytag, ignoreBounds=True)
+            p.ytag.hide()
+        for p in (self.vol, self.rsi):
+            p.dtag = _tag((0.5, 1), "#363a45")
+            p.addItem(p.dtag, ignoreBounds=True)
+            p.dtag.hide()
+
+        self.layer = DrawingLayer(self)
+        self.layer.changed.connect(self.drawingsChanged)
+
         self.price.vb.sigXRangeChanged.connect(self._autoscale)
+        self.price.vb.sigRangeChanged.connect(lambda *_: self._place_last_tag())
         self.glw.scene().sigMouseMoved.connect(self._mouse_moved)
+        self.glw.scene().sigMouseClicked.connect(self._mouse_clicked)
+        self.glw.viewport().installEventFilter(self)
 
     # ------------------------------------------------------------------ construction helpers
     def _make_plot(self, row: int) -> pg.PlotItem:
@@ -133,7 +175,7 @@ class ChartWidget(QtWidgets.QWidget):
         for name in ("bottom", "right"):
             p.getAxis(name).setPen(pg.mkPen(theme.GRID))
             p.getAxis(name).setTextPen(pg.mkPen(theme.TEXT))
-        p.showGrid(x=True, y=True, alpha=0.12)
+        p.showGrid(x=True, y=True, alpha=0.10)
         p.vb.setMouseEnabled(x=True, y=False)
         dash = pg.mkPen(theme.MUTED, style=QtCore.Qt.PenStyle.DashLine)
         p.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
@@ -142,6 +184,11 @@ class ChartWidget(QtWidgets.QWidget):
         p.addItem(p.hline, ignoreBounds=True)
         p.hline.hide()
         return p
+
+    def eventFilter(self, obj, ev):
+        if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.MouseButtonPress:
+            self.activated.emit()
+        return super().eventFilter(obj, ev)
 
     def _set_rsi_visible(self, on: bool):
         grid = self.glw.ci.layout
@@ -153,6 +200,61 @@ class ChartWidget(QtWidgets.QWidget):
             grid.setRowFixedHeight(2, 0)
         self.vol.getAxis("bottom").setStyle(showValues=not on)
 
+    def _bottom_plot(self):
+        return self.rsi if self.rsi.isVisible() else self.vol
+
+    # ------------------------------------------------------------------ coordinate helpers (used by drawings)
+    def has_data(self) -> bool:
+        return self.df is not None and len(self._times) > 1
+
+    def x_limit(self) -> float:
+        return len(self._times) + 80
+
+    def y_range(self):
+        return self.price.vb.viewRange()[1]
+
+    def time_to_x(self, ts: float) -> float:
+        t, n = self._times, len(self._times)
+        if n < 2:
+            return 0.0
+        if ts <= t[0]:
+            return (ts - t[0]) / max(t[1] - t[0], 1)
+        if ts >= t[-1]:
+            return n - 1 + (ts - t[-1]) / max(t[-1] - t[-2], 1)
+        i = int(np.searchsorted(t, ts))
+        return i - 1 + (ts - t[i - 1]) / max(t[i] - t[i - 1], 1)
+
+    def x_to_time(self, x: float) -> float:
+        t, n = self._times, len(self._times)
+        if n < 2:
+            return 0.0
+        if x <= 0:
+            return float(t[0] + x * (t[1] - t[0]))
+        if x >= n - 1:
+            return float(t[-1] + (x - (n - 1)) * (t[-1] - t[-2]))
+        i = int(np.floor(x))
+        return float(t[i] + (x - i) * (t[i + 1] - t[i]))
+
+    def set_cursor_for_tool(self, on: bool):
+        self.glw.viewport().setCursor(QtCore.Qt.CursorShape.CrossCursor if on
+                                      else QtCore.Qt.CursorShape.ArrowCursor)
+
+    def snap(self, x: float, y: float):
+        """Magnet: snap to the nearest O/H/L/C of the bar under the cursor if close enough."""
+        n = len(self._lows)
+        if not self.magnet or n == 0:
+            return x, y
+        i = int(min(max(round(x), 0), n - 1))
+        r = self.df.iloc[i]
+        vb = self.price.vb
+        py = vb.mapViewToScene(QtCore.QPointF(x, y)).y()
+        best, best_d = None, 16.0
+        for v in (r["Open"], r["High"], r["Low"], r["Close"]):
+            d = abs(vb.mapViewToScene(QtCore.QPointF(x, float(v))).y() - py)
+            if d < best_d:
+                best, best_d = float(v), d
+        return (float(i), best) if best is not None else (x, y)
+
     # ------------------------------------------------------------------ data
     def set_data(self, df: pd.DataFrame, label: str = ""):
         self._wipe()
@@ -160,9 +262,13 @@ class ChartWidget(QtWidgets.QWidget):
         n = len(df)
         for a in self.axes:
             a.set_index(df.index)
+        self._times = df.index.to_numpy().astype("datetime64[s]").astype("int64").astype(float)
 
-        self.candles = CandlestickItem(df)
+        self.candles = CandlestickItem(df, self.style)
         self.price.addItem(self.candles)
+        close = df["Close"].to_numpy(float)
+        self.line_item = pg.PlotDataItem(x=np.arange(n), y=close, pen=pg.mkPen(theme.ACCENT, width=2))
+        self.price.addItem(self.line_item)
 
         up = (df["Close"] >= df["Open"]).to_numpy()
         b_up, b_dn = pg.mkBrush(38, 166, 154, 140), pg.mkBrush(239, 83, 80, 140)
@@ -174,6 +280,7 @@ class ChartWidget(QtWidgets.QWidget):
         self._lows = df["Low"].to_numpy(float)
         self._highs = df["High"].to_numpy(float)
         self._vols = df["Volume"].to_numpy(float)
+        self._apply_style()
 
         for key in list(self._enabled):
             self._build_indicator(key)
@@ -181,18 +288,48 @@ class ChartWidget(QtWidgets.QWidget):
 
         for p in (self.price, self.vol, self.rsi):
             p.vb.setLimits(xMin=-5, xMax=n + 80, minXRange=8)
-        self.price.setXRange(max(-2, n - 160), n + 6, padding=0)
-        self._autoscale()
+        self.layer.rebuild()
+        self.go_latest()
+        self._update_last_tag()
         self._update_header(n - 1)
 
+    def go_latest(self):
+        n = len(self._lows)
+        if n:
+            self.price.setXRange(max(-2, n - 160), n + 6, padding=0)
+            self._autoscale()
+
     def _wipe(self):
-        for item, plot in ((self.candles, self.price), (self.volbars, self.vol)):
+        for item, plot in ((self.candles, self.price), (self.line_item, self.price), (self.volbars, self.vol)):
             if item is not None:
                 plot.removeItem(item)
-        self.candles = self.volbars = None
+        self.candles = self.volbars = self.line_item = None
         for key in list(self._ind_items):
             self._remove_indicator(key)
         self.clear_strategy()
+        self.layer.clear_silent()
+
+    # ------------------------------------------------------------------ style
+    def set_style(self, style: str):
+        if style not in STYLES:
+            return
+        self.style = style
+        if self.df is not None:
+            self._apply_style()
+
+    def _apply_style(self):
+        if self.candles is None:
+            return
+        is_candle = self.style in ("candles", "hollow")
+        if is_candle:
+            self.candles.set_data(self.df, self.style)
+        self.candles.setVisible(is_candle)
+        self.line_item.setVisible(not is_candle)
+        if self.style == "area":
+            self.line_item.setFillLevel(float(np.nanmin(self._lows)))
+            self.line_item.setBrush(pg.mkBrush(41, 98, 255, 55))
+        else:
+            self.line_item.setFillLevel(None)
 
     # ------------------------------------------------------------------ indicators
     def set_indicator(self, key: str, on: bool):
@@ -212,7 +349,7 @@ class ChartWidget(QtWidgets.QWidget):
             return
         c = self.df["Close"]
         L = theme.LINE_COLORS
-        lines = []  # (plot, series, colour, name)
+        lines = []
         if key == "sma20":
             lines = [(self.price, ta.sma(c, 20), L[0], "SMA 20")]
         elif key == "sma50":
@@ -252,7 +389,7 @@ class ChartWidget(QtWidgets.QWidget):
     def _rebuild_legend(self):
         try:
             self.legend.clear()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return
         for items in self._ind_items.values():
             for _, item, name in items:
@@ -304,7 +441,7 @@ class ChartWidget(QtWidgets.QWidget):
     def focus_range(self, x0: float, x1: float):
         self.price.setXRange(x0, x1, padding=0)
 
-    # ------------------------------------------------------------------ interaction
+    # ------------------------------------------------------------------ view / tags
     def _autoscale(self, *_):
         if self.df is None:
             return
@@ -319,6 +456,26 @@ class ChartWidget(QtWidgets.QWidget):
         vmax = float(np.nanmax(self._vols[lo:hi]))
         self.vol.vb.setYRange(0, max(vmax * 1.15, 1.0), padding=0)
         self.rsi.vb.setYRange(0, 100, padding=0)
+        self._place_last_tag()
+
+    def _update_last_tag(self):
+        if self.df is None or len(self.df) == 0:
+            return
+        last, prev = float(self.df["Close"].iloc[-1]), float(self.df["Open"].iloc[-1])
+        color = theme.UP if last >= prev else theme.DOWN
+        self.last_tag.fill = pg.mkBrush(color)
+        self.last_tag.setText(f" {last:,.2f} ")
+        self.last_line.setPen(pg.mkPen(color, style=QtCore.Qt.PenStyle.DotLine))
+        self.last_line.setPos(last)
+        self.last_tag.show()
+        self.last_line.show()
+        self._place_last_tag()
+
+    def _place_last_tag(self):
+        if self.df is None or not self.last_tag.isVisible():
+            return
+        xr = self.price.vb.viewRange()[0][1]
+        self.last_tag.setPos(xr, float(self.df["Close"].iloc[-1]))
 
     def _mouse_moved(self, pos):
         if self.df is None:
@@ -326,15 +483,45 @@ class ChartWidget(QtWidgets.QWidget):
         plots = (self.price, self.vol, self.rsi)
         hovered = next((p for p in plots if p.isVisible() and p.sceneBoundingRect().contains(pos)), None)
         if hovered is None:
+            for p in plots:
+                p.ytag.hide()
+            self.vol.dtag.hide()
+            self.rsi.dtag.hide()
             return
         mp = hovered.vb.mapSceneToView(pos)
+        i = int(round(mp.x()))
         for p in plots:
             p.vline.setPos(mp.x())
             p.hline.setVisible(p is hovered)
+            p.ytag.setVisible(p is hovered)
         hovered.hline.setPos(mp.y())
-        i = int(round(mp.x()))
+        xr = hovered.vb.viewRange()[0][1]
+        hovered.ytag.setText(f" {mp.y():,.2f} ")
+        hovered.ytag.setPos(xr, mp.y())
         if 0 <= i < len(self.df):
             self._update_header(i)
+            fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
+            bp = self._bottom_plot()
+            other = self.vol if bp is self.rsi else self.rsi
+            other.dtag.hide()
+            bp.dtag.setText(f" {self.df.index[i].strftime(fmt)} ")
+            bp.dtag.setPos(mp.x(), bp.vb.viewRange()[1][0])
+            bp.dtag.show()
+        else:
+            self.vol.dtag.hide()
+            self.rsi.dtag.hide()
+        if hovered is self.price:
+            x, y = (self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y()))
+            self.layer.handle_move(x, y)
+
+    def _mouse_clicked(self, ev):
+        if self.df is None or ev.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        if not self.price.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        mp = self.price.vb.mapSceneToView(ev.scenePos())
+        x, y = self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y())
+        self.layer.handle_click(x, y)
 
     def _update_header(self, i: int):
         df = self.df
@@ -344,7 +531,7 @@ class ChartWidget(QtWidgets.QWidget):
         col = theme.UP if r["Close"] >= r["Open"] else theme.DOWN
         fmt = "%a %d %b %Y %H:%M" if self.axes[0].intraday else "%a %d %b %Y"
         ts = df.index[i].strftime(fmt)
-        v = lambda x: f"<span style='color:{col}'>{x:,.2f}</span>"
+        v = lambda x: f"<span style='color:{col}'>{x:,.2f}</span>"  # noqa: E731
         self.header.setText(
             f"<b>{self.label}</b> &nbsp; <span style='color:{theme.MUTED}'>{ts}</span> &nbsp; "
             f"O {v(r['Open'])} &nbsp; H {v(r['High'])} &nbsp; L {v(r['Low'])} &nbsp; C {v(r['Close'])} "

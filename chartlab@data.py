@@ -153,10 +153,27 @@ def load_yahoo(symbol: str, interval: str = "1d", period: str = "2y") -> tuple[p
         raise ImportError("yfinance is not installed. Run: pip install yfinance") from e
     sym = normalize_symbol(symbol)
     period = clamp_period(interval, period)
-    raw = yf.Ticker(sym).history(period=period, interval=interval, auto_adjust=True)
-    if raw is None or raw.empty:
-        raise ValueError(f"No data returned for '{sym}' ({interval}, {period}). Check the symbol / internet.")
-    return standardise(raw), f"{sym} · {interval}"
+    cache = _cache_file(sym, interval, period)
+    try:
+        raw = yf.Ticker(sym).history(period=period, interval=interval, auto_adjust=True)
+        if raw is None or raw.empty:
+            raise ValueError(f"No data returned for '{sym}' ({interval}, {period}). Check the symbol / internet.")
+        df = standardise(raw)
+    except Exception:  # noqa: BLE001 - fall back to the last good download
+        if cache.exists():
+            return pd.read_parquet(cache), f"{sym} · {interval} (offline copy)"
+        raise
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(cache)
+    except Exception:  # noqa: BLE001 - cache is best-effort
+        pass
+    return df, f"{sym} · {interval}"
+
+
+def _cache_file(sym: str, interval: str, period: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{sym}_{interval}_{period}")
+    return USER_DIR / "cache" / f"{safe}.parquet"
 
 
 # --------------------------------------------------------------------------- custom providers

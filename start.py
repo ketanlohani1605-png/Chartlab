@@ -54,6 +54,10 @@ def main():
         import chartlab.mainwindow  # noqa: F401
         print("ChartLab environment OK")
         return
+    if "--mcp" in sys.argv:
+        from chartlab.mcp_server import serve
+        serve()
+        return
     from chartlab.mainwindow import main as run_app
     run_app()
 
