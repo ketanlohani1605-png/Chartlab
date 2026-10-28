@@ -57,9 +57,15 @@ class ChartPanel(QtWidgets.QFrame):
         self.chart.toolChanged.connect(lambda t: self.toolChanged.emit(self, t))
         self.set_active(False)
 
+    multi = False
+
     def set_active(self, on: bool):
-        self.setStyleSheet(
-            f"ChartPanel {{ border: 2px solid {theme.ACCENT if on else theme.GRID}; border-radius: 2px; }}")
+        self._on = on
+        if not self.multi:
+            self.setStyleSheet("ChartPanel { border: 0; }")
+        else:
+            self.setStyleSheet(
+                f"ChartPanel {{ border: 1px solid {theme.ACCENT if on else theme.BORDER}; }}")
 
     @property
     def symbol_key(self) -> str:

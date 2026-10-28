@@ -47,6 +47,21 @@ class DateAxis(pg.AxisItem):
         return out
 
 
+class OverlayLabel(QtWidgets.QLabel):
+    """Transparent text drawn on top of the chart (legend / pane titles) - never steals the mouse."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent; font-size: 12px;")
+
+    def setText(self, t):
+        super().setText(t)
+        self.adjustSize()
+
+
 def _tag(anchor, fill: str) -> pg.TextItem:
     t = pg.TextItem(anchor=anchor, color="#ffffff", fill=pg.mkBrush(fill))
     t.setZValue(100)
@@ -76,12 +91,17 @@ class ChartWidget(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        self.header = QtWidgets.QLabel("Load a symbol or open a CSV file to begin")
-        self.header.setObjectName("chartHeader")
-        self.header.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        lay.addWidget(self.header)
         self.glw = pg.GraphicsLayoutWidget()
+        self.glw.ci.layout.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.glw, 1)
+        self.header = OverlayLabel(self.glw)
+        self.header.setText(f"<span style='color:{theme.MUTED}'>Open a data file or type a symbol and press Enter</span>")
+        self.header.move(10, 6)
+        self.vol_label = OverlayLabel(self.glw)
+        self.rsi_label = OverlayLabel(self.glw)
+        self.vol_label.hide()
+        self.rsi_label.hide()
+        self.header.raise_()
 
         self.axes: list[DateAxis] = []
         self.price = self._make_plot(0)
@@ -100,10 +120,10 @@ class ChartWidget(QtWidgets.QWidget):
 
         try:
             self.legend = self.price.addLegend(
-                offset=(10, 10), labelTextColor=theme.TEXT,
+                offset=(10, 46), labelTextColor=theme.TEXT,
                 brush=pg.mkBrush(19, 23, 34, 170), pen=pg.mkPen(None))
         except TypeError:  # older pyqtgraph
-            self.legend = self.price.addLegend(offset=(10, 10))
+            self.legend = self.price.addLegend(offset=(10, 46))
 
         # tags: last price, crosshair price (per pane) and crosshair date
         self.last_tag = _tag((1, 0.5), theme.UP)
@@ -143,10 +163,14 @@ class ChartWidget(QtWidgets.QWidget):
         p.showAxis("right")
         p.hideAxis("left")
         p.getAxis("right").setWidth(72)
+        f = QtGui.QFont()
+        f.setPixelSize(11)
         for name in ("bottom", "right"):
-            p.getAxis(name).setPen(pg.mkPen(theme.GRID))
-            p.getAxis(name).setTextPen(pg.mkPen(theme.TEXT))
-        p.showGrid(x=True, y=True, alpha=0.10)
+            ax = p.getAxis(name)
+            ax.setPen(pg.mkPen(theme.BORDER))
+            ax.setTextPen(pg.mkPen("#b2b5be"))
+            ax.setStyle(tickFont=f, tickLength=-4)
+        p.showGrid(x=True, y=True, alpha=0.06)
         dash = pg.mkPen(theme.MUTED, style=QtCore.Qt.PenStyle.DashLine)
         p.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
         p.hline = pg.InfiniteLine(angle=0, movable=False, pen=dash)
@@ -156,6 +180,8 @@ class ChartWidget(QtWidgets.QWidget):
         return p
 
     def eventFilter(self, obj, ev):
+        if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.Resize:
+            QtCore.QTimer.singleShot(0, self._place_overlays)
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.MouseButtonPress:
             self.activated.emit()
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.NativeGesture:
@@ -167,6 +193,35 @@ class ChartWidget(QtWidgets.QWidget):
             if self.handle_key(ev):
                 return True
         return super().eventFilter(obj, ev)
+
+    def _place_overlays(self):
+        for plot, lab in ((self.vol, self.vol_label), (self.rsi, self.rsi_label)):
+            vis = plot.isVisible() and self.df is not None
+            lab.setVisible(vis)
+            if vis:
+                tl = self.glw.mapFromScene(plot.sceneBoundingRect().topLeft())
+                lab.move(int(tl.x()) + 10, int(tl.y()) + 3)
+                lab.raise_()
+        self.header.raise_()
+
+    def set_range_preset(self, key: str):
+        """TradingView's bottom range buttons: show the last 1D / 5D / 1M ... / All."""
+        n = len(self._times)
+        if n < 2:
+            return
+        end = self._times[-1]
+        days = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 91, "6mo": 182, "1y": 365, "5y": 1826}
+        if key == "all":
+            x0 = 0
+        elif key == "ytd":
+            jan1 = pd.Timestamp(year=pd.Timestamp(end, unit="s").year, month=1, day=1).timestamp()
+            x0 = int(np.searchsorted(self._times, jan1))
+        else:
+            x0 = int(np.searchsorted(self._times, end - days[key] * 86400))
+        x0 = min(x0, max(n - 10, 0))
+        self.auto_y = True
+        self.price.setXRange(x0 - 1, n + 4, padding=0)
+        self._autoscale()
 
     def handle_key(self, ev) -> bool:
         vb, K = self.price.vb, QtCore.Qt.Key
@@ -363,7 +418,9 @@ class ChartWidget(QtWidgets.QWidget):
                      (self.price, bb["upper"], L[5], None),
                      (self.price, bb["lower"], L[5], None)]
         elif key == "rsi":
-            lines = [(self.rsi, ta.rsi(c, 14), "#b388ff", None)]
+            r14 = ta.rsi(c, 14)
+            self._rsi_arr = r14.to_numpy(float)
+            lines = [(self.rsi, r14, "#b388ff", None)]
 
         items = []
         x = np.arange(len(c))
@@ -394,6 +451,7 @@ class ChartWidget(QtWidgets.QWidget):
                     self.legend.addItem(item, name)
         for item, name in self._strategy_items:
             self.legend.addItem(item, name)
+        self.legend.setVisible(bool(self.legend.items))
 
     # ------------------------------------------------------------------ strategy output
     def clear_strategy(self):
@@ -549,13 +607,22 @@ class ChartWidget(QtWidgets.QWidget):
         df = self.df
         r = df.iloc[i]
         prev = df["Close"].iloc[i - 1] if i > 0 else r["Open"]
+        d = r["Close"] - prev
         chg = (r["Close"] / prev - 1) * 100 if prev else 0.0
         col = theme.UP if r["Close"] >= r["Open"] else theme.DOWN
-        fmt = "%a %d %b %Y %H:%M" if self.axes[0].intraday else "%a %d %b %Y"
+        fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
         ts = df.index[i].strftime(fmt)
-        v = lambda x: f"<span style='color:{col}'>{x:,.2f}</span>"  # noqa: E731
+        m = theme.MUTED
+        v = lambda k, x: (f"<span style='color:{m}'>{k}</span><span style='color:{col}'>{x:,.2f}</span>")  # noqa: E731
         self.header.setText(
-            f"<b>{self.label}</b> &nbsp; <span style='color:{theme.MUTED}'>{ts}</span> &nbsp; "
-            f"O {v(r['Open'])} &nbsp; H {v(r['High'])} &nbsp; L {v(r['Low'])} &nbsp; C {v(r['Close'])} "
-            f"&nbsp; <span style='color:{col}'>{chg:+.2f}%</span> &nbsp; "
-            f"<span style='color:{theme.MUTED}'>Vol {r['Volume']:,.0f}</span>")
+            f"<span style='font-size:14px;color:#ffffff;font-weight:600'>{self.label}</span>"
+            f" &nbsp;<span style='color:{m}'>{ts}</span><br>"
+            f"{v('O', r['Open'])} &nbsp;{v('H', r['High'])} &nbsp;{v('L', r['Low'])} &nbsp;{v('C', r['Close'])}"
+            f" &nbsp;<span style='color:{col}'>{d:+,.2f} ({chg:+.2f}%)</span>")
+        vol = float(r["Volume"])
+        vs = f"{vol / 1e7:.2f}Cr" if vol >= 1e7 else (f"{vol / 1e5:.2f}L" if vol >= 1e5 else f"{vol:,.0f}")
+        self.vol_label.setText(f"<span style='color:#ffffff'>Vol</span> <span style='color:{col}'>{vs}</span>")
+        rs = getattr(self, "_rsi_arr", None)
+        if rs is not None and i < len(rs) and np.isfinite(rs[i]):
+            self.rsi_label.setText(f"<span style='color:#ffffff'>RSI 14</span> <span style='color:#b388ff'>{rs[i]:.2f}</span>")
+        self._place_overlays()

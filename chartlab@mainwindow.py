@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import backtest as bt
 from . import data as datamod
+from . import icons
 from . import scriptmode
 from . import theme
 from .chart import INDICATOR_KEYS, STYLES, DateAxis
@@ -67,6 +68,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_watchlist_dock()
         self._build_strategy_dock()
         self._build_results_dock()
+        self._build_right_rail()
         self._build_menu()
         self.setStatusBar(QtWidgets.QStatusBar())
         self.api_label = QtWidgets.QLabel("")
@@ -77,9 +79,15 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------ construction
     def _build_central(self):
         self.central = QtWidgets.QWidget()
-        self.grid = QtWidgets.QGridLayout(self.central)
+        outer = QtWidgets.QVBoxLayout(self.central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        area = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(area)
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setSpacing(2)
+        outer.addWidget(area, 1)
+        outer.addWidget(self._build_strip())
         self.setCentralWidget(self.central)
         for i in range(4):
             p = ChartPanel(i)
@@ -93,22 +101,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active = self.panels[0]
         self.active.set_active(True)
 
+    def _build_strip(self):
+        """TradingView's bottom bar: 1D 5D 1M 3M 6M YTD 1Y 5Y All  ...  clock."""
+        bar = QtWidgets.QFrame()
+        bar.setObjectName("stripbar")
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(8, 2, 10, 2)
+        h.setSpacing(0)
+        for key, text in (("1d", "1D"), ("5d", "5D"), ("1mo", "1M"), ("3mo", "3M"), ("6mo", "6M"),
+                          ("ytd", "YTD"), ("1y", "1Y"), ("5y", "5Y"), ("all", "All")):
+            b = QtWidgets.QToolButton()
+            b.setText(text)
+            b.setToolTip(f"Show the last {text}" if key != "all" else "Show all data")
+            b.clicked.connect(lambda _=False, k=key: self.active.chart.set_range_preset(k))
+            h.addWidget(b)
+        h.addStretch(1)
+        self.clock = QtWidgets.QLabel("")
+        self.clock.setStyleSheet(f"color:{theme.TEXT}; font-size:12px;")
+        h.addWidget(self.clock)
+        self._clock_timer = QtCore.QTimer(self)
+        self._clock_timer.timeout.connect(self._tick_clock)
+        self._clock_timer.start(1000)
+        self._tick_clock()
+        return bar
+
+    def _tick_clock(self):
+        import datetime as _dt
+        now = _dt.datetime.now().astimezone()
+        off = now.utcoffset().total_seconds() / 3600
+        sign = "+" if off >= 0 else "-"
+        hh, mm = int(abs(off)), int(round((abs(off) % 1) * 60))
+        self.clock.setText(f"{now:%H:%M:%S}  UTC{sign}{hh}" + (f":{mm:02d}" if mm else ""))
+
     def _build_toolbar(self):
         tb = self.addToolBar("Data")
+        tb.setObjectName("topbar")
         tb.setMovable(False)
-        self.source = QtWidgets.QComboBox()
-        self.source.addItem("Yahoo Finance", "yahoo")
-        self.source.addItem("Local file (CSV / Parquet)", "file")
-        for name in datamod.list_providers():
-            self.source.addItem(f"Provider — {name}", f"provider:{name}")
-        self.source.currentIndexChanged.connect(self._source_changed)
-        tb.addWidget(self.source)
-
+        tb.setIconSize(QtCore.QSize(22, 22))
         self.symbol = QtWidgets.QLineEdit()
-        self.symbol.setPlaceholderText("RELIANCE, NIFTY, BSE:SBIN, US:AAPL, BTC-USD")
-        self.symbol.setFixedWidth(250)
+        self.symbol.setObjectName("symbolbox")
+        self.symbol.setPlaceholderText("Symbol")
+        self.symbol.setToolTip("Symbol: RELIANCE, NIFTY, BSE:SBIN, US:AAPL, BTC-USD  (Enter to load)")
+        self.symbol.setFixedWidth(150)
         self.symbol.returnPressed.connect(self.on_load)
         tb.addWidget(self.symbol)
+        tb.addWidget(self._gap(6))
+
+        self.source = QtWidgets.QComboBox()
+        self.source.addItem("Yahoo", "yahoo")
+        self.source.addItem("Local file", "file")
+        for name in datamod.list_providers():
+            self.source.addItem(f"Provider: {name}", f"provider:{name}")
+        self.source.setToolTip("Data source")
+        self.source.currentIndexChanged.connect(self._source_changed)
+        tb.addWidget(self.source)
+        tb.addSeparator()
 
         self.interval_group = QtWidgets.QButtonGroup(self)
         self.interval_btns = {}
@@ -116,33 +163,13 @@ class MainWindow(QtWidgets.QMainWindow):
             b = QtWidgets.QToolButton()
             b.setText(text)
             b.setCheckable(True)
-            b.setAutoRaise(True)
+            b.setToolTip(f"Timeframe {text}")
             self.interval_group.addButton(b)
             self.interval_btns[val] = b
             b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
             tb.addWidget(b)
         self.interval_btns["1d"].setChecked(True)
-
-        self.range = QtWidgets.QComboBox()
-        self.range.addItems(RANGES)
-        self.range.setToolTip("How much history to load")
-        self.range.activated.connect(lambda *_: self.on_load())
-        tb.addWidget(self.range)
-
-        self.load_btn = QtWidgets.QPushButton("Load")
-        self.load_btn.setObjectName("primary")
-        self.load_btn.clicked.connect(self.on_load)
-        tb.addWidget(self.load_btn)
         tb.addSeparator()
-
-        ind_menu = QtWidgets.QMenu(self)
-        self.ind_actions = {}
-        for key, text in INDICATORS.items():
-            a = ind_menu.addAction(text)
-            a.setCheckable(True)
-            a.toggled.connect(lambda on, k=key: self._indicator_toggled(k, on))
-            self.ind_actions[key] = a
-        self._menu_button(tb, "Indicators", ind_menu)
 
         style_menu = QtWidgets.QMenu(self)
         self.style_group = QtGui.QActionGroup(self)
@@ -154,7 +181,16 @@ class MainWindow(QtWidgets.QMainWindow):
             a.triggered.connect(lambda _=False, k=key: self._style_chosen(k))
             self.style_actions[key] = a
         self.style_actions["candles"].setChecked(True)
-        self._menu_button(tb, "Style", style_menu)
+        self._menu_button(tb, "", style_menu, icon="candles_icon", tip="Chart type")
+
+        ind_menu = QtWidgets.QMenu(self)
+        self.ind_actions = {}
+        for key, text in INDICATORS.items():
+            a = ind_menu.addAction(text)
+            a.setCheckable(True)
+            a.toggled.connect(lambda on, k=key: self._indicator_toggled(k, on))
+            self.ind_actions[key] = a
+        self._menu_button(tb, " Indicators", ind_menu, icon="fx", tip="Indicators")
 
         layout_menu = QtWidgets.QMenu(self)
         self.layout_group = QtGui.QActionGroup(self)
@@ -166,54 +202,106 @@ class MainWindow(QtWidgets.QMainWindow):
             a.triggered.connect(lambda _=False, k=key: self.set_layout(k))
             self.layout_actions[key] = a
         self.layout_actions["1"].setChecked(True)
-        self._menu_button(tb, "Layout", layout_menu)
+        self._menu_button(tb, "", layout_menu, icon="layout_icon", tip="Chart layout")
 
         latest = QtWidgets.QToolButton()
-        latest.setText("Latest ⇥")
-        latest.setToolTip("Scroll to the most recent bar")
+        latest.setIcon(icons.get("latest"))
+        latest.setToolTip("Jump to the latest bar  (End)")
         latest.clicked.connect(lambda: self.active.chart.go_latest())
         tb.addWidget(latest)
 
-    def _menu_button(self, tb, text, menu):
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        self.range = QtWidgets.QComboBox()
+        self.range.addItems(RANGES)
+        self.range.setCurrentText("2y")
+        self.range.setToolTip("How much history to load")
+        self.range.activated.connect(lambda *_: self.on_load())
+        tb.addWidget(self.range)
+        self.load_btn = QtWidgets.QPushButton("Load")
+        self.load_btn.setObjectName("primary")
+        self.load_btn.clicked.connect(self.on_load)
+        tb.addWidget(self.load_btn)
+        tb.addWidget(self._gap(8))
+        self.run_btn = QtWidgets.QPushButton("\u25b6  Run")
+        self.run_btn.setObjectName("pill")
+        self.run_btn.setToolTip("Run the strategy / script  (Cmd+R)")
+        self.run_btn.clicked.connect(self.run_backtest)
+        tb.addWidget(self.run_btn)
+        tb.addWidget(self._gap(4))
+
+    @staticmethod
+    def _gap(w: int):
+        g = QtWidgets.QWidget()
+        g.setFixedWidth(w)
+        return g
+
+    def _menu_button(self, tb, text, menu, icon=None, tip=""):
         b = QtWidgets.QToolButton()
-        b.setText(text + " ▾")
+        if icon:
+            b.setIcon(icons.get(icon))
+        b.setText(text)
+        if text:
+            b.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        b.setToolTip(tip)
         b.setMenu(menu)
         b.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         tb.addWidget(b)
+        return b
 
     def _build_draw_toolbar(self):
         tb = QtWidgets.QToolBar("Drawing tools")
+        tb.setObjectName("leftrail")
         tb.setOrientation(QtCore.Qt.Orientation.Vertical)
         tb.setMovable(False)
+        tb.setIconSize(QtCore.QSize(24, 24))
         self.addToolBar(QtCore.Qt.ToolBarArea.LeftToolBarArea, tb)
         self.draw_group = QtGui.QActionGroup(self)
         self.draw_actions = {}
-        cur = tb.addAction("↖")
+        cur = tb.addAction(icons.get("cross"), "")
         cur.setCheckable(True)
         cur.setChecked(True)
         cur.setToolTip("Cursor / select  (Esc)")
         self.draw_group.addAction(cur)
         cur.triggered.connect(lambda: self._tool_clicked(None))
         self.draw_actions[None] = cur
-        for key, glyph in DRAW_BUTTONS:
-            a = tb.addAction(glyph)
+        tb.addSeparator()
+        for key, _glyph in DRAW_BUTTONS:
+            a = tb.addAction(icons.get(key), "")
             a.setCheckable(True)
             a.setToolTip(TOOL_LABELS[key])
             self.draw_group.addAction(a)
             a.triggered.connect(lambda _=False, k=key: self._tool_clicked(k))
             self.draw_actions[key] = a
         tb.addSeparator()
-        self.magnet_action = tb.addAction("\U0001f9f2")
+        self.magnet_action = tb.addAction(icons.get("magnet"), "")
         self.magnet_action.setCheckable(True)
         self.magnet_action.setChecked(True)
         self.magnet_action.setToolTip("Magnet: snap drawings to candle open/high/low/close")
         self.magnet_action.toggled.connect(self._magnet_toggled)
-        d = tb.addAction("⌫")
+        d = tb.addAction(icons.get("eraser"), "")
         d.setToolTip("Delete selected drawing  (Delete)")
         d.triggered.connect(lambda: self.active.chart.layer.delete_selected())
-        c = tb.addAction("\U0001f5d1")
+        c = tb.addAction(icons.get("trash"), "")
         c.setToolTip("Remove all drawings on this chart")
         c.triggered.connect(lambda: self.active.chart.layer.clear())
+
+    def _build_right_rail(self):
+        tb = QtWidgets.QToolBar("Panels")
+        tb.setObjectName("rightrail")
+        tb.setOrientation(QtCore.Qt.Orientation.Vertical)
+        tb.setMovable(False)
+        tb.setIconSize(QtCore.QSize(24, 24))
+        self.addToolBar(QtCore.Qt.ToolBarArea.RightToolBarArea, tb)
+        for dock, ico, tip in ((self.watch_dock, "watchlist", "Watchlist"),
+                               (self.strategy_dock, "code", "Python strategy editor"),
+                               (self.results_dock, "table", "Backtest results")):
+            act = dock.toggleViewAction()
+            act.setIcon(icons.get(ico))
+            act.setToolTip(tip)
+            tb.addAction(act)
 
     def _build_watchlist_dock(self):
         self.watchlist = WatchlistWidget()
@@ -262,10 +350,10 @@ class MainWindow(QtWidgets.QMainWindow):
         row2.addWidget(self.fee)
         v.addLayout(row2)
 
-        self.run_btn = QtWidgets.QPushButton("▶  Run backtest")
-        self.run_btn.setObjectName("primary")
-        self.run_btn.clicked.connect(self.run_backtest)
-        v.addWidget(self.run_btn)
+        run2 = QtWidgets.QPushButton("▶  Run backtest")
+        run2.setObjectName("primary")
+        run2.clicked.connect(self.run_backtest)
+        v.addWidget(run2)
 
         self.strategy_dock = QtWidgets.QDockWidget("Strategy (Python)", self)
         self.strategy_dock.setWidget(w)
@@ -307,6 +395,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results_dock.setWidget(self.tabs)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
         self.tabifyDockWidget(self.watch_dock, self.strategy_dock)
+        for d in (self.watch_dock, self.strategy_dock):
+            d.setTitleBarWidget(QtWidgets.QWidget())      # tabs already name them; the rail toggles them
+        self.results_dock.hide()
         self.watch_dock.raise_()
         self.setTabPosition(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, QtWidgets.QTabWidget.TabPosition.North)
         self.watch_dock.setObjectName("dock_watchlist")
@@ -436,6 +527,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._autoload_extra(p, i)
             else:
                 p.hide()
+        for p in self.panels:
+            p.multi = n > 1
+            p.set_active(p is self.active)
         if self.active not in self.panels[:n]:
             self.set_active(self.panels[0])
 
@@ -710,6 +804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         panel.chart.set_trades(res.trades)
         if panel is self.active:
             self._show_result(panel)
+            self.results_dock.show()
             self.tabs.setCurrentWidget(self.summary)
         m = res.metrics
         self.statusBar().showMessage(f"Script done: {m['trades']} trades, net {m['total_return'] * 100:+.2f}%")
@@ -793,6 +888,7 @@ class MainWindow(QtWidgets.QMainWindow):
         panel.chart.set_trades(res.trades)
         if panel is self.active:
             self._show_result(panel)
+            self.results_dock.show()
             self.tabs.setCurrentWidget(self.summary)
         m = res.metrics
         self.statusBar().showMessage(
