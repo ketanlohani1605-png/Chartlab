@@ -188,6 +188,9 @@ class ChartWidget(QtWidgets.QWidget):
         grid.setRowStretchFactor(1, 2)
         grid.setRowStretchFactor(2, 3)
         self._set_rsi_visible(False)
+        self.vol.setVisible(False)                      # volume is an overlay inside the price pane (like TradingView)
+        grid.setRowFixedHeight(1, 0)
+        self._refresh_axes()
 
         try:
             self.legend = self.price.addLegend(
@@ -214,7 +217,7 @@ class ChartWidget(QtWidgets.QWidget):
             p.ytag = _tag((1, 0.5), "#363a45")
             p.addItem(p.ytag, ignoreBounds=True)
             p.ytag.hide()
-        for p in (self.vol, self.rsi):
+        for p in (self.price, self.vol, self.rsi):
             p.dtag = _tag((0.5, 1), "#363a45")
             p.addItem(p.dtag, ignoreBounds=True)
             p.dtag.hide()
@@ -247,7 +250,7 @@ class ChartWidget(QtWidgets.QWidget):
             ax.setPen(pg.mkPen(theme.BORDER))
             ax.setTextPen(pg.mkPen("#b2b5be"))
             ax.setStyle(tickFont=f, tickLength=-4)
-        p.showGrid(x=True, y=True, alpha=0.12)
+        p.showGrid(x=True, y=True, alpha=0.10)
         dash = pg.mkPen(theme.MUTED, style=QtCore.Qt.PenStyle.DashLine)
         p.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
         p.hline = pg.InfiniteLine(angle=0, movable=False, pen=dash)
@@ -373,7 +376,11 @@ class ChartWidget(QtWidgets.QWidget):
     def _place_overlays(self):
         if hasattr(self, "replay_bar") and self.replay_bar.isVisible():
             self.replay_bar.place()
-        for plot, lab in ((self.vol, self.vol_label), (self.rsi, self.rsi_label)):
+        if self.df is not None:                                  # volume legend sits under the OHLC header
+            self.vol_label.show()
+            self.vol_label.move(10, self.header.y() + self.header.height() + 2)
+            self.vol_label.raise_()
+        for plot, lab in ((self.rsi, self.rsi_label),):
             vis = plot.isVisible() and self.df is not None
             lab.setVisible(vis)
             if vis:
@@ -439,10 +446,15 @@ class ChartWidget(QtWidgets.QWidget):
             grid.setRowMaximumHeight(2, _QWIDGETSIZE_MAX)
         else:
             grid.setRowFixedHeight(2, 0)
-        self.vol.getAxis("bottom").setStyle(showValues=not on)
+        self._refresh_axes()
+
+    def _refresh_axes(self):
+        owner = self._bottom_plot()
+        for pl in (self.price, self.vol, self.rsi):
+            pl.getAxis("bottom").setStyle(showValues=pl is owner)
 
     def _bottom_plot(self):
-        return self.rsi if self.rsi.isVisible() else self.vol
+        return self.rsi if self.rsi.isVisible() else self.price
 
     # ------------------------------------------------------------------ coordinate helpers (used by drawings)
     def _n(self) -> int:
@@ -520,7 +532,8 @@ class ChartWidget(QtWidgets.QWidget):
         self.line_item.setDownsampling(auto=True, method='peak')
 
         self.volbars = VolumeItem(df)
-        self.vol.addItem(self.volbars)
+        self.volbars.overlay = self.price.vb
+        self.price.addItem(self.volbars, ignoreBounds=True)
 
         self._lows = df["Low"].to_numpy(float)
         self._highs = df["High"].to_numpy(float)
@@ -546,7 +559,7 @@ class ChartWidget(QtWidgets.QWidget):
             self._autoscale()
 
     def _wipe(self):
-        for item, plot in ((self.candles, self.price), (self.line_item, self.price), (self.volbars, self.vol)):
+        for item, plot in ((self.candles, self.price), (self.line_item, self.price), (self.volbars, self.price)):
             if item is not None:
                 plot.removeItem(item)
         self.candles = self.volbars = self.line_item = None
@@ -722,7 +735,9 @@ class ChartWidget(QtWidgets.QWidget):
             return
         ymin, ymax = float(np.nanmin(self._lows[lo:hi])), float(np.nanmax(self._highs[lo:hi]))
         pad = (ymax - ymin) * 0.08 or ymax * 0.01
-        self.price.vb.setYRange(ymin - pad, ymax + pad, padding=0)
+        self.price.vb.setYRange(ymin - pad - (ymax - ymin) * 0.10, ymax + pad, padding=0)   # room for the volume strip
+        if self.volbars is not None:
+            self.volbars.update()
         vmax = float(np.nanmax(self._vols[lo:hi]))
         self.vol.vb.setYRange(0, max(vmax * 1.15, 1.0), padding=0)
         self.rsi.vb.setYRange(0, 100, padding=0)
@@ -787,8 +802,8 @@ class ChartWidget(QtWidgets.QWidget):
         if hovered is None:
             for p in plots:
                 p.ytag.hide()
-            self.vol.dtag.hide()
-            self.rsi.dtag.hide()
+            for o in plots:
+                o.dtag.hide()
             return
         mp = hovered.vb.mapSceneToView(pos)
         if hovered is self.price and not self.layer.tool and not self._panning():
@@ -808,14 +823,15 @@ class ChartWidget(QtWidgets.QWidget):
             self._update_header(i)
             fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
             bp = self._bottom_plot()
-            other = self.vol if bp is self.rsi else self.rsi
-            other.dtag.hide()
+            for o in plots:
+                if o is not bp:
+                    o.dtag.hide()
             bp.dtag.setText(f" {self.df.index[i].strftime(fmt)} ")
             bp.dtag.setPos(mp.x(), bp.vb.viewRange()[1][0])
             bp.dtag.show()
         else:
-            self.vol.dtag.hide()
-            self.rsi.dtag.hide()
+            for o in plots:
+                o.dtag.hide()
         if hovered is self.price:
             x, y = (self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y()))
             self.layer.handle_move(x, y)
@@ -895,6 +911,24 @@ class ChartWidget(QtWidgets.QWidget):
         x, y = self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y())
         self.layer.handle_click(x, y)
 
+    def interval_tag(self) -> str:
+        if self.df is None or len(self.df) < 2:
+            return "1D"
+        sec = float(np.median(np.diff(self.df.index.values[-50:]).astype("timedelta64[s]").astype(float)))
+        if sec < 3600:
+            return f"{max(int(round(sec / 60)), 1)}m"
+        if sec < 86400 * 0.9:
+            return f"{int(round(sec / 3600))}h"
+        if sec < 86400 * 3:
+            return "1D"
+        if sec < 86400 * 20:
+            return "1W"
+        return "1M"
+
+    def exchange_tag(self) -> str:
+        lab = (self.label or "").upper()
+        return "NSE" if lab and not lab.endswith("=X") and "." not in lab else (lab.split(".")[-1] if "." in lab else "FX")
+
     def _update_header(self, i: int):
         df = self.df
         r = df.iloc[i]
@@ -908,6 +942,7 @@ class ChartWidget(QtWidgets.QWidget):
         v = lambda k, x: (f"<span style='color:{m}'>{k}</span><span style='color:{col}'>{x:,.2f}</span>")  # noqa: E731
         self.header.setText(
             f"<span style='font-size:14px;color:#ffffff;font-weight:600'>{self.label}</span>"
+            f" <span style='color:{m}'>· {self.interval_tag()} · {self.exchange_tag()}</span>"
             f" &nbsp;<span style='color:{m}'>{ts}</span><br>"
             f"{v('O', r['Open'])} &nbsp;{v('H', r['High'])} &nbsp;{v('L', r['Low'])} &nbsp;{v('C', r['Close'])}"
             f" &nbsp;<span style='color:{col}'>{d:+,.2f} ({chg:+.2f}%)</span>")

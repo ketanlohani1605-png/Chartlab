@@ -38,47 +38,38 @@ class QuoteWorker(QtCore.QThread):
 
 
 class QuoteDelegate(QtWidgets.QStyledItemDelegate):
-    """Symbol on the left, last price + coloured change badge on the right (TradingView style)."""
+    """TradingView watchlist row: Symbol | Last | Chg | Chg%  (flat, no badges)."""
 
     def sizeHint(self, option, index):
-        return QtCore.QSize(option.rect.width(), 46)
+        return QtCore.QSize(option.rect.width(), 30)
 
     def paint(self, p, option, index):
         p.save()
-        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        r = option.rect.adjusted(6, 3, -6, -3)
+        r = option.rect
         if option.state & QtWidgets.QStyle.StateFlag.State_Selected:
-            p.setBrush(QtGui.QColor("#1e2a55"))
-            p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.drawRoundedRect(r, 8, 8)
+            p.fillRect(r, QtGui.QColor("#2a2e39"))
         elif option.state & QtWidgets.QStyle.StateFlag.State_MouseOver:
-            p.setBrush(QtGui.QColor(theme.HOVER))
-            p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.drawRoundedRect(r, 8, 8)
+            p.fillRect(r, QtGui.QColor(theme.HOVER))
         sym = index.data(QtCore.Qt.ItemDataRole.UserRole)
         q = index.data(QtCore.Qt.ItemDataRole.UserRole + 1)
         f = QtGui.QFont(option.font)
+        f.setPointSize(12)
         f.setBold(True)
-        f.setPointSize(11)
         p.setFont(f)
+        al = QtCore.Qt.AlignmentFlag
         p.setPen(QtGui.QColor("white"))
-        p.drawText(r.adjusted(10, 0, 0, 0), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft, sym)
+        p.drawText(r.adjusted(12, 0, 0, 0), al.AlignVCenter | al.AlignLeft, sym)
         if q:
-            col = QtGui.QColor(theme.UP if q[1] >= 0 else theme.DOWN)
             f.setBold(False)
-            f.setPointSize(11)
             p.setFont(f)
-            badge = QtCore.QRect(r.right() - 74, r.center().y() - 11, 66, 22)
-            c2 = QtGui.QColor(col)
-            c2.setAlpha(45)
-            p.setBrush(c2)
-            p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.drawRoundedRect(badge, 6, 6)
+            w = r.width()
+            col = QtGui.QColor(theme.UP if q[1] >= 0 else theme.DOWN)
+            chg = q[0] - q[0] / (1 + q[1]) if q[1] > -1 else 0.0
+            p.setPen(QtGui.QColor("white"))
+            p.drawText(QtCore.QRect(r.x() + w * 38 // 100, r.y(), w * 24 // 100, r.height()), al.AlignVCenter | al.AlignRight, f"{q[0]:,.2f}")
             p.setPen(col)
-            p.drawText(badge, QtCore.Qt.AlignmentFlag.AlignCenter, f"{q[1] * 100:+.2f}%")
-            p.setPen(QtGui.QColor(theme.TEXT))
-            p.drawText(r.adjusted(0, 0, -82, 0), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignRight,
-                       f"{q[0]:,.2f}")
+            p.drawText(QtCore.QRect(r.x() + w * 62 // 100, r.y(), w * 18 // 100, r.height()), al.AlignVCenter | al.AlignRight, f"{chg:+,.2f}")
+            p.drawText(QtCore.QRect(r.x() + w * 80 // 100, r.y(), w * 20 // 100 - 10, r.height()), al.AlignVCenter | al.AlignRight, f"{q[1] * 100:+.2f}%")
         p.restore()
 
 
@@ -103,6 +94,10 @@ class WatchlistWidget(QtWidgets.QWidget):
         row.addWidget(add)
         v.addLayout(row)
 
+        hdr = QtWidgets.QLabel("<table width='100%'><tr><td width='38%'>Symbol</td><td width='24%' align='right'>Last</td>"
+                               "<td width='18%' align='right'>Chg</td><td width='20%' align='right'>Chg%</td></tr></table>")
+        hdr.setStyleSheet(f"color:{theme.MUTED}; font-size:11px; padding:4px 12px; border-bottom:1px solid {theme.GRID};")
+        v.addWidget(hdr)
         self.list = QtWidgets.QListWidget()
         self.list.setUniformItemSizes(True)
         self.list.setStyleSheet(
@@ -115,6 +110,11 @@ class WatchlistWidget(QtWidgets.QWidget):
         self.list.customContextMenuRequested.connect(self._menu)
         v.addWidget(self.list, 1)
 
+        self.card = QtWidgets.QLabel("")
+        self.card.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.card.setStyleSheet(f"background:{theme.BG}; border-top:1px solid {theme.GRID}; padding:10px 12px;")
+        v.addWidget(self.card)
+        self.list.currentItemChanged.connect(lambda *_: self._update_card())
         row2 = QtWidgets.QHBoxLayout()
         self.refresh_btn = QtWidgets.QPushButton("Refresh prices")
         self.refresh_btn.clicked.connect(self.refresh)
@@ -178,6 +178,23 @@ class WatchlistWidget(QtWidgets.QWidget):
         font.setPointSize(11)
         it.setFont(font)
 
+    def _update_card(self):
+        it = self.list.currentItem()
+        if it is None:
+            self.card.setText("")
+            return
+        sym = it.data(QtCore.Qt.ItemDataRole.UserRole)
+        q = self.quotes.get(sym)
+        if not q:
+            self.card.setText(f"<span style='font-size:16px;font-weight:600;color:white'>{sym}</span>")
+            return
+        col = theme.UP if q[1] >= 0 else theme.DOWN
+        chg = q[0] - q[0] / (1 + q[1]) if q[1] > -1 else 0.0
+        self.card.setText(
+            f"<div style='font-size:15px;font-weight:600;color:white'>{sym} <span style='color:{theme.MUTED};font-size:11px'>NSE</span></div>"
+            f"<div><span style='font-size:26px;color:white'>{q[0]:,.2f}</span> "
+            f"<span style='font-size:13px;color:{col}'>{chg:+,.2f} &nbsp;{q[1] * 100:+.2f}%</span></div>")
+
     def _add_from_edit(self):
         if self.add(self.edit.text()):
             self.edit.clear()
@@ -205,6 +222,7 @@ class WatchlistWidget(QtWidgets.QWidget):
         self.quotes.update(q)
         for i in range(self.list.count()):
             self._paint(self.list.item(i))
+        self._update_card()
         self.refresh_btn.setEnabled(True)
         self.status.setText(f"Updated {QtCore.QTime.currentTime().toString('HH:mm:ss')} (delayed)")
 

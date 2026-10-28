@@ -89,6 +89,7 @@ class VolumeItem(pg.GraphicsObject):
     def __init__(self, df=None):
         super().__init__()
         self.limit = None
+        self.overlay = None      # ViewBox of the price pane: draw as a thin strip at its bottom (TradingView style)
         self.v = np.zeros(0)
         self.up = np.zeros(0, bool)
         if df is not None:
@@ -105,6 +106,8 @@ class VolumeItem(pg.GraphicsObject):
         n = len(self.v)
         if n == 0:
             return QtCore.QRectF()
+        if self.overlay is not None:
+            return QtCore.QRectF(-1, -1e9, n + 2, 2e9)
         return QtCore.QRectF(-1, 0, n + 2, max(float(np.nanmax(self.v)), 1.0))
 
     def paint(self, p, *args):
@@ -121,8 +124,13 @@ class VolumeItem(pg.GraphicsObject):
             up = self.up[last]
             xs, w = edges + (g - 1) / 2.0, 0.4 * g
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        for is_up, col in ((True, QtGui.QColor(38, 166, 154, 140)), (False, QtGui.QColor(239, 83, 80, 140))):
+        base, k = 0.0, 1.0
+        if self.overlay is not None:                   # scale so the tallest visible bar is ~16% of the pane
+            (y0, y1) = self.overlay.viewRange()[1]
+            vmax = float(np.nanmax(v)) or 1.0
+            base, k = y0, 0.16 * (y1 - y0) / vmax
+        for is_up, col in ((True, QtGui.QColor(8, 153, 129, 110)), (False, QtGui.QColor(242, 54, 69, 110))):
             p.setBrush(col)
             m = up == is_up
             for a, b in zip(xs[m], v[m]):
-                p.drawRect(QtCore.QRectF(a - w, 0, 2 * w, b))
+                p.drawRect(QtCore.QRectF(a - w, base, 2 * w, b * k))

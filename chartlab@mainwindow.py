@@ -45,7 +45,8 @@ LAYOUTS = {"1": "Single chart", "2h": "Two charts — side by side", "2v": "Two 
            "4": "Four charts"}
 LAYOUT_COUNT = {"1": 1, "2h": 2, "2v": 2, "4": 4}
 DRAW_BUTTONS = [("trend", "╱"), ("ray", "↗"), ("hline", "—"), ("vline", "|"),
-                ("rect", "▭"), ("fib", "φ"), ("measure", "m"), ("text", "T")]
+                ("rect", "▭"), ("fib", "φ"), ("measure", "m"), ("text", "T"),
+                ("hray", "→"), ("crossline", "+")]
 STYLE_NAMES = {"candles": "Candles", "hollow": "Hollow candles", "line": "Line", "area": "Area"}
 
 
@@ -126,7 +127,16 @@ class MainWindow(QtWidgets.QMainWindow):
             b.setToolTip(f"Show the last {text}" if key != "all" else "Show all data")
             b.clicked.connect(lambda _=False, k=key: self.active.chart.set_range_preset(k))
             h.addWidget(b)
+        gd = QtWidgets.QToolButton()
+        gd.setText("⏷ Go to…")
+        gd.setToolTip("Go to date")
+        gd.clicked.connect(self._goto_date)
+        h.addWidget(gd)
         h.addStretch(1)
+        adj = QtWidgets.QLabel("ADJ  ")
+        adj.setToolTip("Prices are adjusted for splits / dividends")
+        adj.setStyleSheet(f"color:{theme.MUTED}; font-size:12px; font-weight:600;")
+        h.addWidget(adj)
         self.clock = QtWidgets.QLabel("")
         self.clock.setStyleSheet(f"color:{theme.TEXT}; font-size:12px;")
         h.addWidget(self.clock)
@@ -135,6 +145,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clock_timer.start(1000)
         self._tick_clock()
         return bar
+
+    def _goto_date(self):
+        ch = self.active.chart
+        if not ch.has_data():
+            return
+        txt, ok = QtWidgets.QInputDialog.getText(self, "Go to date", "Date (YYYY-MM-DD):")
+        if not ok or not txt.strip():
+            return
+        try:
+            import pandas as _pd
+            t = _pd.Timestamp(txt.strip())
+            if ch.df.index.tz is not None and t.tzinfo is None:
+                t = t.tz_localize(ch.df.index.tz)
+            i = int(ch.df.index.searchsorted(t))
+            i = max(0, min(i, len(ch.df) - 1))
+            ch.price.vb.setXRange(i - 60, i + 60, padding=0)
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "Go to date", f"Invalid date: {e}")
 
     def _tick_clock(self):
         import datetime as _dt
@@ -261,6 +289,20 @@ class MainWindow(QtWidgets.QMainWindow):
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
+        def tbtn(icon, tip, fn):
+            b = QtWidgets.QToolButton()
+            b.setIcon(icons.get(icon))
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            tb.addWidget(b)
+            return b
+        tbtn("undo", "Undo  (Ctrl+Z)", lambda: self.active.chart.layer.undo())
+        tbtn("redo", "Redo  (Ctrl+Shift+Z)", lambda: self.active.chart.layer.redo())
+        tb.addSeparator()
+        tbtn("fullscreen", "Full screen  (Ctrl+Cmd+F)", self.toggle_fullscreen)
+        tbtn("camera", "Save chart image", self.save_chart_image)
+        tb.addSeparator()
+
         self.range = QtWidgets.QComboBox()
         self.range.addItems(RANGES)
         self.range.setCurrentText("2y")
@@ -326,7 +368,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.draw_actions[None] = cur
         tb.addSeparator()
         for key, _glyph in DRAW_BUTTONS:
-            a = tb.addAction(icons.get(key), "")
+            a = tb.addAction(icons.get({"hray": "ray", "crossline": "cross"}.get(key, key)), "")
             a.setCheckable(True)
             a.setToolTip(TOOL_LABELS[key])
             self.draw_group.addAction(a)
@@ -556,6 +598,17 @@ class MainWindow(QtWidgets.QMainWindow):
             QtGui.QShortcut(QtGui.QKeySequence(k), self, activated=lambda: self.active.chart.layer.redo())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+A"), self, activated=lambda: self.create_alert())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+R"), self, activated=lambda: self.active.chart.go_latest())
+
+    def toggle_fullscreen(self):
+        self.setWindowState(self.windowState() ^ QtCore.Qt.WindowState.WindowFullScreen)
+
+    def save_chart_image(self):
+        ch = self.active.chart
+        default = str(Path.home() / "Pictures" / f"{(ch.label or 'chart').replace(' ', '_')}.png")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save chart image", default, "PNG (*.png)")
+        if path:
+            ch.glw.grab().save(path)
+            self.statusBar().showMessage(f"Saved {path}")
 
     def toggle_replay(self):
         ch = self.active.chart

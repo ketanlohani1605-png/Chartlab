@@ -13,10 +13,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
 
-TOOLS = {"trend": 2, "ray": 2, "hline": 1, "vline": 1, "rect": 2, "fib": 2, "measure": 2, "text": 1}
+TOOLS = {"trend": 2, "ray": 2, "hline": 1, "vline": 1, "rect": 2, "fib": 2, "measure": 2, "text": 1, "hray": 1, "crossline": 1}
 TOOL_LABELS = {"trend": "Trend line", "ray": "Ray", "hline": "Horizontal line",
                "vline": "Vertical line", "rect": "Rectangle", "fib": "Fib retracement",
-               "measure": "Measure (price / % / bars)", "text": "Text note"}
+               "measure": "Measure (price / % / bars)", "text": "Text note",
+               "hray": "Horizontal ray", "crossline": "Cross line"}
 FIB_LEVELS = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
 FIB_COLORS = ["#787b86", "#f23645", "#ff9800", "#4caf50", "#089981", "#00bcd4", "#787b86"]
 DEFAULT_COLOR = "#2962ff"
@@ -335,6 +336,11 @@ class DrawingLayer(QtCore.QObject):
                                                     "fill": (19, 23, 34, 200)}))
         elif t == "vline" and pts:
             items.append(pg.InfiniteLine(pos=pts[0][0], angle=90, movable=False, pen=pen))
+        elif t == "hray" and pts:
+            items.append(pg.PlotDataItem([pts[0][0], xmax], [pts[0][1], pts[0][1]], pen=pen))
+        elif t == "crossline" and pts:
+            items.append(pg.InfiniteLine(pos=pts[0][1], angle=0, movable=False, pen=pen))
+            items.append(pg.InfiniteLine(pos=pts[0][0], angle=90, movable=False, pen=pen))
         elif t == "rect" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             r = QtWidgets.QGraphicsRectItem(QtCore.QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)))
@@ -402,6 +408,11 @@ class DrawingLayer(QtCore.QObject):
             return [((x1, y1), (ex, y1 + (y2 - y1) * (ex - x1) / (x2 - x1)))]
         if t == "hline":
             return [((-5, pts[0][1]), (far, pts[0][1]))]
+        if t == "hray":
+            return [((pts[0][0], pts[0][1]), (far, pts[0][1]))]
+        if t == "crossline":
+            lo, hi = self.chart.y_range()
+            return [((-5, pts[0][1]), (far, pts[0][1])), ((pts[0][0], lo), (pts[0][0], hi))]
         if t == "vline":
             lo, hi = self.chart.y_range()
             return [((pts[0][0], lo), (pts[0][0], hi))]

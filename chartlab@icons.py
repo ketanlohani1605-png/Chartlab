@@ -205,9 +205,54 @@ def latest(p, r, c):
     p.drawLine(QtCore.QPointF(18, 6), QtCore.QPointF(18, 18))
 
 
+def undo(p, r, c):
+    path = QtGui.QPainterPath(QtCore.QPointF(9, 8))
+    path.lineTo(5, 12)
+    path.lineTo(9, 16)
+    p.drawPath(path)
+    path2 = QtGui.QPainterPath(QtCore.QPointF(5, 12))
+    path2.lineTo(15, 12)
+    path2.cubicTo(19, 12, 20, 17, 16, 18)
+    path2.lineTo(11, 18)
+    p.drawPath(path2)
+
+
+def redo(p, r, c):
+    p.save()
+    p.translate(24, 0)
+    p.scale(-1, 1)
+    undo(p, r, c)
+    p.restore()
+
+
+def camera(p, r, c):
+    p.drawRoundedRect(QtCore.QRectF(4, 8, 16, 11), 2, 2)
+    p.drawPolyline([QtCore.QPointF(9, 8), QtCore.QPointF(10.5, 5.5), QtCore.QPointF(13.5, 5.5), QtCore.QPointF(15, 8)])
+    p.drawEllipse(QtCore.QPointF(12, 13.5), 3, 3)
+
+
+def fullscreen(p, r, c):
+    for (x, y, dx, dy) in ((5, 5, 1, 1), (19, 5, -1, 1), (5, 19, 1, -1), (19, 19, -1, -1)):
+        p.drawPolyline([QtCore.QPointF(x + 5 * dx, y), QtCore.QPointF(x, y), QtCore.QPointF(x, y + 5 * dy)])
+
+
+def zoom(p, r, c):
+    p.drawEllipse(QtCore.QPointF(11, 11), 6, 6)
+    p.drawLine(QtCore.QPointF(15.5, 15.5), QtCore.QPointF(20, 20))
+    p.drawLine(QtCore.QPointF(8.5, 11), QtCore.QPointF(13.5, 11))
+    p.drawLine(QtCore.QPointF(11, 8.5), QtCore.QPointF(11, 13.5))
+
+
+def plus(p, r, c):
+    p.drawEllipse(QtCore.QPointF(12, 12), 8, 8)
+    p.drawLine(QtCore.QPointF(12, 8), QtCore.QPointF(12, 16))
+    p.drawLine(QtCore.QPointF(8, 12), QtCore.QPointF(16, 12))
+
+
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
-    "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest")}
+    "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
+    "undo", "redo", "camera", "fullscreen", "zoom", "plus")}
 
 
 def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:
