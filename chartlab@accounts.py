@@ -157,6 +157,12 @@ class AccountsDialog(QtWidgets.QDialog):
         self.live = QtWidgets.QCheckBox("Live orders (REAL money)")
         self.live.setToolTip("Off = paper: chartlab.order() only prints what it would send")
         form.addRow(self.live)
+        self.mult = QtWidgets.QDoubleSpinBox()
+        self.mult.setRange(0.1, 1000)
+        self.mult.setDecimals(2)
+        self.mult.setValue(1.0)
+        self.mult.setToolTip("Order size multiplier for this account: 2 = double the quantity/lots of the script")
+        form.addRow("Qty multiplier", self.mult)
         self.msg = QtWidgets.QLabel("")
         self.msg.setWordWrap(True)
         form.addRow(self.msg)
@@ -194,6 +200,7 @@ class AccountsDialog(QtWidgets.QDialog):
             self.client.setText(a.get("client_id", ""))
             self.token.setText(a.get("access_token", ""))
             self.live.setChecked(bool(a.get("live")))
+            self.mult.setValue(float(a.get("qty_mult", 1) or 1))
 
     def _new(self):
         self.list.clearSelection()
@@ -204,7 +211,8 @@ class AccountsDialog(QtWidgets.QDialog):
 
     def _current(self) -> dict:
         return {"name": self.name.text().strip(), "broker": self.broker.currentData(),
-                "client_id": self.client.text().strip(), "access_token": self.token.text().strip(), "live": self.live.isChecked()}
+                "client_id": self.client.text().strip(), "access_token": self.token.text().strip(), "live": self.live.isChecked(),
+                "qty_mult": self.mult.value()}
 
     def save(self):
         a = self._current()
@@ -252,6 +260,11 @@ class PickAccountsDialog(QtWidgets.QDialog):
             "credentials with <code>chartlab.account()</code>.<br>"
             f"<span style='color:{theme.DOWN}'>If your script places orders, they will be REAL orders on every "
             "ticked account.</span>"))
+        self.one = QtWidgets.QRadioButton("One script, orders sent to ALL ticked accounts at the same instant (fastest)")
+        self.one.setChecked(True)
+        self.sep = QtWidgets.QRadioButton("A separate copy of the script per account (independent runs)")
+        v.addWidget(self.one)
+        v.addWidget(self.sep)
         self.list = QtWidgets.QListWidget()
         for a in accts:
             it = QtWidgets.QListWidgetItem(f"{a['name']}  ({BROKERS.get(a['broker'], a['broker'])})  -  "
@@ -267,6 +280,9 @@ class PickAccountsDialog(QtWidgets.QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
+
+    def broadcast(self) -> bool:
+        return self.one.isChecked()
 
     def chosen(self) -> list[str]:
         return [self.list.item(i).data(QtCore.Qt.ItemDataRole.UserRole) for i in range(self.list.count())

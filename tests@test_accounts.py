@@ -55,22 +55,57 @@ log = w.log_view.toPlainText()
 print(log)
 assert "[A1] I am A1 111 tokA" in log and "[A2] I am A2 222 tokB" in log
 assert "tokA" not in log.split("[A2]")[1].split("\n")[0]
-# order(): paper prints only, live sends exactly one POST
-n = len(calls)
-r = D.place_order("111", "tokA", "RELIANCE", "buy", 5, live=False)
-assert r["paper"] and len(calls) == n and r["request"]["quantity"] == 5
-r = D.place_order("111", "tokA", "RELIANCE", "SELL", 2, "LIMIT", 100.5, live=True)
-assert len(calls) == n + 1 and calls[-1][0].endswith("/orders") and calls[-1][1]["transactionType"] == "SELL" and calls[-1][1]["price"] == 100.5
-A.save_accounts([{"name": "P", "broker": "dhan", "client_id": "9", "access_token": "t", "live": False},
-                 {"name": "L", "broker": "dhan", "client_id": "8", "access_token": "u", "live": True}], tmp)
-w.editor.setPlainText("import chartlab\nchartlab.order('NIFTY','BUY',1)\n")
-import chartlab.dhan_core as D2
-w.run_multi(["P"])
+# ---- fast routing: fake Session so no network; 5 live accounts must fire in parallel
+import threading
+sent = []
+def fake_req(self, method, path, body=None):
+    time.sleep(0.25)
+    sent.append((self.hdr["client-id"], path, body, time.perf_counter()))
+    return {"orderId": "1", "orderStatus": "TRANSIT"}
+D.Session.request = fake_req
+D.instrument = lambda sym, ex="NSE": {"security_id": "1333", "segment": "NSE_EQ", "instrument": "EQUITY", "lot": 1}
+accts = [{"name": f"L{i}", "client_id": str(i), "access_token": "t", "live": True, "qty_mult": 1 + i} for i in range(5)]
+accts.append({"name": "PAPER", "client_id": "99", "access_token": "t", "live": False})
+t0 = time.perf_counter()
+res = D.place_many(accts, "RELIANCE", "buy", 10)
+el = time.perf_counter() - t0
+assert el < 0.6, el                                   # serial would be 1.25 s
+assert [r["request"]["quantity"] for r in res[:5]] == [10, 20, 30, 40, 50]
+assert res[5].get("paper") and len(sent) == 5
+spread = max(x[3] for x in sent) - min(x[3] for x in sent)
+assert spread < 0.15, spread                          # all released together
+# one failing account does not block the rest
+def flaky(self, method, path, body=None):
+    if self.hdr["client-id"] == "2":
+        raise RuntimeError("boom")
+    return {"ok": 1}
+D.Session.request = flaky
+res = D.place_many(accts, "RELIANCE", "SELL", 1, "LIMIT", 5.0)
+assert [r["ok"] for r in res] == [True, True, False, True, True, True]
+# options: lots x lot-size, per-account multiplier, nearest expiry
+import datetime as _d
+tbl = pd.DataFrame({"inst": ["OPTIDX"] * 3, "und": ["NIFTY"] * 3, "sid": [111, 222, 333], "lot": [75] * 3,
+                    "expiry": [_d.date.today() + _d.timedelta(days=d) for d in (7, 1, 14)],
+                    "strike": [24500.0] * 3, "type": ["CE"] * 3})
+D._options_table = lambda: tbl
+o = D.option("NIFTY", 24500, "CE")
+assert o["security_id"] == "222" and o["lot"] == 75
+D.instrument = lambda sym, ex="NSE": sym if isinstance(sym, dict) else None
+D.Session.request = fake_req
+sent.clear()
+D.place_many(accts[:2], o, "BUY", lots=2)
+assert [x[2]["quantity"] for x in sent] == [150, 300] or sorted(x[2]["quantity"] for x in sent) == [150, 300]
+
+# ---- one-script broadcast mode, paper accounts, real subprocess
+A.save_accounts([{"name": "P1", "broker": "dhan", "client_id": "1", "access_token": "a", "live": False},
+                 {"name": "P2", "broker": "dhan", "client_id": "2", "access_token": "b", "live": False, "qty_mult": 2}], tmp)
+w.editor.setPlainText("import chartlab\nprint('n accounts', len(chartlab.accounts()))\nchartlab.order('NIFTY','BUY',lots=0,qty=3)\n")
+w.run_multi(["P1", "P2"], broadcast=True)
 t0 = time.time()
 while any(p.state() != QtCore.QProcess.ProcessState.NotRunning for p in w._multi):
     app.processEvents(); time.sleep(0.02)
     assert time.time() - t0 < 60
 lg = w.log_view.toPlainText()
-assert "[P] [PAPER] BUY 1 NIFTY" in lg and "Traceback" not in lg
-print(lg.split("running on")[-1])
+assert "n accounts 2" in lg and "[PAPER] P1: BUY 3 NIFTY" in lg and "[PAPER] P2: BUY 6 NIFTY" in lg, lg
+assert "Traceback" not in lg
 print("ACCOUNTS OK")

@@ -86,3 +86,4 @@ Strategies are executed with Python `exec` on your machine - only run strategy c
 - Source dropdown shows "API: <name>"; type a symbol (RELIANCE, NSE:TCS, NIFTY) and Load - the app fetches candles itself.
 - Accounts -> Run script on multiple accounts: your script runs once per ticked account, all at the same time; inside it call chartlab.account() for that account credentials.
 - chartlab.order("RELIANCE","BUY",10) inside your script places an order on that account. Accounts are PAPER by default (only prints); tick "Live orders" in Manage broker accounts to send real orders.
+- Fast orders: Accounts -> Run script on multiple accounts -> "One script" mode. chartlab.warmup() opens all broker connections; chartlab.order("NIFTY","BUY",lots=1) or chartlab.order(chartlab.option("NIFTY",24500,"CE"),"BUY",lots=1) hits every ticked account at the same instant (parallel, kept-alive connections). Set a per-account Qty multiplier in Manage broker accounts.

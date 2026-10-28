@@ -729,9 +729,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec():
             names = dlg.chosen()
             if names:
-                self.run_multi(names)
+                self.run_multi(names, broadcast=dlg.broadcast())
 
-    def run_multi(self, names: list[str]) -> dict:
+    def run_multi(self, names: list[str], broadcast: bool = False) -> dict:
         self.stop_script()
         self.stop_multi()
         try:
@@ -745,6 +745,8 @@ class MainWindow(QtWidgets.QMainWindow):
         code = self.strategy_code()
         self._multi = []
         self.tabs.setCurrentWidget(self.log_view)
+        if broadcast:
+            return self._run_broadcast(py, chosen, data, code)
         self.add_log(f"--- running on {len(chosen)} accounts at once: " + ", ".join(names))
         for a in chosen:
             work = scriptmode.prepare(data)
@@ -766,6 +768,32 @@ class MainWindow(QtWidgets.QMainWindow):
             proc.closeWriteChannel()
         self.statusBar().showMessage(f"Running on {len(chosen)} accounts… (Strategy -> Stop script to stop all)")
         return {"ok": True, "accounts": names}
+
+    def _run_broadcast(self, py, chosen, data, code) -> dict:
+        """ONE script process; chartlab.order() fans each order out to all accounts in parallel threads."""
+        import os
+        work = scriptmode.prepare(data)
+        script = work / "user_script.py"
+        script.write_text(code)
+        af = work / "accounts.json"
+        fd = os.open(af, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(chosen, f)
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        for k, v in {**scriptmode.environment(work, data), "CHARTLAB_ACCOUNTS_FILE": str(af)}.items():
+            env.insert(k, v)
+        proc = QtCore.QProcess(self)
+        proc.setProcessEnvironment(env)
+        proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self.add_log(bytes(proc.readAllStandardOutput()).decode("utf8", "replace")))
+        proc.finished.connect(lambda c, _s: (af.unlink(missing_ok=True), self._multi_done("all accounts", c)))
+        self._multi = [proc]
+        live = [a["name"] for a in chosen if a.get("live")]
+        self.add_log(f"--- ONE script, orders to {len(chosen)} accounts at once (LIVE: {', '.join(live) or 'none, paper only'})")
+        proc.start(py, [str(work / "_runner.py"), str(script)])
+        proc.closeWriteChannel()
+        self.statusBar().showMessage("Running on all accounts… (Strategy -> Stop script to stop)")
+        return {"ok": True, "accounts": [a["name"] for a in chosen], "mode": "broadcast"}
 
     def _multi_done(self, tag, code):
         self.add_log(f"[{tag}] finished" + ("" if code == 0 else f" with errors (exit {code})"))

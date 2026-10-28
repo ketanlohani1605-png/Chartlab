@@ -32,20 +32,45 @@ def data():
     return pd.read_parquet(_DATA)
 
 def account():
-    """Credentials of the broker account this copy of the script runs on (multi-account mode), or {}."""
+    """Credentials of the broker account this copy of the script runs on (separate-copies mode), or {}."""
     if not os.environ.get("CHARTLAB_ACCOUNT"):
         return {}
     return {k[len("CHARTLAB_"):].lower(): v for k, v in os.environ.items()
-            if k.startswith("CHARTLAB_") and k not in ("CHARTLAB_OUT", "CHARTLAB_DATA", "CHARTLAB_PYTHON")}
+            if k.startswith("CHARTLAB_") and k not in ("CHARTLAB_OUT", "CHARTLAB_DATA", "CHARTLAB_PYTHON",
+                                                     "CHARTLAB_ACCOUNTS_FILE")}
 
-def order(symbol, side, qty, order_type="MARKET", price=None, product="INTRADAY", exchange="NSE"):
-    """Place an order on THIS account (multi-account mode). Paper unless the account is set to Live orders."""
+def accounts():
+    """All accounts this run trades on: every ticked account (one-script mode) or just this one."""
+    f = os.environ.get("CHARTLAB_ACCOUNTS_FILE")
+    if f:
+        return json.load(open(f))
     a = account()
     if not a:
-        raise RuntimeError("chartlab.order() needs an account: use Accounts -> Run script on multiple accounts")
+        return []
+    return [{"name": a["account"], "client_id": a["client_id"], "access_token": a["access_token"],
+             "live": a.get("live") == "1", "qty_mult": 1}]
+
+def warmup():
+    """Open all broker connections now so the first order is instant. Call once at start."""
     import chartlab_dhan
-    return chartlab_dhan.place_order(a["client_id"], a["access_token"], symbol, side, qty, order_type, price,
-                                     product, exchange, live=a.get("live") == "1", tag=a["account"])
+    r = chartlab_dhan.warmup(accounts())
+    print("[chartlab] connections ready:", r)
+    return r
+
+def option(underlying, strike, kind, expiry=None):
+    """Option contract, e.g. chartlab.option('NIFTY', 24500, 'CE'); expiry None = nearest."""
+    import chartlab_dhan
+    return chartlab_dhan.option(underlying, strike, kind, expiry)
+
+def order(symbol, side, qty=0, order_type="MARKET", price=None, product="INTRADAY", exchange="NSE", lots=0):
+    """Order on ALL accounts of this run at the same instant (in parallel). symbol: 'RELIANCE', 'NIFTY' or an
+    option() contract. For options use lots=1 (quantity = lots x lot size, scaled by each account's multiplier).
+    Paper accounts only print. Returns one result per account with latency in ms."""
+    accts = accounts()
+    if not accts:
+        raise RuntimeError("chartlab.order() needs accounts: use Accounts -> Run script on multiple accounts")
+    import chartlab_dhan
+    return chartlab_dhan.place_many(accts, symbol, side, qty, order_type, price, product, exchange, lots)
 
 def report(trades=None, equity=None, plots=None):
     import pandas as pd
