@@ -43,7 +43,7 @@ LAYOUTS = {"1": "Single chart", "2h": "Two charts — side by side", "2v": "Two 
            "4": "Four charts"}
 LAYOUT_COUNT = {"1": 1, "2h": 2, "2v": 2, "4": 4}
 DRAW_BUTTONS = [("trend", "╱"), ("ray", "↗"), ("hline", "—"), ("vline", "|"),
-                ("rect", "▭"), ("fib", "φ")]
+                ("rect", "▭"), ("fib", "φ"), ("measure", "m"), ("text", "T")]
 STYLE_NAMES = {"candles": "Candles", "hollow": "Hollow candles", "line": "Line", "area": "Area"}
 
 
@@ -146,6 +146,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.symbol.returnPressed.connect(self.on_load)
         tb.addWidget(self.symbol)
         tb.addWidget(self._gap(6))
+        self._symbol_model = QtCore.QStringListModel(self._suggestions())
+        comp = QtWidgets.QCompleter(self._symbol_model, self)
+        comp.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        comp.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+        comp.setMaxVisibleItems(12)
+        comp.activated.connect(lambda _t: QtCore.QTimer.singleShot(0, self.on_load))
+        self.symbol.setCompleter(comp)
 
         self.source = QtWidgets.QComboBox()
         self.source.addItem("Yahoo", "yahoo")
@@ -231,6 +238,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_btn.clicked.connect(self.run_backtest)
         tb.addWidget(self.run_btn)
         tb.addWidget(self._gap(4))
+
+    @staticmethod
+    def _suggestions() -> list[str]:
+        base = ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN",
+                "ITC", "LT", "BHARTIARTL", "TATAMOTORS", "TATASTEEL", "AXISBANK", "KOTAKBANK", "HINDUNILVR",
+                "BAJFINANCE", "MARUTI", "SUNPHARMA", "WIPRO", "HCLTECH", "ADANIENT", "ADANIPORTS", "ONGC",
+                "NTPC", "POWERGRID", "COALINDIA", "ASIANPAINT", "ULTRACEMCO", "TITAN", "M&M", "JSWSTEEL",
+                "TECHM", "NESTLEIND", "DRREDDY", "CIPLA", "EICHERMOT", "HEROMOTOCO", "BPCL", "GRASIM",
+                "US:AAPL", "US:MSFT", "US:NVDA", "US:TSLA", "BTC-USD", "ETH-USD", "BSE:TCS", "BSE:SBIN"]
+        return base
 
     @staticmethod
     def _gap(w: int):
@@ -442,6 +459,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtGui.QShortcut(QtGui.QKeySequence(key), self,
                             activated=lambda: self.active.chart.layer.delete_selected())
         QtGui.QShortcut(QtGui.QKeySequence("Escape"), self, activated=self._escape)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self, activated=lambda: self.active.chart.layer.undo())
+        for k in ("Ctrl+Shift+Z", "Ctrl+Y"):
+            QtGui.QShortcut(QtGui.QKeySequence(k), self, activated=lambda: self.active.chart.layer.redo())
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+R"), self, activated=lambda: self.active.chart.go_latest())
 
     def _escape(self):
         self.active.chart.layer.cancel()

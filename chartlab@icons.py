@@ -112,6 +112,18 @@ def trash(p, r, c):
     p.drawLine(QtCore.QPointF(14, 10), QtCore.QPointF(14, 16))
 
 
+def measure(p, r, c):
+    p.drawRect(QtCore.QRectF(4, 8, 16, 8))
+    for x in (8, 12, 16):
+        p.drawLine(QtCore.QPointF(x, 8), QtCore.QPointF(x, 11))
+
+
+def text(p, r, c):
+    p.drawLine(QtCore.QPointF(6, 6), QtCore.QPointF(18, 6))
+    p.drawLine(QtCore.QPointF(12, 6), QtCore.QPointF(12, 19))
+    p.drawLine(QtCore.QPointF(9, 19), QtCore.QPointF(15, 19))
+
+
 def watchlist(p, r, c):
     for y in (7, 12, 17):
         p.drawLine(QtCore.QPointF(10, y), QtCore.QPointF(20, y))
@@ -160,7 +172,7 @@ def latest(p, r, c):
 
 
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
-    "cross", "cursor", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
+    "cross", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest")}
 
 

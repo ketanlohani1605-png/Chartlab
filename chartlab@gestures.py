@@ -68,6 +68,18 @@ class TVViewBox(pg.ViewBox):
             ev.ignore()
             return
         ev.accept()
+        if self.is_price and axis is None:
+            layer = self.chart.layer
+            if ev.isStart():
+                st = self.mapSceneToView(ev.buttonDownScenePos())
+                self._dragging_drawing = layer.begin_drag(st.x(), st.y())
+            if getattr(self, "_dragging_drawing", False):
+                pos = self.mapSceneToView(ev.scenePos())
+                layer.drag_to(pos.x(), pos.y())
+                if ev.isFinish():
+                    layer.end_drag()
+                    self._dragging_drawing = False
+                return
         dp = ev.pos() - ev.lastPos()
         x0, x1, y0, y1 = self._span()
         w, h = max(self.width(), 1.0), max(self.height(), 1.0)

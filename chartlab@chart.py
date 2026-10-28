@@ -289,8 +289,7 @@ class ChartWidget(QtWidgets.QWidget):
         return float(t[i] + (x - i) * (t[i + 1] - t[i]))
 
     def set_cursor_for_tool(self, on: bool):
-        self.glw.viewport().setCursor(QtCore.Qt.CursorShape.CrossCursor if on
-                                      else QtCore.Qt.CursorShape.ArrowCursor)
+        self.glw.viewport().setCursor(QtCore.Qt.CursorShape.CrossCursor)
 
     def snap(self, x: float, y: float):
         """Magnet: snap to the nearest O/H/L/C of the bar under the cursor if close enough."""
@@ -560,6 +559,10 @@ class ChartWidget(QtWidgets.QWidget):
             self.rsi.dtag.hide()
             return
         mp = hovered.vb.mapSceneToView(pos)
+        if hovered is self.price and not self.layer.tool and not self._panning():
+            self.glw.viewport().setCursor(QtCore.Qt.CursorShape.PointingHandCursor
+                                          if self.layer.hover_hit(mp.x(), mp.y())
+                                          else QtCore.Qt.CursorShape.CrossCursor)
         i = int(round(mp.x()))
         for p in plots:
             p.vline.setPos(mp.x())
@@ -585,7 +588,42 @@ class ChartWidget(QtWidgets.QWidget):
             x, y = (self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y()))
             self.layer.handle_move(x, y)
 
+    def _panning(self) -> bool:
+        return bool(QtWidgets.QApplication.mouseButtons() & QtCore.Qt.MouseButton.LeftButton)
+
+    def _context_menu(self, ev):
+        mp = self.price.vb.mapSceneToView(ev.scenePos())
+        menu = QtWidgets.QMenu(self)
+        hit = self.layer._hit_test(mp.x(), mp.y())
+        if hit is not None:
+            self.layer.selected = hit
+            self.layer.rebuild()
+            menu.addAction("Duplicate", self.layer.duplicate_selected)
+            col = menu.addMenu("Color")
+            for name, c in (("Blue", "#2962ff"), ("Red", "#f23645"), ("Green", "#089981"), ("Orange", "#ff9800"),
+                            ("Purple", "#9c27b0"), ("White", "#ffffff")):
+                col.addAction(name, lambda c=c, h=hit: self.layer.set_color(h, c))
+            menu.addAction("Delete", self.layer.delete_selected)
+            menu.addSeparator()
+        price = mp.y()
+        menu.addAction(f"Add horizontal line at {price:,.2f}",
+                       lambda: self.layer.add("hline", [[self.x_to_time(mp.x()), price]]))
+        menu.addSeparator()
+        a = menu.addAction("Auto-scale price")
+        a.setCheckable(True)
+        a.setChecked(self.auto_y)
+        a.toggled.connect(self.set_auto_y)
+        menu.addAction("Reset chart view", lambda: (self.set_auto_y(True), self.go_latest()))
+        menu.addAction("Undo\tCtrl+Z", self.layer.undo)
+        menu.addAction("Redo\tCtrl+Shift+Z", self.layer.redo)
+        menu.addAction("Remove all drawings", self.layer.clear)
+        menu.exec(QtGui.QCursor.pos())
+
     def _mouse_clicked(self, ev):
+        if self.df is not None and ev.button() == QtCore.Qt.MouseButton.RightButton and \
+                self.price.sceneBoundingRect().contains(ev.scenePos()):
+            self._context_menu(ev)
+            return
         if self.df is None or ev.button() != QtCore.Qt.MouseButton.LeftButton:
             return
         if ev.double():                                  # double-click an axis = reset that scale
