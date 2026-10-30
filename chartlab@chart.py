@@ -38,6 +38,14 @@ class _DotGridMixin:
 
 
 class PriceAxis(_DotGridMixin, pg.AxisItem):
+    chart = None
+
+    def tickStrings(self, values, scale, spacing):
+        ch = self.chart
+        if ch is not None and ch.scale_mode != "regular" and ch.df is not None:
+            return [ch.axis_label(v) for v in values]
+        return super().tickStrings(values, scale, spacing)
+
     """Right axis with TradingView-like tick density (a label every ~40 px)."""
 
     def tickSpacing(self, minVal, maxVal, size):
@@ -197,6 +205,7 @@ class ChartWidget(QtWidgets.QWidget):
     tradeRequested = QtCore.Signal(str, float)
     settingsRequested = QtCore.Signal()
     typed = QtCore.Signal(str)
+    barHovered = QtCore.Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -204,6 +213,10 @@ class ChartWidget(QtWidgets.QWidget):
         self.label = ""
         self.style = "candles"
         self.magnet = True
+        self.scale_mode = "regular"      # regular | log | percent
+        self._base = 1.0
+        self._last_overlays = None
+        self._last_trades = None
         self.auto_y = True
         self._limit = None            # replay: only bars [0, _limit) exist yet
         self.replay = {"active": False, "picking": False, "playing": False, "speed": 1.0}
@@ -335,6 +348,7 @@ class ChartWidget(QtWidgets.QWidget):
         p.hideButtons()
         p.showAxis("right")
         p.hideAxis("left")
+        p.getAxis("right").chart = self
         p.getAxis("right").setWidth(72)
         f = QtGui.QFont()
         f.setPixelSize(12)
@@ -380,7 +394,7 @@ class ChartWidget(QtWidgets.QWidget):
                 it.limit = self._limit
                 it.update()
         if self.line_item is not None:
-            c = self.df["Close"].to_numpy(float)
+            c = self.ty(self.df["Close"].to_numpy(float))
             self.line_item.setData(np.arange(n), c[:n])
         for items in self._ind_items.values():
             for _, it, _n in items:
@@ -584,6 +598,52 @@ class ChartWidget(QtWidgets.QWidget):
         self._refresh_axes()
 
     # ------------------------------------------------------------------ settings
+    def ty(self, y):
+        """price -> view coordinate for the current scale mode (works on scalars and arrays)."""
+        if self.scale_mode == "log":
+            return np.log10(np.maximum(y, 1e-9))
+        if self.scale_mode == "percent":
+            return (np.asarray(y, float) / (self._base or 1.0) - 1.0) * 100.0 if not np.isscalar(y) else (y / (self._base or 1.0) - 1.0) * 100.0
+        return y
+
+    def iy(self, v):
+        if self.scale_mode == "log":
+            return 10 ** v
+        if self.scale_mode == "percent":
+            return (self._base or 1.0) * (1.0 + v / 100.0)
+        return v
+
+    def axis_label(self, v: float) -> str:
+        if self.scale_mode == "percent":
+            return f"{v:+.2f}%"
+        return self.fp(self.iy(v))
+
+    def set_scale_mode(self, mode: str):
+        if mode == self.scale_mode:
+            return
+        self.scale_mode = mode
+        if self.df is None:
+            return
+        self._base = float(self.df["Close"].iloc[0])
+        n = len(self.df)
+        self.candles.set_data(self.df, self.style, self.ty)
+        close = self.ty(self.df["Close"].to_numpy(float))
+        self.line_item.setData(np.arange(n), close[:self._n()])
+        for key in list(self._enabled):
+            self._remove_indicator(key)
+            self._build_indicator(key)
+        self._rebuild_legend()
+        if self._last_overlays is not None:
+            self.set_strategy_overlays(self._last_overlays)
+        if self._last_trades is not None:
+            self.set_trades(self._last_trades)
+        self._apply_style()
+        self.layer.rebuild()
+        self.price.getAxis("right").picture = None
+        self.price.getAxis("right").update()
+        self._update_last_tag()
+        self.go_latest()
+
     def fp(self, x: float) -> str:
         """Format a price with the precision chosen in Settings."""
         p = settings.get()["precision"]
@@ -722,9 +782,10 @@ class ChartWidget(QtWidgets.QWidget):
         py = vb.mapViewToScene(QtCore.QPointF(x, y)).y()
         best, best_d = None, 16.0
         for v in (r["Open"], r["High"], r["Low"], r["Close"]):
-            d = abs(vb.mapViewToScene(QtCore.QPointF(x, float(v))).y() - py)
+            tv = float(self.ty(float(v)))
+            d = abs(vb.mapViewToScene(QtCore.QPointF(x, tv)).y() - py)
             if d < best_d:
-                best, best_d = float(v), d
+                best, best_d = tv, d
         return (float(i), best) if best is not None else (x, y)
 
     # ------------------------------------------------------------------ data
@@ -740,10 +801,11 @@ class ChartWidget(QtWidgets.QWidget):
             a.set_index(df.index)
         self._times = df.index.to_numpy().astype("datetime64[s]").astype("int64").astype(float)
 
-        self.candles = CandleItem(df, self.style)
+        self._base = float(df["Close"].iloc[0])
+        self.candles = CandleItem(df, self.style, self.ty)
         self.price.addItem(self.candles)
         close = df["Close"].to_numpy(float)
-        self.line_item = pg.PlotDataItem(x=np.arange(n), y=close, pen=pg.mkPen(theme.ACCENT, width=2))
+        self.line_item = pg.PlotDataItem(x=np.arange(n), y=self.ty(close), pen=pg.mkPen(theme.ACCENT, width=2))
         self.price.addItem(self.line_item)
         self.line_item.setClipToView(True)
         self.line_item.setDownsampling(auto=True, method='peak')
@@ -798,11 +860,11 @@ class ChartWidget(QtWidgets.QWidget):
             return
         is_candle = self.style in ("candles", "hollow")
         if is_candle:
-            self.candles.set_data(self.df, self.style)
+            self.candles.set_data(self.df, self.style, self.ty)
         self.candles.setVisible(is_candle)
         self.line_item.setVisible(not is_candle)
         if self.style == "area":
-            self.line_item.setFillLevel(float(np.nanmin(self._lows)))
+            self.line_item.setFillLevel(float(self.ty(np.nanmin(self._lows))))
             self.line_item.setBrush(pg.mkBrush(41, 98, 255, 55))
         else:
             self.line_item.setFillLevel(None)
@@ -849,8 +911,11 @@ class ChartWidget(QtWidgets.QWidget):
         items = []
         x = np.arange(len(c))
         for plot, y, color, name in lines:
-            item = pg.PlotDataItem(x=x, y=y.to_numpy(float), pen=pg.mkPen(color, width=1.3), connect="finite")
-            item._full = (x, y.to_numpy(float))
+            yy = y.to_numpy(float)
+            if plot is self.price:
+                yy = self.ty(yy)
+            item = pg.PlotDataItem(x=x, y=yy, pen=pg.mkPen(color, width=1.3), connect="finite")
+            item._full = (x, yy)
             plot.addItem(item)
             if self._limit is not None:
                 item.setData(x[:self._limit], item._full[1][:self._limit])
@@ -893,13 +958,15 @@ class ChartWidget(QtWidgets.QWidget):
         for item, _ in self._strategy_items:
             self.price.removeItem(item)
         self._strategy_items = []
+        self._last_overlays = overlays
         if self.df is None:
             return
         x = np.arange(len(self.df))
         for i, (name, series) in enumerate(overlays.items()):
             color = theme.LINE_COLORS[(i + 2) % len(theme.LINE_COLORS)]
-            item = pg.PlotDataItem(x=x, y=series.to_numpy(float), pen=pg.mkPen(color, width=1.4), connect="finite")
-            item._full = (x, series.to_numpy(float))
+            sy = self.ty(series.to_numpy(float))
+            item = pg.PlotDataItem(x=x, y=sy, pen=pg.mkPen(color, width=1.4), connect="finite")
+            item._full = (x, sy)
             self.price.addItem(item)
             if self._limit is not None:
                 item.setData(x[:self._limit], item._full[1][:self._limit])
@@ -907,6 +974,7 @@ class ChartWidget(QtWidgets.QWidget):
         self._rebuild_legend()
 
     def set_trades(self, trades: pd.DataFrame):
+        self._last_trades = trades
         for item in self._marker_items:
             self.price.removeItem(item)
         self._marker_items = []
@@ -915,9 +983,9 @@ class ChartWidget(QtWidgets.QWidget):
         ei = trades["entry_idx"].to_numpy(int)
         closed = trades[~trades["open"].astype(bool)]
         xi = closed["exit_idx"].to_numpy(int)
-        buys = pg.ScatterPlotItem(x=ei, y=self._lows[ei] * 0.994, symbol="t1", size=13,
+        buys = pg.ScatterPlotItem(x=ei, y=self.ty(self._lows[ei] * 0.994), symbol="t1", size=13,
                                   brush=pg.mkBrush(theme.UP), pen=pg.mkPen("#0b3d38"))
-        sells = pg.ScatterPlotItem(x=xi, y=self._highs[xi] * 1.006, symbol="t", size=13,
+        sells = pg.ScatterPlotItem(x=xi, y=self.ty(self._highs[xi] * 1.006), symbol="t", size=13,
                                    brush=pg.mkBrush(theme.DOWN), pen=pg.mkPen("#4a1614"))
         for s in (buys, sells):
             self.price.addItem(s)
@@ -950,7 +1018,7 @@ class ChartWidget(QtWidgets.QWidget):
         lo, hi = max(0, int(np.floor(x0))), min(n, int(np.ceil(x1)) + 1)
         if hi <= lo:
             return
-        ymin, ymax = float(np.nanmin(self._lows[lo:hi])), float(np.nanmax(self._highs[lo:hi]))
+        ymin, ymax = float(np.nanmin(self.ty(self._lows[lo:hi]))), float(np.nanmax(self.ty(self._highs[lo:hi])))
         S = settings.get()
         rng = (ymax - ymin) or ymax * 0.02
         self.price.vb.setYRange(ymin - rng * (S['margin_bottom'] + 10) / 100, ymax + rng * S['margin_top'] / 100, padding=0)   # room for the volume strip
@@ -967,9 +1035,9 @@ class ChartWidget(QtWidgets.QWidget):
         last, prev = float(self.df["Close"].iloc[self._n() - 1]), float(self.df["Open"].iloc[self._n() - 1])
         color = theme.UP if last >= prev else theme.DOWN
         self.last_tag.fill = pg.mkBrush(color)
-        self.last_tag.setText(f" {self.fp(last)} ")
+        self.last_tag.setText(f" {self.axis_label(float(self.ty(last)))} " if self.scale_mode == "percent" else f" {self.fp(last)} ")
         self.last_line.setPen(pg.mkPen(color, style=QtCore.Qt.PenStyle.DotLine))
-        self.last_line.setPos(last)
+        self.last_line.setPos(float(self.ty(last)))
         self.last_tag.setVisible(bool(settings.get()['last_label']))
         self.last_line.setVisible(bool(settings.get()['last_line']))
         self._place_last_tag()
@@ -978,7 +1046,7 @@ class ChartWidget(QtWidgets.QWidget):
         if self.df is None or not self.last_tag.isVisible():
             return
         xr = self.price.vb.viewRange()[0][1]
-        y = float(self.df["Close"].iloc[self._n() - 1])
+        y = float(self.ty(float(self.df["Close"].iloc[self._n() - 1])))
         self.last_tag.setPos(xr, y)
         self.cd_tag.setPos(xr, y)
 
@@ -1035,7 +1103,7 @@ class ChartWidget(QtWidgets.QWidget):
             p.ytag.setVisible(p is hovered)
         hovered.hline.setPos(mp.y())
         xr = hovered.vb.viewRange()[0][1]
-        hovered.ytag.setText(f" {self.fp(mp.y())} ")
+        hovered.ytag.setText(f" {self.axis_label(mp.y()) if hovered is self.price else self.fp(mp.y())} ")
         hovered.ytag.setPos(xr, mp.y())
         if 0 <= i < self._n():
             self._update_header(i)
@@ -1089,7 +1157,7 @@ class ChartWidget(QtWidgets.QWidget):
                 col.addAction(name, lambda c=c, h=hit: self.layer.set_color(h, c))
             menu.addAction("Delete", self.layer.delete_selected)
             menu.addSeparator()
-        price = mp.y()
+        price = float(self.iy(mp.y()))
         menu.addAction(f"Copy price {self.fp(price)}", lambda: QtWidgets.QApplication.clipboard().setText(f"{price:.2f}"))
         menu.addAction(f"Add alert at {price:,.2f}\tAlt+A", lambda: self.alertRequested.emit(float(price)))
         menu.addAction(f"Add horizontal line at {price:,.2f}",
@@ -1116,6 +1184,12 @@ class ChartWidget(QtWidgets.QWidget):
         a.setCheckable(True)
         a.setChecked(self.auto_y)
         a.toggled.connect(lambda on: (self.set_auto_y(on), self._autoscale()))
+        menu.addSeparator()
+        for lbl, md, sc in (("Regular", "regular", ""), ("Percent", "percent", "Alt+P"), ("Logarithmic", "log", "Alt+L")):
+            ma = menu.addAction(lbl + (f"\t{sc}" if sc else ""))
+            ma.setCheckable(True)
+            ma.setChecked(self.scale_mode == md)
+            ma.triggered.connect(lambda _=False, md=md: self.set_scale_mode(md))
         menu.addSeparator()
         inv = menu.addAction("Invert scale\tAlt+I")
         inv.setCheckable(True)
@@ -1179,7 +1253,32 @@ class ChartWidget(QtWidgets.QWidget):
         lab = (self.label or "").upper()
         return "NSE" if lab and not lab.endswith("=X") and "." not in lab else (lab.split(".")[-1] if "." in lab else "FX")
 
+    def data_window_html(self, i: int) -> str:
+        df = self.df
+        if df is None or not 0 <= i < len(df):
+            return ""
+        r = df.iloc[i]
+        prev = df["Close"].iloc[i - 1] if i > 0 else r["Open"]
+        d = r["Close"] - prev
+        col = theme.UP if d >= 0 else theme.DOWN
+        rows = [("Date", df.index[i].strftime("%a %d %b '%y %H:%M")), ("Symbol", self.label)]
+        for k in ("Open", "High", "Low", "Close"):
+            rows.append((k, self.fp(r[k])))
+        rows.append(("Change", f"{d:+,.2f} ({(r['Close'] / prev - 1) * 100 if prev else 0:+.2f}%)"))
+        rows.append(("Volume", f"{float(r['Volume']):,.0f}"))
+        for key, items in self._ind_items.items():
+            for _, it, name in items:
+                f = getattr(it, "_full", None)
+                if f is not None and name and i < len(f[1]) and np.isfinite(f[1][i]):
+                    rows.append((name, self.fp(self.iy(f[1][i]))))
+        out = "<table cellspacing=6>"
+        for k, v in rows:
+            vc = col if k in ("Open", "High", "Low", "Close", "Change") else "#d1d4dc"
+            out += f"<tr><td style='color:#787b86'>{k}</td><td align=right style='color:{vc}'>{v}</td></tr>"
+        return out + "</table>"
+
     def _update_header(self, i: int):
+        self.barHovered.emit(i)
         self._update_trade_buttons()
         df = self.df
         r = df.iloc[i]

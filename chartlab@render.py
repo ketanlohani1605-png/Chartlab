@@ -28,17 +28,22 @@ def _visible(item, n: int):
 
 
 class CandleItem(pg.GraphicsObject):
-    def __init__(self, df=None, style="candles"):
+    def __init__(self, df=None, style="candles", tf=None):
         super().__init__()
         self.style = style
+        self.tf = tf
         self.limit = None
         self.o = self.h = self.l = self.c = np.zeros(0)
         if df is not None:
             self.set_data(df, style)
 
-    def set_data(self, df, style="candles"):
+    def set_data(self, df, style="candles", tf=None):
         self.style = style
+        if tf is not None:
+            self.tf = tf
         self.o, self.h, self.l, self.c = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
+        if self.tf is not None:
+            self.o, self.h, self.l, self.c = (np.asarray(self.tf(a), float) for a in (self.o, self.h, self.l, self.c))
         self.prepareGeometryChange()
         self.informViewBoundsChanged()
         self.update()

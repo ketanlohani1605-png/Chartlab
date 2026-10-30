@@ -78,6 +78,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_watchlist_dock()
         self._build_strategy_dock()
         self._build_alerts_dock()
+        self._build_data_dock()
         self._build_results_dock()
         self._build_right_rail()
         self._build_menu()
@@ -115,6 +116,7 @@ class MainWindow(QtWidgets.QMainWindow):
             p.chart.tradeRequested.connect(self._on_trade)
             p.chart.settingsRequested.connect(self.open_settings)
             p.chart.typed.connect(self._chart_typed)
+            p.chart.barHovered.connect(lambda i, p=p: self._update_data_window(p, i))
             self.panels.append(p)
         self.active = self.panels[0]
         self.active.set_active(True)
@@ -498,11 +500,27 @@ class MainWindow(QtWidgets.QMainWindow):
         for dock, ico, tip in ((self.watch_dock, "watchlist", "Watchlist"),
                                (self.strategy_dock, "code", "Python strategy editor"),
                                (self.results_dock, "table", "Backtest results"),
-                               (self.alerts_dock, "bell", "Alerts")):
+                               (self.alerts_dock, "bell", "Alerts"),
+                               (self.data_dock, "table", "Data window")):
             act = dock.toggleViewAction()
             act.setIcon(icons.get(ico))
             act.setToolTip(tip)
             tb.addAction(act)
+
+    def _build_data_dock(self):
+        self.data_lbl = QtWidgets.QLabel("Hover a bar")
+        self.data_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self.data_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.data_lbl.setStyleSheet("padding:8px;")
+        self.data_dock = QtWidgets.QDockWidget("Data window", self)
+        self.data_dock.setObjectName("data_dock")
+        self.data_dock.setWidget(self.data_lbl)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.data_dock)
+        self.data_dock.hide()
+
+    def _update_data_window(self, panel, i):
+        if panel is self.active and self.data_dock.isVisible():
+            self.data_lbl.setText(panel.chart.data_window_html(i))
 
     def _build_alerts_dock(self):
         self.alerts_panel = alertmod.AlertsPanel(self.alerts)
@@ -708,7 +726,9 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=lambda: self.statusBar().showMessage("Layout saved (auto)", 2000))
         QtGui.QShortcut(QtGui.QKeySequence("Alt+G"), self, activated=lambda: self._goto_date())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+I"), self, activated=lambda: self.active.chart.price.vb.invertY(not self.active.chart.price.vb.state["yInverted"]))
-        QtGui.QShortcut(QtGui.QKeySequence("Alt+D"), self, activated=lambda: self.statusBar().showMessage("Data window: hover the chart – values show in the legend", 3000))
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+L"), self, activated=lambda: self._toggle_scale("log"))
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+P"), self, activated=lambda: self._toggle_scale("percent"))
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+D"), self, activated=lambda: self.data_dock.setVisible(not self.data_dock.isVisible()))
         QtGui.QShortcut(QtGui.QKeySequence("Shift+F"), self, activated=self.toggle_fullscreen)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+,"), self, activated=self.open_settings)
 
@@ -728,11 +748,15 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.open_interval_popup(ch)
 
+    def _toggle_scale(self, mode):
+        ch = self.active.chart
+        ch.set_scale_mode("regular" if ch.scale_mode == mode else mode)
+
     def quick_search(self):
         """Ctrl+K: 'Search tool or function' – a filterable list of actions."""
         items = {"Settings": self.open_settings, "Go to date": self._goto_date, "Full screen": self.toggle_fullscreen,
                  "Save chart image": self.save_chart_image, "Reset chart view": lambda: self.active.chart.go_latest(),
-                 "Create alert": lambda: self.create_alert(), "Symbol search": self.open_symbol_search,
+                 "Create alert": lambda: self.create_alert(), "Data window": lambda: self.data_dock.setVisible(not self.data_dock.isVisible()), "Symbol search": self.open_symbol_search,
                  "Change interval": lambda: self.open_interval_popup("")}
         for lbl, fn in getattr(self, "_extra_actions", {}).items():
             items[lbl] = fn

@@ -131,13 +131,13 @@ class DrawingLayer(QtCore.QObject):
         kind, idx = g["mode"]
         if kind == "pt":
             sx, sy = self.chart.snap(x, y) if self.chart.magnet else (x, y)
-            d["pts"][idx] = [self.chart.x_to_time(sx), sy]
+            d["pts"][idx] = [self.chart.x_to_time(sx), float(self.chart.iy(sy))]
         else:
             dx, dy = x - g["x0"], y - g["y0"]
             new = []
             for (t, p) in g["orig"]:
                 nx = self.chart.time_to_x(t) + (0 if d["type"] == "hline" else dx)
-                new.append([self.chart.x_to_time(nx), p + (0 if d["type"] == "vline" else dy)])
+                new.append([self.chart.x_to_time(nx), p if d["type"] == "vline" else float(self.chart.iy(self.chart.ty(p) + dy))])
             d["pts"] = new
         self._drop_items(d["id"])
         self._build(d)
@@ -256,7 +256,7 @@ class DrawingLayer(QtCore.QObject):
     def handle_click(self, x: float, y: float):
         if self.tool:
             t = self.chart.x_to_time(x)
-            self.pending.append([t, y])
+            self.pending.append([t, float(self.chart.iy(y))])
             if len(self.pending) >= TOOLS[self.tool]:
                 note = None
                 if self.tool == "text":
@@ -287,7 +287,7 @@ class DrawingLayer(QtCore.QObject):
     def handle_move(self, x: float, y: float):
         if not (self.tool and self.pending):
             return
-        d = {"id": -1, "type": self.tool, "pts": self.pending + [[self.chart.x_to_time(x), y]],
+        d = {"id": -1, "type": self.tool, "pts": self.pending + [[self.chart.x_to_time(x), float(self.chart.iy(y))]],
              "color": DEFAULT_COLOR}
         self._clear_preview()
         self._preview_items = self._make_items(d, preview=True)
@@ -317,7 +317,8 @@ class DrawingLayer(QtCore.QObject):
         self._preview_items = []
 
     def _xy(self, d):
-        return [(self.chart.time_to_x(t), p) for t, p in d["pts"]]
+        ty = self.chart.ty
+        return [(self.chart.time_to_x(t), float(ty(p))) for t, p in d["pts"]]
 
     def _make_items(self, d, preview: bool = False) -> list:
         if not self.chart.has_data():
@@ -343,7 +344,7 @@ class DrawingLayer(QtCore.QObject):
             items.append(pg.PlotDataItem([x1, ex], [y1, ey], pen=pen))
         elif t == "hline" and pts:
             items.append(pg.InfiniteLine(pos=pts[0][1], angle=0, movable=False, pen=pen,
-                                         label="{value:0.2f}",
+                                         label=f"{self.chart.iy(pts[0][1]):,.2f}",
                                          labelOpts={"position": 0.04, "color": color,
                                                     "fill": (19, 23, 34, 200)}))
         elif t == "vline" and pts:
@@ -398,8 +399,9 @@ class DrawingLayer(QtCore.QObject):
             r.setPen(qp); r.setBrush(QtGui.QBrush(c))
             items.append(r)
             if t == "pricerange":
-                dp = y2 - y1
-                txt = f"{dp:+,.2f} ({dp / y1 * 100 if y1 else 0:+.2f}%)"
+                ry1, ry2 = float(self.chart.iy(y1)), float(self.chart.iy(y2))
+                dp = ry2 - ry1
+                txt = f"{dp:+,.2f} ({dp / ry1 * 100 if ry1 else 0:+.2f}%)"
                 items.append(pg.PlotDataItem([(x1 + x2) / 2] * 2, [y1, y2], pen=pg.mkPen(col, width=1.2)))
             else:
                 txt = f"{int(round(x2 - x1))} bars"
@@ -431,7 +433,7 @@ class DrawingLayer(QtCore.QObject):
             for lvl, col in zip(FIB_LEVELS, FIB_COLORS):
                 price = y2 + (y1 - y2) * lvl
                 items.append(pg.PlotDataItem([xa, xb], [price, price], pen=pg.mkPen(col, width=1.4 if sel else 1)))
-                tx = pg.TextItem(f"{lvl:g}  ({price:,.2f})", color=col, anchor=(0, 1))
+                tx = pg.TextItem(f"{lvl:g}  ({self.chart.iy(price):,.2f})", color=col, anchor=(0, 1))
                 tx.setPos(xa, price)
                 items.append(tx)
         elif t == "measure" and len(pts) == 2:
@@ -447,8 +449,9 @@ class DrawingLayer(QtCore.QObject):
             r.setBrush(QtGui.QBrush(c))
             items.append(r)
             items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pg.mkPen(col, width=1.2)))
-            dp = y2 - y1
-            pct = dp / y1 * 100 if y1 else 0.0
+            ry1, ry2 = (float(self.chart.iy(y1)), float(self.chart.iy(y2)))
+            dp = ry2 - ry1
+            pct = dp / ry1 * 100 if ry1 else 0.0
             bars = int(round(x2 - x1))
             tx = pg.TextItem(f"{dp:+,.2f} ({pct:+.2f}%)\n{bars} bars", color="#ffffff", anchor=(0.5, 1 if up else 0),
                              fill=pg.mkBrush(col))
