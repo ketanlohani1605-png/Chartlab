@@ -33,6 +33,8 @@ jobs:
           pyinstaller --noconfirm --windowed --name ChartLab \
             --add-data "strategies:strategies" \
             --add-data "providers:providers" \
+            --add-data "assets:assets" \
+            --icon assets/icon.icns \
             --collect-submodules chartlab \
             --collect-submodules yfinance \
             --collect-submodules pyqtgraph --collect-data pyqtgraph \
@@ -74,6 +76,8 @@ jobs:
           pyinstaller --noconfirm --windowed --name ChartLab \
             --add-data "strategies:strategies" \
             --add-data "providers:providers" \
+            --add-data "assets:assets" \
+            --icon assets/icon.icns \
             --collect-submodules chartlab \
             --collect-submodules yfinance \
             --collect-submodules pyqtgraph --collect-data pyqtgraph \
@@ -115,6 +119,8 @@ jobs:
           pyinstaller --noconfirm --windowed --name ChartLab \
             --add-data "strategies:strategies" \
             --add-data "providers:providers" \
+            --add-data "assets:assets" \
+            --icon assets/icon.icns \
             --collect-submodules chartlab \
             --collect-submodules yfinance \
             --collect-submodules pyqtgraph --collect-data pyqtgraph \
