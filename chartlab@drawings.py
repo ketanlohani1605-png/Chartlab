@@ -13,11 +13,14 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
 
-TOOLS = {"trend": 2, "ray": 2, "hline": 1, "vline": 1, "rect": 2, "fib": 2, "measure": 2, "text": 1, "hray": 1, "crossline": 1}
+TOOLS = {"trend": 2, "ray": 2, "hline": 1, "vline": 1, "rect": 2, "fib": 2, "measure": 2, "text": 1, "hray": 1, "crossline": 1,
+         "ext": 2, "arrow": 2, "ellipse": 2, "pricerange": 2, "daterange": 2, "long": 2, "short": 2}
 TOOL_LABELS = {"trend": "Trend line", "ray": "Ray", "hline": "Horizontal line",
                "vline": "Vertical line", "rect": "Rectangle", "fib": "Fib retracement",
                "measure": "Measure (price / % / bars)", "text": "Text note",
-               "hray": "Horizontal ray", "crossline": "Cross line"}
+               "hray": "Horizontal ray", "crossline": "Cross line", "ext": "Extended line",
+               "arrow": "Arrow", "ellipse": "Ellipse", "pricerange": "Price range", "daterange": "Date range",
+               "long": "Long position", "short": "Short position"}
 FIB_LEVELS = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
 FIB_COLORS = ["#787b86", "#f23645", "#ff9800", "#4caf50", "#089981", "#00bcd4", "#787b86"]
 DEFAULT_COLOR = "#2962ff"
@@ -360,6 +363,66 @@ class DrawingLayer(QtCore.QObject):
             c.setAlpha(45)
             r.setBrush(QtGui.QBrush(c))
             items.append(r)
+        elif t == "ext" and len(pts) == 2:
+            (x1, y1), (x2, y2) = pts
+            if x2 == x1:
+                items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pen))
+            else:
+                ya = y1 + (y2 - y1) * (-5 - x1) / (x2 - x1)
+                yb = y1 + (y2 - y1) * (xmax - x1) / (x2 - x1)
+                items.append(pg.PlotDataItem([-5, xmax], [ya, yb], pen=pen))
+        elif t == "arrow" and len(pts) == 2:
+            (x1, y1), (x2, y2) = pts
+            items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pen))
+            import math as _m
+            vb = self.chart.price.vb
+            pa = vb.mapViewToScene(QtCore.QPointF(x1, y1)); pb = vb.mapViewToScene(QtCore.QPointF(x2, y2))
+            ang = _m.degrees(_m.atan2(-(pb.y() - pa.y()), pb.x() - pa.x()))
+            ar = pg.ArrowItem(pos=(x2, y2), angle=180 - ang, headLen=14, tipAngle=30, brush=pg.mkBrush(color), pen=pg.mkPen(color))
+            items.append(ar)
+        elif t == "ellipse" and len(pts) == 2:
+            (x1, y1), (x2, y2) = pts
+            r = QtWidgets.QGraphicsEllipseItem(QtCore.QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)))
+            qpen = QtGui.QPen(pen); qpen.setCosmetic(True)
+            r.setPen(qpen)
+            c = QtGui.QColor(color); c.setAlpha(40)
+            r.setBrush(QtGui.QBrush(c))
+            items.append(r)
+        elif t in ("pricerange", "daterange") and len(pts) == 2:
+            (x1, y1), (x2, y2) = pts
+            up = (y2 >= y1) if t == "pricerange" else (x2 >= x1)
+            col = theme.UP if up else theme.DOWN
+            c = QtGui.QColor(col); c.setAlpha(50)
+            r = QtWidgets.QGraphicsRectItem(QtCore.QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)))
+            qp = QtGui.QPen(pg.mkPen(col, width=1)); qp.setCosmetic(True)
+            r.setPen(qp); r.setBrush(QtGui.QBrush(c))
+            items.append(r)
+            if t == "pricerange":
+                dp = y2 - y1
+                txt = f"{dp:+,.2f} ({dp / y1 * 100 if y1 else 0:+.2f}%)"
+                items.append(pg.PlotDataItem([(x1 + x2) / 2] * 2, [y1, y2], pen=pg.mkPen(col, width=1.2)))
+            else:
+                txt = f"{int(round(x2 - x1))} bars"
+                items.append(pg.PlotDataItem([x1, x2], [(y1 + y2) / 2] * 2, pen=pg.mkPen(col, width=1.2)))
+            tx = pg.TextItem(txt, color="#ffffff", anchor=(0.5, 1), fill=pg.mkBrush(col))
+            tx.setPos((x1 + x2) / 2, max(y1, y2))
+            items.append(tx)
+        elif t in ("long", "short") and len(pts) == 2:
+            (x1, y1), (x2, y2) = pts                      # entry price = y1, target = y2, stop mirrored
+            sgn = 1 if t == "long" else -1
+            tgt = y2
+            stop = y1 - (tgt - y1)
+            xa, xb = min(x1, x2), max(x1, x2, min(x1, x2) + 1)
+            for lo, hi, col in ((min(y1, tgt), max(y1, tgt), theme.UP), (min(y1, stop), max(y1, stop), theme.DOWN)):
+                c = QtGui.QColor(col); c.setAlpha(55)
+                r = QtWidgets.QGraphicsRectItem(QtCore.QRectF(xa, lo, xb - xa, hi - lo))
+                r.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen)); r.setBrush(QtGui.QBrush(c))
+                items.append(r)
+            items.append(pg.PlotDataItem([xa, xb], [y1, y1], pen=pg.mkPen("#d1d4dc", width=1.2)))
+            rr = abs(tgt - y1) / abs(stop - y1) if stop != y1 else 0
+            tx = pg.TextItem(f"{'Long' if sgn > 0 else 'Short'}  R/R {rr:.2f}", color="#ffffff", anchor=(0, 1), fill=pg.mkBrush("#2a2e39"))
+            tx.setPos(xa, y1)
+            items.append(tx)
         elif t == "fib" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             xa, xb = min(x1, x2), max(x1, x2, min(x1, x2) + 1)
@@ -425,6 +488,17 @@ class DrawingLayer(QtCore.QObject):
         if t == "vline":
             lo, hi = self.chart.y_range()
             return [((pts[0][0], lo), (pts[0][0], hi))]
+        if t in ("rect", "ellipse", "pricerange", "daterange", "long", "short") and len(pts) == 2:
+            (x1, y1), (x2, y2) = pts
+            return [((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)), ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))]
+        if t == "arrow" and len(pts) == 2:
+            return [(pts[0], pts[1])]
+        if t == "ext" and len(pts) == 2:
+            (x1, y1), (x2, y2) = pts
+            if x2 == x1:
+                return [(pts[0], pts[1])]
+            f = lambda x: y1 + (y2 - y1) * (x - x1) / (x2 - x1)
+            return [((-5, f(-5)), (far, f(far)))]
         if t == "rect" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             return [((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)), ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))]

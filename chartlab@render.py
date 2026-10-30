@@ -6,7 +6,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui
 
-from . import theme
+from . import settings, theme
 
 MIN_BAR_PX = 3.0
 
@@ -67,22 +67,31 @@ class CandleItem(pg.GraphicsObject):
             l = np.minimum.reduceat(self.l[i0:i1], edges - i0)
             xs = edges + (g - 1) / 2.0
             w = 0.36 * g
-        up = c >= o
+        S = settings.get()
+        if S["prev_close"]:
+            if g == 1:
+                pc = np.concatenate(([self.c[i0 - 1] if i0 > 0 else o[0]], self.c[i0:i1 - 1]))
+            else:
+                pc = self.c[np.maximum(edges - 1, 0)]
+            up = c >= pc
+        else:
+            up = c >= o
         hollow = self.style == "hollow"
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
-        for is_up, color in ((True, theme.UP), (False, theme.DOWN)):
+        for is_up, body, brd, wick in ((True, S["up"], S["border_up"], S["wick_up"]),
+                                       (False, S["down"], S["border_down"], S["wick_down"])):
             m = up == is_up
             if not m.any():
                 continue
-            pen = pg.mkPen(color)
-            p.setPen(pen)
-            p.setBrush(QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush) if (hollow and is_up) else pg.mkBrush(color))
             x, hh, ll, oo, cc = xs[m], h[m], l[m], o[m], c[m]
-            lines = [QtCore.QLineF(a, b, a, d) for a, b, d in zip(x, ll, hh)]
-            p.drawLines(lines)
-            if g == 1 or True:
-                for a, b, d in zip(x, oo, cc):
-                    p.drawRect(QtCore.QRectF(a - w, b, 2 * w, d - b))
+            if S["wick"]:
+                p.setPen(pg.mkPen(wick))
+                p.drawLines([QtCore.QLineF(a, b, a, d) for a, b, d in zip(x, ll, hh)])
+            p.setPen(pg.mkPen(brd) if S["border"] else QtCore.Qt.PenStyle.NoPen)
+            fill = QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush) if ((hollow and is_up) or not S["body"]) else pg.mkBrush(body)
+            p.setBrush(fill)
+            for a, b, d in zip(x, oo, cc):
+                p.drawRect(QtCore.QRectF(a - w, b, 2 * w, d - b))
 
 
 class VolumeItem(pg.GraphicsObject):
@@ -94,6 +103,12 @@ class VolumeItem(pg.GraphicsObject):
         self.up = np.zeros(0, bool)
         if df is not None:
             self.set_data(df)
+
+    @staticmethod
+    def _c(up):
+        c = QtGui.QColor(settings.get()['up' if up else 'down'])
+        c.setAlpha(110)
+        return c
 
     def set_data(self, df):
         self.v = df["Volume"].to_numpy(float)
@@ -129,7 +144,7 @@ class VolumeItem(pg.GraphicsObject):
             (y0, y1) = self.overlay.viewRange()[1]
             vmax = float(np.nanmax(v)) or 1.0
             base, k = y0, 0.16 * (y1 - y0) / vmax
-        for is_up, col in ((True, QtGui.QColor(8, 153, 129, 110)), (False, QtGui.QColor(242, 54, 69, 110))):
+        for is_up, col in ((True, self._c(True)), (False, self._c(False))):
             p.setBrush(col)
             m = up == is_up
             for a, b in zip(xs[m], v[m]):

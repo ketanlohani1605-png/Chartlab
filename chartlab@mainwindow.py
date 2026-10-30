@@ -60,6 +60,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("ChartLab")
         self.setUnifiedTitleAndToolBarOnMac(True)
         self.settings = settings or QtCore.QSettings("ChartLab", "ChartLab")
+        from . import settings as _cs
+        _cs.load(self.settings)
         self.layout_name = "1"
         self.panels: list[ChartPanel] = []
         self.active: ChartPanel | None = None
@@ -83,6 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.api_label = QtWidgets.QLabel("")
         self.statusBar().addPermanentWidget(self.api_label)
         self._shortcuts()
+        self.apply_chart_settings()
         self._restore()
 
     # ------------------------------------------------------------------ construction
@@ -110,6 +113,8 @@ class MainWindow(QtWidgets.QMainWindow):
             p.chart.replayChanged.connect(lambda: self.replay_btn.setChecked(self.active.chart.replay['active']))
             p.chart.alertRequested.connect(lambda price, pp=p: self.create_alert(price, pp))
             p.chart.tradeRequested.connect(self._on_trade)
+            p.chart.settingsRequested.connect(self.open_settings)
+            p.chart.typed.connect(self._chart_typed)
             self.panels.append(p)
         self.active = self.panels[0]
         self.active.set_active(True)
@@ -168,22 +173,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"PAPER {side} {sym} @ {price:,.2f}  (paper trade, no broker order sent)", 6000)
 
     def _goto_date(self):
+        from .tvui import GoTo
+        import pandas as _pd
         ch = self.active.chart
         if not ch.has_data():
             return
-        txt, ok = QtWidgets.QInputDialog.getText(self, "Go to date", "Date (YYYY-MM-DD):")
-        if not ok or not txt.strip():
+        d = GoTo(self)
+        if not d.exec():
             return
-        try:
-            import pandas as _pd
-            t = _pd.Timestamp(txt.strip())
-            if ch.df.index.tz is not None and t.tzinfo is None:
+
+        def idx(qd, qt=None):
+            t = _pd.Timestamp(qd.year(), qd.month(), qd.day())
+            if qt is not None:
+                t += _pd.Timedelta(hours=qt.hour(), minutes=qt.minute())
+            if ch.df.index.tz is not None:
                 t = t.tz_localize(ch.df.index.tz)
-            i = int(ch.df.index.searchsorted(t))
-            i = max(0, min(i, len(ch.df) - 1))
+            return max(0, min(int(ch.df.index.searchsorted(t)), len(ch.df) - 1))
+        if d.tabs.currentIndex() == 0:
+            i = idx(d.date.date(), d.time.time())
             ch.price.vb.setXRange(i - 60, i + 60, padding=0)
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "Go to date", f"Invalid date: {e}")
+        else:
+            i0, i1 = idx(d.d0.date()), idx(d.d1.date())
+            ch.price.vb.setXRange(i0 - 2, max(i1, i0 + 5) + 2, padding=0)
+
+    def open_symbol_search(self, text: str = ""):
+        from .tvui import SymbolSearch
+        d = SymbolSearch(self, list(self._symbol_model.stringList()), text)
+        if d.exec() and d.chosen:
+            self.symbol.setText(d.chosen)
+            self.on_load()
+
+    def open_interval_popup(self, first: str):
+        from .tvui import IntervalPopup
+        d = IntervalPopup(self, first)
+        if d.exec() and d.code in self.interval_btns:
+            self.interval_btns[d.code].click()
+            self._sync_interval_label()
 
     def _tick_clock(self):
         import datetime as _dt
@@ -340,6 +365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tbtn("undo", "Undo  (Ctrl+Z)", lambda: self.active.chart.layer.undo())
         tbtn("redo", "Redo  (Ctrl+Shift+Z)", lambda: self.active.chart.layer.redo())
         tb.addSeparator()
+        tbtn("gear", "Settings", self.open_settings)
         tbtn("fullscreen", "Full screen  (Ctrl+Cmd+F)", self.toggle_fullscreen)
         tbtn("camera", "Save chart image", self.save_chart_image)
         tb.addSeparator()
@@ -408,13 +434,36 @@ class MainWindow(QtWidgets.QMainWindow):
         cur.triggered.connect(lambda: self._tool_clicked(None))
         self.draw_actions[None] = cur
         tb.addSeparator()
-        for key, _glyph in DRAW_BUTTONS:
-            a = tb.addAction(icons.get({"hray": "ray", "crossline": "cross"}.get(key, key)), "")
-            a.setCheckable(True)
-            a.setToolTip(TOOL_LABELS[key])
-            self.draw_group.addAction(a)
-            a.triggered.connect(lambda _=False, k=key: self._tool_clicked(k))
-            self.draw_actions[key] = a
+        ICON = {"hray": "ray", "crossline": "cross", "ext": "trend", "arrow": "ray", "ellipse": "rect",
+                "pricerange": "measure", "daterange": "measure", "long": "measure", "short": "measure"}
+        SC = {"trend": "Alt+T", "hline": "Alt+H", "hray": "Alt+J", "vline": "Alt+V", "crossline": "Alt+C",
+              "fib": "Alt+F", "rect": "Shift+Alt+R"}
+        GROUPS = [("Trend lines", ["trend", "ray", "ext", "hray", "hline", "vline", "crossline"]),
+                  ("Fib", ["fib"]),
+                  ("Shapes", ["rect", "ellipse", "arrow"]),
+                  ("Forecasting and measurement", ["long", "short", "pricerange", "daterange", "measure"]),
+                  ("Annotation", ["text"])]
+        self.tool_groups = {}
+        for gname, keys in GROUPS:
+            ga = tb.addAction(icons.get(ICON.get(keys[0], keys[0])), "")
+            ga.setCheckable(True)
+            ga.setToolTip(gname)
+            self.draw_group.addAction(ga)
+            for k in keys:
+                self.draw_actions[k] = ga
+            self.tool_groups[ga] = keys
+            ga.setData(keys[0])
+            ga.triggered.connect(lambda _=False, ga=ga: self._tool_clicked(ga.data()))
+            if len(keys) == 1:
+                continue
+            menu = QtWidgets.QMenu(self)
+            for k in keys:
+                act = menu.addAction(icons.get(ICON.get(k, k)), TOOL_LABELS[k] + (f"\t{SC[k]}" if k in SC else ""))
+                act.triggered.connect(lambda _=False, k=k, ga=ga: (ga.setIcon(icons.get(ICON.get(k, k))), ga.setData(k), self._tool_clicked(k)))
+            ga.setMenu(menu)
+            btn = tb.widgetForAction(ga)
+            btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._tool_icon = ICON
         tb.addSeparator()
         self.magnet_action = tb.addAction(icons.get("magnet"), "")
         self.magnet_action.setCheckable(True)
@@ -650,6 +699,72 @@ class MainWindow(QtWidgets.QMainWindow):
             QtGui.QShortcut(QtGui.QKeySequence(k), self, activated=lambda: self.active.chart.layer.redo())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+A"), self, activated=lambda: self.create_alert())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+R"), self, activated=lambda: self.active.chart.go_latest())
+        for key, tool in (("Alt+T", "trend"), ("Alt+H", "hline"), ("Alt+J", "hray"), ("Alt+V", "vline"),
+                          ("Alt+C", "crossline"), ("Alt+F", "fib"), ("Shift+Alt+R", "rect")):
+            QtGui.QShortcut(QtGui.QKeySequence(key), self, activated=lambda t=tool: self._tool_clicked(t))
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+K"), self, activated=self.quick_search)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+H"), self, activated=lambda: [p.chart.layer.set_hidden(not p.chart.layer.hidden) for p in self.panels])
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+Return"), self, activated=lambda: self.statusBar().showMessage("Maximise chart: use the 1-chart layout", 3000))
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=lambda: self.statusBar().showMessage("Layout saved (auto)", 2000))
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+G"), self, activated=lambda: self._goto_date())
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+I"), self, activated=lambda: self.active.chart.price.vb.invertY(not self.active.chart.price.vb.state["yInverted"]))
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+D"), self, activated=lambda: self.statusBar().showMessage("Data window: hover the chart – values show in the legend", 3000))
+        QtGui.QShortcut(QtGui.QKeySequence("Shift+F"), self, activated=self.toggle_fullscreen)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+,"), self, activated=self.open_settings)
+
+    def open_settings(self, tab: int = 0):
+        from . import settings as cs
+        dlg = cs.SettingsDialog(self, tab if isinstance(tab, int) else 0)
+        dlg.applied.connect(lambda _s: (cs.save(self.settings), self.apply_chart_settings()))
+        dlg.exec()
+
+    def apply_chart_settings(self):
+        for p in self.panels:
+            p.chart.apply_settings()
+
+    def _chart_typed(self, ch: str):
+        if ch.isalpha():
+            self.open_symbol_search(ch.upper())
+        else:
+            self.open_interval_popup(ch)
+
+    def quick_search(self):
+        """Ctrl+K: 'Search tool or function' – a filterable list of actions."""
+        items = {"Settings": self.open_settings, "Go to date": self._goto_date, "Full screen": self.toggle_fullscreen,
+                 "Save chart image": self.save_chart_image, "Reset chart view": lambda: self.active.chart.go_latest(),
+                 "Create alert": lambda: self.create_alert(), "Symbol search": self.open_symbol_search,
+                 "Change interval": lambda: self.open_interval_popup("")}
+        for lbl, fn in getattr(self, "_extra_actions", {}).items():
+            items[lbl] = fn
+        d = QtWidgets.QDialog(self)
+        d.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
+        d.resize(520, 360)
+        d.setStyleSheet("QDialog{background:#1e222d;border:1px solid #434651;border-radius:8px;} QLineEdit{background:#131722;border:1px solid #434651;border-radius:6px;padding:8px;font-size:14px;} QListWidget{background:transparent;border:0;} QListWidget::item{padding:8px;} QListWidget::item:selected{background:#2a2e39;}")
+        lay = QtWidgets.QVBoxLayout(d)
+        e = QtWidgets.QLineEdit()
+        e.setPlaceholderText("Search tool or function")
+        lst = QtWidgets.QListWidget()
+        lay.addWidget(e)
+        lay.addWidget(lst)
+
+        def fill(t=""):
+            lst.clear()
+            for k in items:
+                if t.lower() in k.lower():
+                    lst.addItem(k)
+            if lst.count():
+                lst.setCurrentRow(0)
+
+        def go(*_):
+            it = lst.currentItem()
+            if it:
+                d.accept()
+                items[it.text()]()
+        e.textChanged.connect(fill)
+        e.returnPressed.connect(go)
+        lst.itemActivated.connect(go)
+        fill()
+        d.exec()
 
     def toggle_fullscreen(self):
         self.setWindowState(self.windowState() ^ QtCore.Qt.WindowState.WindowFullScreen)
@@ -837,7 +952,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.style_actions[p.chart.style].setChecked(True)
             self.magnet_action.setChecked(p.chart.magnet)
             tool = p.chart.layer.tool
-            self.draw_actions.get(tool, self.draw_actions[None]).setChecked(True)
+            act = self.draw_actions.get(tool, self.draw_actions[None])
+            act.setChecked(True)
+            if tool and act in getattr(self, 'tool_groups', {}):
+                act.setIcon(icons.get(self._tool_icon.get(tool, tool)))
         finally:
             self._syncing = False
         self._source_changed()

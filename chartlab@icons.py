@@ -284,10 +284,22 @@ def compare(p, r, c):
     p.drawLine(QtCore.QPointF(8, 12), QtCore.QPointF(16, 12))
 
 
+def gear(p, r, c):
+    import math
+    path = QtGui.QPainterPath()
+    for k in range(6):
+        a = math.radians(60 * k - 30)
+        pt = QtCore.QPointF(12 + 8.6 * math.cos(a), 12 + 8.6 * math.sin(a))
+        path.moveTo(pt) if k == 0 else path.lineTo(pt)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.drawEllipse(QtCore.QPointF(12, 12), 3, 3)
+
+
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
-    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar")}
+    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear")}
 
 
 def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:

@@ -9,7 +9,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import icons
 from . import indicators as ta
-from . import theme
+from . import settings, theme
 from .drawings import DrawingLayer
 from .gestures import TVViewBox
 from .render import CandleItem, VolumeItem
@@ -57,6 +57,9 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
         super().__init__(orientation, **kw)
         self._index = None
         self.intraday = False
+        self.h24 = True
+        self.dow = True
+        self.datefmt = "%d %b '%y"
 
     def set_index(self, index: pd.DatetimeIndex):
         self._index = index
@@ -71,7 +74,7 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
                 continue
             t = idx[i]
             if self.intraday:
-                out.append(t.strftime("%d %b %H:%M"))
+                out.append(t.strftime("%d %b %H:%M" if self.h24 else "%d %b %I:%M%p"))
             else:                                   # TradingView: month names on month starts, day numbers between
                 prev = idx[max(i - max(int(round(spacing)), 1), 0)]
                 if i == 0 or prev.month != t.month or prev.year != t.year:
@@ -192,6 +195,8 @@ class ChartWidget(QtWidgets.QWidget):
     toolChanged = QtCore.Signal(object)
     drawingsChanged = QtCore.Signal()
     tradeRequested = QtCore.Signal(str, float)
+    settingsRequested = QtCore.Signal()
+    typed = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -470,19 +475,19 @@ class ChartWidget(QtWidgets.QWidget):
         if hasattr(self, "replay_bar") and self.replay_bar.isVisible():
             self.replay_bar.place()
         if self.df is not None:                                  # volume legend sits under the OHLC header
-            col = not self.collapse_btn.isChecked()
+            col = not self.collapse_btn.isChecked() and bool(settings.get()['sl_trade'])
             self.sell_btn.setVisible(col)
             self.buy_btn.setVisible(col)
             self.spread_lbl.setVisible(col)
             self.collapse_btn.show()
-            self.watermark.show()
+            self._apply_watermark_vis()
             y = self.header.y() + self.header.height() + 4
             if col:
                 self.sell_btn.move(10, y)
                 self.spread_lbl.move(96, y + 10)
                 self.buy_btn.move(96 + self.spread_lbl.width() + 6, y)
                 y += 46
-            self.vol_label.setVisible(col)
+            self.vol_label.setVisible(not self.collapse_btn.isChecked() and bool(settings.get()['sl_volume']))
             self.vol_label.move(10, y)
             self.collapse_btn.move(10, y + (24 if col else 0))
             gh = self.glw.height()
@@ -528,13 +533,34 @@ class ChartWidget(QtWidgets.QWidget):
             if k == K.Key_Right:
                 self.replay_step(1)
                 return True
+        mods = ev.modifiers()
+        M = QtCore.Qt.KeyboardModifier
+        txt = ev.text()
+        if not (mods & (M.ControlModifier | M.AltModifier | M.MetaModifier)) and len(txt) == 1 and \
+                (txt.isalnum() or txt == ","):
+            self.typed.emit("" if txt == "," else txt)
+            return True
+        if mods & M.ControlModifier:
+            if k == K.Key_Left:
+                vb.pan_x(-step * 5); return True
+            if k == K.Key_Right:
+                vb.pan_x(step * 5); return True
+            if k == K.Key_Up:
+                vb.zoom_x(0.8); return True
+            if k == K.Key_Down:
+                vb.zoom_x(1.25); return True
+        if (mods & M.AltModifier) and (mods & M.ShiftModifier):
+            if k == K.Key_Left:
+                vb.pan_x(-x0 - 2); return True
+            if k == K.Key_Right:
+                self.go_latest(); return True
         if self.replay["active"] and k == K.Key_Escape:
             self.replay_exit()
             return True
         if k == K.Key_Left:
-            vb.pan_x(-step)
+            vb.pan_x(-1)
         elif k == K.Key_Right:
-            vb.pan_x(step)
+            vb.pan_x(1)
         elif k in (K.Key_Plus, K.Key_Equal, K.Key_Up):
             vb.zoom_x(0.8)
         elif k in (K.Key_Minus, K.Key_Down):
@@ -556,6 +582,88 @@ class ChartWidget(QtWidgets.QWidget):
         else:
             grid.setRowFixedHeight(2, 0)
         self._refresh_axes()
+
+    # ------------------------------------------------------------------ settings
+    def fp(self, x: float) -> str:
+        """Format a price with the precision chosen in Settings."""
+        p = settings.get()["precision"]
+        if p == "Integer":
+            return f"{x:,.0f}"
+        if p != "Default":
+            return f"{x:,.{int(p.split()[0])}f}"
+        return f"{x:,.2f}"
+
+    def apply_settings(self):
+        S = settings.get()
+        self.glw.setBackground(S["bg"])
+        for pl in (self.price, self.vol, self.rsi):
+            pl.showGrid(x=bool(S["grid_v"]), y=bool(S["grid_h"]), alpha=0.35)
+            f = QtGui.QFont()
+            f.setPixelSize(int(S["text_size"]))
+            f.setWeight(QtGui.QFont.Weight.DemiBold)
+            for name in ("bottom", "right"):
+                ax = pl.getAxis(name)
+                ax.setPen(pg.mkPen(S["grid_color"]))
+                ax.setTextPen(pg.mkPen(S["text_color"]))
+                ax.setStyle(tickFont=f)
+                ax.picture = None
+                ax.update()
+            dash = pg.mkPen(S["crosshair"], width=1, style=QtCore.Qt.PenStyle.DashLine)
+            pl.vline.setPen(dash)
+            pl.hline.setPen(dash)
+        for ax in self.axes:
+            ax.dow = bool(S["dow"])
+            ax.h24 = bool(S["h24"])
+            ax.datefmt = S["date_format"]
+        self.last_line.setVisible(bool(S["last_line"]) and self.df is not None)
+        self.last_tag.setVisible(bool(S["last_label"]) and self.df is not None)
+        if self.candles is not None:
+            self.candles.update()
+        if self.volbars is not None:
+            self.volbars.update()
+        self._apply_watermark()
+        if self.df is not None:
+            self._update_last_tag()
+            self._autoscale()
+            self._update_header(self._n() - 1 if self._n() else 0)
+        self._place_overlays()
+
+    def _apply_watermark_vis(self):
+        self.watermark.setVisible(settings.get()['watermark'] != 'Hidden')
+
+    def _apply_watermark(self):
+        S = settings.get()
+        mode = S["watermark"]
+        if mode == "Hidden" or self.df is None:
+            self.watermark.hide()
+            return
+        if mode == "Logo":
+            self.watermark.setPixmap(_watermark_pixmap())
+        else:
+            if mode == "Ticker":
+                txt = (self.label or "").split(" ")[0]
+            elif mode == "Interval":
+                txt = self.interval_tag()
+            else:
+                txt = self.label or ""
+            big = mode != "Ticker and description"
+            f = QtGui.QFont()
+            f.setPixelSize(64 if big else 28)
+            f.setWeight(QtGui.QFont.Weight.Bold)
+            fm = QtGui.QFontMetrics(f)
+            w, h = fm.horizontalAdvance(txt) + 8, fm.height() + 4
+            pm = QtGui.QPixmap(max(w, 4), h)
+            pm.fill(QtCore.Qt.GlobalColor.transparent)
+            p = QtGui.QPainter(pm)
+            col = QtGui.QColor(S["wm_color"])
+            col.setAlpha(60)
+            p.setPen(col)
+            p.setFont(f)
+            p.drawText(pm.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, txt)
+            p.end()
+            self.watermark.setPixmap(pm)
+        self.watermark.adjustSize()
+        self.watermark.show()
 
     def _refresh_axes(self):
         owner = self._bottom_plot()
@@ -664,7 +772,7 @@ class ChartWidget(QtWidgets.QWidget):
         n = self._n()
         self.auto_y = True
         if n:
-            self.price.setXRange(max(-2, n - 150), n + 12, padding=0)
+            self.price.setXRange(max(-2, n - 150), n + int(settings.get()['scale_right_bars']), padding=0)
             self._autoscale()
 
     def _wipe(self):
@@ -843,8 +951,9 @@ class ChartWidget(QtWidgets.QWidget):
         if hi <= lo:
             return
         ymin, ymax = float(np.nanmin(self._lows[lo:hi])), float(np.nanmax(self._highs[lo:hi]))
-        pad = (ymax - ymin) * 0.08 or ymax * 0.01
-        self.price.vb.setYRange(ymin - pad - (ymax - ymin) * 0.10, ymax + pad, padding=0)   # room for the volume strip
+        S = settings.get()
+        rng = (ymax - ymin) or ymax * 0.02
+        self.price.vb.setYRange(ymin - rng * (S['margin_bottom'] + 10) / 100, ymax + rng * S['margin_top'] / 100, padding=0)   # room for the volume strip
         if self.volbars is not None:
             self.volbars.update()
         vmax = float(np.nanmax(self._vols[lo:hi]))
@@ -858,11 +967,11 @@ class ChartWidget(QtWidgets.QWidget):
         last, prev = float(self.df["Close"].iloc[self._n() - 1]), float(self.df["Open"].iloc[self._n() - 1])
         color = theme.UP if last >= prev else theme.DOWN
         self.last_tag.fill = pg.mkBrush(color)
-        self.last_tag.setText(f" {last:,.2f} ")
+        self.last_tag.setText(f" {self.fp(last)} ")
         self.last_line.setPen(pg.mkPen(color, style=QtCore.Qt.PenStyle.DotLine))
         self.last_line.setPos(last)
-        self.last_tag.show()
-        self.last_line.show()
+        self.last_tag.setVisible(bool(settings.get()['last_label']))
+        self.last_line.setVisible(bool(settings.get()['last_line']))
         self._place_last_tag()
 
     def _place_last_tag(self):
@@ -882,7 +991,7 @@ class ChartWidget(QtWidgets.QWidget):
 
     def _update_countdown(self):
         """TradingView's 'time left in this bar' under the last-price label (only while the bar is live)."""
-        if self.df is None or self._limit is not None or not self.isVisible():
+        if self.df is None or self._limit is not None or not self.isVisible() or not settings.get()['countdown']:
             self.cd_tag.hide()
             return
         step = self.bar_seconds()
@@ -926,7 +1035,7 @@ class ChartWidget(QtWidgets.QWidget):
             p.ytag.setVisible(p is hovered)
         hovered.hline.setPos(mp.y())
         xr = hovered.vb.viewRange()[0][1]
-        hovered.ytag.setText(f" {mp.y():,.2f} ")
+        hovered.ytag.setText(f" {self.fp(mp.y())} ")
         hovered.ytag.setPos(xr, mp.y())
         if 0 <= i < self._n():
             self._update_header(i)
@@ -981,6 +1090,7 @@ class ChartWidget(QtWidgets.QWidget):
             menu.addAction("Delete", self.layer.delete_selected)
             menu.addSeparator()
         price = mp.y()
+        menu.addAction(f"Copy price {self.fp(price)}", lambda: QtWidgets.QApplication.clipboard().setText(f"{price:.2f}"))
         menu.addAction(f"Add alert at {price:,.2f}\tAlt+A", lambda: self.alertRequested.emit(float(price)))
         menu.addAction(f"Add horizontal line at {price:,.2f}",
                        lambda: self.layer.add("hline", [[self.x_to_time(mp.x()), price]]))
@@ -993,9 +1103,40 @@ class ChartWidget(QtWidgets.QWidget):
         menu.addAction("Undo\tCtrl+Z", self.layer.undo)
         menu.addAction("Redo\tCtrl+Shift+Z", self.layer.redo)
         menu.addAction("Remove all drawings", self.layer.clear)
+        menu.addSeparator()
+        menu.addAction("Settings…", self.settingsRequested.emit)
+        menu.exec(QtGui.QCursor.pos())
+
+    def _axis_menu(self):
+        """TradingView's price-scale right-click menu."""
+        S = settings.get()
+        vb = self.price.vb
+        menu = QtWidgets.QMenu(self)
+        a = menu.addAction("Auto (fits data to screen)")
+        a.setCheckable(True)
+        a.setChecked(self.auto_y)
+        a.toggled.connect(lambda on: (self.set_auto_y(on), self._autoscale()))
+        menu.addSeparator()
+        inv = menu.addAction("Invert scale\tAlt+I")
+        inv.setCheckable(True)
+        inv.setChecked(bool(vb.state["yInverted"]))
+        inv.toggled.connect(lambda on: vb.invertY(on))
+        menu.addSeparator()
+        for key, label in (("last_label", "Symbol last value label"), ("last_line", "Symbol last price line"),
+                           ("countdown", "Countdown to bar close")):
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(bool(S[key]))
+            act.toggled.connect(lambda on, k=key: (S.__setitem__(k, on), self.apply_settings()))
+        menu.addSeparator()
+        menu.addAction("More settings\u2026", self.settingsRequested.emit)
         menu.exec(QtGui.QCursor.pos())
 
     def _mouse_clicked(self, ev):
+        if self.df is not None and ev.button() == QtCore.Qt.MouseButton.RightButton and \
+                self.price.getAxis("right").sceneBoundingRect().contains(ev.scenePos()):
+            self._axis_menu()
+            return
         if self.df is not None and ev.button() == QtCore.Qt.MouseButton.RightButton and \
                 self.price.sceneBoundingRect().contains(ev.scenePos()):
             self._context_menu(ev)
@@ -1046,19 +1187,25 @@ class ChartWidget(QtWidgets.QWidget):
         d = r["Close"] - prev
         chg = (r["Close"] / prev - 1) * 100 if prev else 0.0
         col = theme.UP if r["Close"] >= r["Open"] else theme.DOWN
-        fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
+        S = settings.get()
+        dfmt = ("%a " if S["dow"] else "") + S["date_format"]
+        fmt = dfmt + (" %H:%M" if S["h24"] else " %I:%M %p") if self.axes[0].intraday else dfmt
         ts = df.index[i].strftime(fmt)
+        fp = self.fp
         m = theme.MUTED
-        v = lambda k, x: (f"<span style='color:#ffffff'>{k}</span><span style='color:{col}'>{x:,.2f}</span>")  # noqa: E731
-        self.header.setText(
-            f"<span style='font-size:16px;color:#ffffff;font-weight:500'>{self.label}</span>"
-            f" <span style='color:{m}'>· {self.interval_tag()} · {self.exchange_tag()}</span>"
-            f" &nbsp;<span style='color:{m}'>{ts}</span><br>"
-            f"{v('O', r['Open'])} &nbsp;{v('H', r['High'])} &nbsp;{v('L', r['Low'])} &nbsp;{v('C', r['Close'])}"
-            f" &nbsp;<span style='color:{col}'>{d:+,.2f} ({chg:+.2f}%)</span>")
+        v = lambda k, x: (f"<span style='color:#ffffff'>{k}</span><span style='color:{col}'>{fp(x)}</span>")  # noqa: E731
+        title = (f"<span style='font-size:16px;color:#ffffff;font-weight:500'>{self.label}</span>"
+                 f" <span style='color:{m}'>· {self.interval_tag()} · {self.exchange_tag()}</span>"
+                 f" &nbsp;<span style='color:{m}'>{ts}</span><br>") if S["sl_title"] else ""
+        vals = (f"{v('O', r['Open'])} &nbsp;{v('H', r['High'])} &nbsp;{v('L', r['Low'])} &nbsp;{v('C', r['Close'])}"
+                if S["sl_values"] else "")
+        chgt = f" &nbsp;<span style='color:{col}'>{d:+,.2f} ({chg:+.2f}%)</span>" if S["sl_change"] else ""
+        self.header.setText(title + vals + chgt)
+        self.header.setVisible(bool(title or vals or chgt))
         vol = float(r["Volume"])
         vs = f"{vol / 1e7:.2f}Cr" if vol >= 1e7 else (f"{vol / 1e5:.2f}L" if vol >= 1e5 else f"{vol:,.0f}")
         self.vol_label.setText(f"<span style='color:#ffffff'>Vol</span> <span style='color:{col}'>{vs}</span>")
+        self.vol_label.setVisible(bool(S["sl_volume"]) and not self.collapse_btn.isChecked())
         rs = getattr(self, "_rsi_arr", None)
         if rs is not None and i < len(rs) and np.isfinite(rs[i]):
             self.rsi_label.setText(f"<span style='color:#ffffff'>RSI 14</span> <span style='color:#b388ff'>{rs[i]:.2f}</span>")
