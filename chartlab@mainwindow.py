@@ -1346,6 +1346,9 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("ChartLab")
+    _ic = datamod.ROOT / "assets" / "logo.png"
+    if _ic.exists():
+        app.setWindowIcon(QtGui.QIcon(str(_ic)))
     app.setStyleSheet(theme.STYLESHEET)
     win = MainWindow()
     geo = app.primaryScreen().availableGeometry()

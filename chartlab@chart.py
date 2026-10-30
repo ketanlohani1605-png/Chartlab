@@ -168,6 +168,23 @@ def _tag(anchor, fill: str) -> pg.TextItem:
     return t
 
 
+def _watermark_pixmap(size: int = 64, opacity: float = 0.22) -> QtGui.QPixmap:
+    """The SN logo, faded, drawn in the bottom-left of every chart (TradingView puts its own logo there)."""
+    from .data import ROOT
+    src = QtGui.QPixmap(str(ROOT / "assets" / "logo.png"))
+    out = QtGui.QPixmap(size, size)
+    out.fill(QtCore.Qt.GlobalColor.transparent)
+    if src.isNull():
+        return out
+    p = QtGui.QPainter(out)
+    p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+    p.setOpacity(opacity)
+    p.drawPixmap(0, 0, src.scaled(size, size, QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                                  QtCore.Qt.TransformationMode.SmoothTransformation))
+    p.end()
+    return out
+
+
 class ChartWidget(QtWidgets.QWidget):
     replayChanged = QtCore.Signal()
     alertRequested = QtCore.Signal(float)
@@ -219,8 +236,11 @@ class ChartWidget(QtWidgets.QWidget):
         self.collapse_btn.setStyleSheet("QToolButton { background:#000; border:1px solid #2b2b2b; border-radius:4px; color:#d1d4dc; font-size:14px; } QToolButton:hover { background:#1a1a1a; }")
         self.collapse_btn.toggled.connect(lambda _c: self._place_overlays())
         self.collapse_btn.hide()
-        self.watermark = OverlayLabel(self.glw)
-        self.watermark.setText("<span style='font-size:26px;font-weight:800;color:#262626;font-style:italic'>ChartLab</span>")
+        self.watermark = QtWidgets.QLabel(self.glw)
+        self.watermark.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.watermark.setStyleSheet("background: transparent;")
+        self.watermark.setPixmap(_watermark_pixmap())
+        self.watermark.adjustSize()
         self.watermark.hide()
 
         self.axes: list[DateAxis] = []
@@ -466,7 +486,7 @@ class ChartWidget(QtWidgets.QWidget):
             self.vol_label.move(10, y)
             self.collapse_btn.move(10, y + (24 if col else 0))
             gh = self.glw.height()
-            self.watermark.move(14, max(gh - 90, 0))
+            self.watermark.move(14, max(gh - 100, 0))
             for w in (self.sell_btn, self.buy_btn, self.spread_lbl, self.vol_label, self.collapse_btn):
                 w.raise_()
         for plot, lab in ((self.rsi, self.rsi_label),):
