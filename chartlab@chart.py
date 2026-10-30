@@ -37,6 +37,19 @@ class _DotGridMixin:
             return specs
 
 
+class PriceAxis(_DotGridMixin, pg.AxisItem):
+    """Right axis with TradingView-like tick density (a label every ~40 px)."""
+
+    def tickSpacing(self, minVal, maxVal, size):
+        span = maxVal - minVal
+        if span <= 0 or size <= 0:
+            return super().tickSpacing(minVal, maxVal, size)
+        raw = span / max(size / 40.0, 2)
+        mag = 10 ** np.floor(np.log10(raw))
+        step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+        return [(step, 0)]
+
+
 class DateAxis(_DotGridMixin, pg.AxisItem):
     """X axis that plots bar numbers (no weekend gaps, like TradingView) but shows dates."""
 
@@ -59,10 +72,12 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
             t = idx[i]
             if self.intraday:
                 out.append(t.strftime("%d %b %H:%M"))
-            elif spacing > 60:
-                out.append(t.strftime("%b %Y"))
-            else:
-                out.append(t.strftime("%d %b %y"))
+            else:                                   # TradingView: month names on month starts, day numbers between
+                prev = idx[max(i - max(int(round(spacing)), 1), 0)]
+                if i == 0 or prev.month != t.month or prev.year != t.year:
+                    out.append(str(t.year) if t.month == 1 else t.strftime("%b"))
+                else:
+                    out.append(str(t.day))
         return out
 
 
@@ -290,7 +305,7 @@ class ChartWidget(QtWidgets.QWidget):
     def _make_plot(self, row: int) -> pg.PlotItem:
         axis = DateAxis("bottom")
         self.axes.append(axis)
-        p = self.glw.addPlot(row=row, col=0, axisItems={"bottom": axis}, viewBox=TVViewBox(self, price=(row == 0)))
+        p = self.glw.addPlot(row=row, col=0, axisItems={"bottom": axis, "right": PriceAxis("right")}, viewBox=TVViewBox(self, price=(row == 0)))
         p.setMenuEnabled(False)
         p.hideButtons()
         p.showAxis("right")

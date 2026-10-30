@@ -22,7 +22,7 @@ def _icon(name: str, draw, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:
             p = QtGui.QPainter(pm)
             p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
             c = QtGui.QColor("#ffffff" if (state_on and mode == QtGui.QIcon.Mode.Normal) else col)
-            pen = QtGui.QPen(c, 1.5)
+            pen = QtGui.QPen(c, 1.25)
             pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
             p.setPen(pen)
@@ -249,6 +249,13 @@ def plus(p, r, c):
     p.drawLine(QtCore.QPointF(8, 12), QtCore.QPointF(16, 12))
 
 
+def calendar(p, r, c):
+    p.drawRoundedRect(QtCore.QRectF(4.5, 6, 15, 13), 2, 2)
+    p.drawLine(QtCore.QPointF(4.5, 10), QtCore.QPointF(19.5, 10))
+    p.drawLine(QtCore.QPointF(8.5, 4), QtCore.QPointF(8.5, 7.5))
+    p.drawLine(QtCore.QPointF(15.5, 4), QtCore.QPointF(15.5, 7.5))
+
+
 def eye(p, r, c):
     path = QtGui.QPainterPath(QtCore.QPointF(3.5, 12))
     path.quadTo(12, 3, 20.5, 12)
@@ -280,7 +287,7 @@ def compare(p, r, c):
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
-    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare")}
+    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar")}
 
 
 def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:

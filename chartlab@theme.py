@@ -32,6 +32,10 @@ QToolButton {{ background: transparent; border: 0; border-radius: 6px; padding: 
 QToolButton:hover {{ background: {HOVER}; }}
 QToolButton:checked {{ background: {HOVER}; color: white; }}
 QToolButton:pressed {{ background: #3a3e4a; }}
+QToolBar#topbar QToolButton {{ font-size: 14px; font-weight: 400; color: #d1d4dc; padding: 6px 10px; }}
+QToolBar#topbar QToolButton:checked {{ background: #262626; color: #fff; }}
+QToolBar#topbar QComboBox {{ font-size: 14px; color: #d1d4dc; }}
+QFrame#stripbar QToolButton {{ font-size: 13px; font-weight: 400; color: #d1d4dc; padding: 5px 8px; }}
 QToolButton::menu-indicator {{ image: none; width: 0px; }}
 QToolBar#leftrail QToolButton, QToolBar#rightrail QToolButton {{ padding: 7px; border-radius: 6px; }}
 QToolBar#leftrail QToolButton:checked {{ background: {HOVER}; }}
@@ -39,7 +43,9 @@ QLabel#chartHeader {{ background: transparent; padding: 0; font-size: 12px; }}
 QFrame#stripbar {{ border-top: 4px solid {GUTTER}; }}
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{ background: {BG}; border: 1px solid {BORDER}; border-radius: 6px; padding: 4px 8px; selection-background-color: {ACCENT}; }}
 QLineEdit:focus {{ border-color: {ACCENT}; }}
-QLineEdit#symbolbox {{ background: #1a1a1a; border: 0; border-radius: 16px; padding: 5px 14px; font-weight: 700; font-size: 14px; color: white; }}
+QFrame#symbolpill {{ background: #1a1a1a; border-radius: 17px; min-height: 34px; max-height: 34px; }}
+QFrame#symbolpill QLabel {{ background: transparent; }}
+QLineEdit#symbolbox {{ background: transparent; border: 0; border-radius: 0; padding: 5px 14px; font-weight: 700; font-size: 14px; color: white; }}
 QComboBox {{ background: transparent; border: 0; padding: 4px 6px; }}
 QComboBox:hover {{ background: {HOVER}; }}
 QComboBox::drop-down {{ border: 0; width: 14px; }}

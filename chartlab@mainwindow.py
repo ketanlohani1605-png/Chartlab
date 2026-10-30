@@ -129,7 +129,7 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(lambda _=False, k=key: self.active.chart.set_range_preset(k))
             h.addWidget(b)
         gd = QtWidgets.QToolButton()
-        gd.setText("⏷ Go to…")
+        gd.setIcon(icons.get("calendar"))
         gd.setToolTip("Go to date")
         gd.clicked.connect(self._goto_date)
         h.addWidget(gd)
@@ -146,6 +146,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clock_timer.start(1000)
         self._tick_clock()
         return bar
+
+    @staticmethod
+    def _tv_interval(text: str) -> str:
+        return {"1D": "D", "1W": "W", "1M": "M"}.get(text, text[:-1] if text.endswith("m") else text)
+
+    def _sync_interval_label(self):
+        for val, text in INTERVALS:
+            if self.interval_btns[val].isChecked():
+                self.interval_btn.setText(self._tv_interval(text))
+                return
 
     def _zoom_x(self, f):
         vb = self.active.chart.price.vb
@@ -192,9 +202,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.symbol.setObjectName("symbolbox")
         self.symbol.setPlaceholderText("Symbol")
         self.symbol.setToolTip("Symbol: RELIANCE, NIFTY, BSE:SBIN, US:AAPL, BTC-USD  (Enter to load)")
-        self.symbol.setFixedWidth(150)
+        self.symbol.setFixedWidth(130)
         self.symbol.returnPressed.connect(self.on_load)
-        tb.addWidget(self.symbol)
+        pill = QtWidgets.QFrame()
+        pill.setObjectName("symbolpill")
+        ph = QtWidgets.QHBoxLayout(pill)
+        ph.setContentsMargins(4, 0, 6, 0)
+        ph.setSpacing(0)
+        ph.addWidget(self.symbol)
+        cmp_ = QtWidgets.QLabel()
+        cmp_.setPixmap(icons.get("compare").pixmap(20, 20))
+        cmp_.setToolTip("Compare or add symbol")
+        ph.addWidget(cmp_)
+        tb.addWidget(pill)
         tb.addWidget(self._gap(6))
         self._symbol_model = QtCore.QStringListModel(self._suggestions())
         comp = QtWidgets.QCompleter(self._symbol_model, self)
@@ -225,8 +245,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.interval_group.addButton(b)
             self.interval_btns[val] = b
             b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
-            tb.addWidget(b)
+            b.setVisible(False)                        # kept for state/tests; TradingView shows just the current one
         self.interval_btns["1d"].setChecked(True)
+        self.interval_btn = QtWidgets.QToolButton()
+        self.interval_btn.setToolTip("Time interval")
+        self.interval_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        im = QtWidgets.QMenu(self)
+        for val, text in INTERVALS:
+            im.addAction(text, lambda v=val: self.interval_btns[v].click())
+        self.interval_btn.setMenu(im)
+        tb.addWidget(self.interval_btn)
+        self.interval_group.buttonToggled.connect(lambda *_: self._sync_interval_label())
+        self._sync_interval_label()
         tb.addSeparator()
 
         style_menu = QtWidgets.QMenu(self)
