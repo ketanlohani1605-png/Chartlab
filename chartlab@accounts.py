@@ -117,6 +117,113 @@ def test_account(acct: dict) -> str:
     raise RuntimeError("Unsupported broker")
 
 
+STATUS: dict[str, dict] = {}          # account name -> last status (shared by the dialog, toolbar dot, delegate)
+
+
+def _parse_validity(s) -> float | None:
+    """Dhan tokenValidity like '30/10/2026 15:30' -> days left (float) or None."""
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+        try:
+            return (dt.datetime.strptime(str(s)[:19], fmt) - dt.datetime.now()).total_seconds() / 86400
+        except ValueError:
+            continue
+    return None
+
+
+def get_status(acct: dict) -> dict:
+    """Never raises. {state: ok|expiring|expired|auth|offline|error, msg, client, validity, days_left, funds, segments, plan}"""
+    st = {"state": "error", "msg": "", "client": acct.get("client_id", ""), "validity": "", "days_left": None,
+          "funds": None, "segments": "", "plan": "", "ts": dt.datetime.now().strftime("%H:%M:%S")}
+    if acct.get("broker") != "dhan":
+        st["msg"] = "Unsupported broker"
+        return st
+    hdr = {"access-token": acct.get("access_token", ""), "client-id": acct.get("client_id", "")}
+    try:
+        js = json.loads(_http(f"{DHAN}/profile", None, hdr, timeout=12))
+    except RuntimeError as e:
+        m = str(e)
+        if "Could not reach" in m:
+            st.update(state="offline", msg="No internet / Dhan unreachable")
+        elif any(k in m for k in ("401", "403", "DH-901", "DH-902", "Invalid", "invalid", "expired")):
+            st.update(state="auth", msg="Token invalid or expired - paste a fresh access token")
+        else:
+            st.update(state="error", msg=m[:160])
+        return st
+    st["client"] = js.get("dhanClientId", st["client"])
+    st["validity"] = str(js.get("tokenValidity", ""))
+    st["days_left"] = _parse_validity(js.get("tokenValidity"))
+    st["segments"] = str(js.get("activeSegment", "")).replace(",", ", ")
+    st["plan"] = ("Data API active" if str(js.get("dataPlan", "")).lower() == "active" else
+                  f"Data plan: {js.get('dataPlan', '-')}")
+    try:
+        fl = json.loads(_http(f"{DHAN}/fundlimit", None, hdr, timeout=12))
+        st["funds"] = float(fl.get("availabelBalance", fl.get("availableBalance", 0)) or 0)
+    except Exception:  # noqa: BLE001 - funds are a bonus, never fail the check for them
+        pass
+    d = st["days_left"]
+    if d is not None and d <= 0:
+        st.update(state="expired", msg="Token has expired")
+    elif d is not None and d < 2:
+        st.update(state="expiring", msg=f"Connected - token expires in {max(d, 0) * 24:.0f} h")
+    else:
+        st.update(state="ok", msg="Connected")
+    return st
+
+
+STATE_COLOR = {"ok": "#089981", "expiring": "#ff9800", "expired": "#f23645", "auth": "#f23645",
+               "offline": "#787b86", "error": "#f23645", None: "#4a4e59"}
+
+
+class StatusPoller(QtCore.QObject):
+    """Checks accounts in background threads; emits updated(name) on the GUI thread. Never blocks the UI."""
+    updated = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._busy: set[str] = set()
+
+    def refresh(self, accts: list[dict] | None = None, force: bool = True):
+        import threading
+        for a in (accts if accts is not None else load_accounts()):
+            n = a["name"]
+            if n in self._busy:
+                continue
+            if not force and n in STATUS and (dt.datetime.now() - STATUS[n].get("_at", dt.datetime.min)).total_seconds() < 60:
+                continue
+            self._busy.add(n)
+            threading.Thread(target=self._run, args=(dict(a),), daemon=True).start()
+
+    def _run(self, a: dict):
+        st = get_status(a)
+        st["_at"] = dt.datetime.now()
+        STATUS[a["name"]] = st
+        self._busy.discard(a["name"])
+        try:
+            self.updated.emit(a["name"])
+        except RuntimeError:                  # object deleted while quitting
+            pass
+
+
+def overall_state(accts: list[dict] | None = None) -> tuple[str | None, str]:
+    """-> (state for the toolbar dot, tooltip text)."""
+    accts = accts if accts is not None else load_accounts()
+    if not accts:
+        return None, "No accounts yet - click to connect a broker"
+    lines, worst = [], "ok"
+    rank = {"ok": 0, "offline": 1, "expiring": 2, "expired": 3, "auth": 3, "error": 3}
+    for a in accts:
+        st = STATUS.get(a["name"])
+        s = st["state"] if st else None
+        lines.append(f"{a['name']}: " + (st["msg"] if st else "checking..."))
+        if s and rank.get(s, 0) > rank.get(worst, 0):
+            worst = s
+    if all(STATUS.get(a["name"]) is None for a in accts):
+        worst = None
+    return worst, "\n".join(lines)
+
+
 def load_api(account: str, symbol: str, interval: str, period: str):
     """Entry point used by the chart panel: -> (DataFrame cleaned like other sources, label)."""
     a = get_account(account)
@@ -163,6 +270,11 @@ class _AccountCard(QtWidgets.QStyledItemDelegate):
         p.drawText(r.adjusted(54, 0, -74, -9), QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignLeft,
                    f"{BROKERS.get(a['broker'], a['broker'])}  ·  {cid[:4]}…{cid[-3:]}" if len(cid) > 8 else
                    f"{BROKERS.get(a['broker'], a['broker'])}  ·  {cid}")
+        st = STATUS.get(a["name"])
+        dc = QtGui.QColor(STATE_COLOR.get(st["state"] if st else None))
+        p.setPen(QtGui.QPen(QtGui.QColor("#1a1e2a"), 2))
+        p.setBrush(dc)
+        p.drawEllipse(QtCore.QPoint(av.right() - 2, av.bottom() - 2), 6, 6)
         live = bool(a.get("live"))
         col = QtGui.QColor(theme.DOWN if live else "#787b86")
         badge = QtCore.QRect(r.right() - 64, r.center().y() - 10, 54, 20)
@@ -194,6 +306,8 @@ class AccountsDialog(QtWidgets.QDialog):
                            f"QPushButton#danger:hover {{ background: rgba(242,54,69,40); }}")
         self.accts = load_accounts(path)
         self.editing = -1
+        self.poller = StatusPoller(self)
+        self.poller.updated.connect(self._status_updated)
         root = QtWidgets.QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -239,7 +353,13 @@ class AccountsDialog(QtWidgets.QDialog):
         sub.setObjectName("sub")
         sub.setWordWrap(True)
         rv.addWidget(sub)
-        rv.addSpacing(8)
+        rv.addSpacing(4)
+        self.card = QtWidgets.QLabel("")
+        self.card.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.card.setWordWrap(True)
+        self.card.setStyleSheet("background:#131722;border:1px solid #2a2e39;border-radius:10px;padding:10px 12px;")
+        rv.addWidget(self.card)
+        rv.addSpacing(6)
 
         def field(label, w):
             l = QtWidgets.QLabel(label.upper())
@@ -298,9 +418,12 @@ class AccountsDialog(QtWidgets.QDialog):
         d.clicked.connect(self.delete)
         btns.addWidget(d)
         btns.addStretch(1)
-        tb = QtWidgets.QPushButton("Test connection")
+        self.tbtn = tb = QtWidgets.QPushButton("Test connection")
         tb.clicked.connect(self.test)
         btns.addWidget(tb)
+        self._debounce = QtCore.QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.timeout.connect(self.test)
         sb = QtWidgets.QPushButton("Save")
         sb.setObjectName("primary")
         sb.setDefault(True)
@@ -308,7 +431,41 @@ class AccountsDialog(QtWidgets.QDialog):
         btns.addWidget(sb)
         rv.addLayout(btns)
         root.addWidget(right, 1)
+        self.token.textChanged.connect(lambda *_: self._token_edited())
         self._fill()
+        self.poller.refresh(self.accts, force=False)
+
+    def _token_edited(self):
+        t = self.token.text().strip()
+        if len(t) > 40 and self.client.text().strip():
+            self._debounce.start(700)
+
+    def _status_updated(self, name: str):
+        self.list.viewport().update()
+        if (0 <= self.editing < len(self.accts) and self.accts[self.editing]["name"] == name) or (self.editing < 0 and name in ("_new", self.name.text().strip())):
+            self._show_status(STATUS.get(name))
+        self.tbtn.setEnabled(True)
+        self.tbtn.setText("Test connection")
+
+    def _show_status(self, st):
+        if not st:
+            self.card.setText("<span style='color:#787b86'>Not checked yet</span>")
+            return
+        c = STATE_COLOR.get(st["state"])
+        rows = [f"<b style='color:{c}'>\u25CF {st['msg'] or st['state']}</b>"]
+        if st.get("client"):
+            rows.append(f"Client <b>{st['client']}</b>")
+        if st.get("validity"):
+            d = st.get("days_left")
+            rows.append(f"Token valid until <b>{st['validity']}</b>" + (f"  ({d:.1f} days left)" if d is not None and d > 0 else ""))
+        if st.get("segments"):
+            rows.append(f"Segments: {st['segments']}")
+        if st.get("plan"):
+            rows.append(st["plan"])
+        if st.get("funds") is not None:
+            rows.append(f"Available balance <b>\u20B9{st['funds']:,.2f}</b>")
+        rows.append(f"<span style='color:#787b86'>checked {st.get('ts', '')}</span>")
+        self.card.setText("<br>".join(rows))
 
     def _say(self, text: str, ok: bool | None = None):
         col = theme.UP if ok else (theme.DOWN if ok is False else theme.MUTED)
@@ -343,6 +500,8 @@ class AccountsDialog(QtWidgets.QDialog):
             self.live.setChecked(bool(a.get("live")))
             self.mult.setValue(float(a.get("qty_mult", 1) or 1))
             self._say("")
+            self._show_status(STATUS.get(a["name"]))
+            self.poller.refresh([a], force=False)
 
     def _new(self):
         self.editing = -1
@@ -355,6 +514,7 @@ class AccountsDialog(QtWidgets.QDialog):
         self.live.setChecked(False)
         self.mult.setValue(1.0)
         self._say("")
+        self.card.setText("<span style='color:#787b86'>Fill in Client ID + access token - the connection is checked automatically.</span>")
         self.name.setFocus()
 
     def _current(self) -> dict:
@@ -377,6 +537,8 @@ class AccountsDialog(QtWidgets.QDialog):
         save_accounts(self.accts, self.path)
         self._fill(a["name"])
         self._say("Saved.", True)
+        self.saved = a["name"]
+        self.poller.refresh([a], force=True)
 
     def delete(self):
         if 0 <= self.editing < len(self.accts):
@@ -386,12 +548,18 @@ class AccountsDialog(QtWidgets.QDialog):
             self._say("Deleted.", True)
 
     def test(self):
-        self._say("Testing connection…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            self._say(test_account(self._current()), True)
-        except Exception as e:  # noqa: BLE001
-            self._say(str(e), False)
+        cur = self._current()
+        if not cur["client_id"] or not cur["access_token"]:
+            self._say("Enter Client ID and access token first.", False)
+            return
+        self.tbtn.setEnabled(False)
+        self.tbtn.setText("Testing…")
+        self.card.setText("<span style='color:#787b86'>Checking with Dhan…</span>")
+        key = cur["name"] or "_new"
+        cur["name"] = key
+        if self.editing < 0:
+            self._pending_new = key
+        self.poller.refresh([cur], force=True)
 
 
 class PickAccountsDialog(QtWidgets.QDialog):

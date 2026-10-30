@@ -352,7 +352,15 @@ class MainWindow(QtWidgets.QMainWindow):
         m_.addAction("Stop all runs", self.stop_script)
         self.acct_btn.setMenu(m_)
         self.acct_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.acct_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         tb.addWidget(self.acct_btn)
+        self.acct_poller = acctmod.StatusPoller(self)
+        self.acct_poller.updated.connect(self._acct_status_changed)
+        self._acct_timer = QtCore.QTimer(self)
+        self._acct_timer.timeout.connect(lambda: self.acct_poller.refresh())
+        self._acct_timer.start(10 * 60 * 1000)
+        QtCore.QTimer.singleShot(1500, lambda: self.acct_poller.refresh())
+        self._update_acct_dot()
 
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
@@ -996,9 +1004,39 @@ class MainWindow(QtWidgets.QMainWindow):
         if cur is not None and self.source.findData(cur) >= 0:
             self.source.setCurrentIndex(self.source.findData(cur))
 
-    def manage_accounts(self):
-        acctmod.AccountsDialog(self).exec()
+    def _update_acct_dot(self):
+        state, tip = acctmod.overall_state()
+        pm = QtGui.QPixmap(14, 14)
+        pm.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.setBrush(QtGui.QColor(acctmod.STATE_COLOR.get(state)))
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.drawEllipse(2, 2, 10, 10)
+        p.end()
+        self.acct_btn.setIcon(QtGui.QIcon(pm))
+        self.acct_btn.setText(" Accounts")
+        self.acct_btn.setToolTip(tip)
+
+    def _acct_status_changed(self, name):
+        self._update_acct_dot()
+        st = acctmod.STATUS.get(name)
+        if st and st["state"] in ("expired", "auth", "expiring") and name not in getattr(self, "_warned", set()):
+            self._warned = getattr(self, "_warned", set()) | {name}
+            self.statusBar().showMessage(f"Account '{name}': {st['msg']}  (Accounts -> Manage broker accounts)", 10000)
+
+    def manage_accounts(self, select: str = ""):
+        dlg = acctmod.AccountsDialog(self)
+        dlg.poller.updated.connect(self._acct_status_changed)
+        dlg.exec()
         self._fill_api_sources()
+        self._update_acct_dot()
+        added = getattr(dlg, "saved", "")
+        if added and self.source.findData(f"api:{added}") >= 0 and not any(
+                str(self.source.itemData(i)).startswith("api:") and self.source.currentData() == self.source.itemData(i)
+                for i in range(self.source.count())):
+            self.source.setCurrentIndex(self.source.findData(f"api:{added}"))
+            self.statusBar().showMessage(f"Data source set to API: {added}", 5000)
 
     def run_on_accounts(self):
         """Run the editor's script once per chosen account, all at the same time."""
@@ -1191,6 +1229,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_load_failed(self, panel, msg):
         self.load_btn.setEnabled(True)
+        src = str(panel.params.get("source", ""))
+        if src.startswith("api:") and any(k in msg for k in ("401", "403", "DH-90", "nvalid", "xpired")):
+            acct = src.split(":", 1)[1]
+            msg = f"API token for '{acct}' is invalid or expired. Opening Accounts so you can paste a fresh one…"
+            self.statusBar().showMessage(msg)
+            self.add_log(f"[load {panel.params['symbol']}] {msg}")
+            QtCore.QTimer.singleShot(300, lambda: self.manage_accounts())
+            return
         self.statusBar().showMessage(msg)
         self.add_log(f"[load {panel.params['symbol']}] {msg}")  # never a modal dialog: it would freeze the app
 
