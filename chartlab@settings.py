@@ -19,7 +19,7 @@ DEFAULTS = {
     "sl_title": True, "sl_values": True, "sl_change": True, "sl_volume": True, "sl_trade": True,
     "sl_ind_titles": True, "sl_ind_values": True,
     # Scales and lines
-    "countdown": True, "last_label": True, "last_line": True, "plus_button": False, "scale_right_bars": 12,
+    "countdown": True, "last_label": True, "last_line": True, "plus_button": True, "scale_right_bars": 12,
     "date_format": "%d %b '%y", "h24": True, "dow": True,
     # Canvas
     "bg": "#000000", "grid_v": True, "grid_h": True, "grid_color": "#262626",

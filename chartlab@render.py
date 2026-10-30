@@ -42,6 +42,14 @@ class CandleItem(pg.GraphicsObject):
         if tf is not None:
             self.tf = tf
         self.o, self.h, self.l, self.c = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
+        if style == "heikin":
+            c = (self.o + self.h + self.l + self.c) / 4.0
+            o = np.empty_like(c)
+            o[0] = (self.o[0] + self.c[0]) / 2.0
+            for i in range(1, len(c)):
+                o[i] = (o[i - 1] + c[i - 1]) / 2.0
+            self.h, self.l = np.maximum.reduce([self.h, o, c]), np.minimum.reduce([self.l, o, c])
+            self.o, self.c = o, c
         if self.tf is not None:
             self.o, self.h, self.l, self.c = (np.asarray(self.tf(a), float) for a in (self.o, self.h, self.l, self.c))
         self.prepareGeometryChange()
@@ -89,6 +97,12 @@ class CandleItem(pg.GraphicsObject):
             if not m.any():
                 continue
             x, hh, ll, oo, cc = xs[m], h[m], l[m], o[m], c[m]
+            if self.style == "bars":
+                p.setPen(pg.mkPen(body))
+                p.drawLines([QtCore.QLineF(a, lo, a, hi) for a, lo, hi in zip(x, ll, hh)])
+                p.drawLines([QtCore.QLineF(a - w, b, a, b) for a, b in zip(x, oo)])
+                p.drawLines([QtCore.QLineF(a, d, a + w, d) for a, d in zip(x, cc)])
+                continue
             if S["wick"]:
                 p.setPen(pg.mkPen(wick))
                 p.drawLines([QtCore.QLineF(a, b, a, d) for a, b, d in zip(x, ll, hh)])

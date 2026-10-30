@@ -15,7 +15,7 @@ from .gestures import TVViewBox
 from .render import CandleItem, VolumeItem
 
 _QWIDGETSIZE_MAX = 16777215
-STYLES = ["candles", "hollow", "line", "area"]
+STYLES = ["candles", "hollow", "bars", "heikin", "line", "linemark", "step", "area", "baseline"]
 INDICATOR_KEYS = ["sma20", "sma50", "sma200", "ema20", "ema50", "bb", "rsi"]
 
 
@@ -90,6 +90,25 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
                 else:
                     out.append(str(t.day))
         return out
+
+
+class CornerOverlay(QtWidgets.QWidget):
+    """Paints rounded panel corners (gutter colour outside a rounded rect) like TradingView's panes."""
+    R = 10
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def paintEvent(self, _ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        path = QtGui.QPainterPath()
+        path.addRect(QtCore.QRectF(self.rect()))
+        rr = QtGui.QPainterPath()
+        rr.addRoundedRect(QtCore.QRectF(self.rect()), self.R, self.R)
+        p.fillPath(path.subtracted(rr), QtGui.QColor(theme.GUTTER))
 
 
 class OverlayLabel(QtWidgets.QLabel):
@@ -254,6 +273,14 @@ class ChartWidget(QtWidgets.QWidget):
         self.collapse_btn.setStyleSheet("QToolButton { background:#000; border:1px solid #2b2b2b; border-radius:4px; color:#d1d4dc; font-size:14px; } QToolButton:hover { background:#1a1a1a; }")
         self.collapse_btn.toggled.connect(lambda _c: self._place_overlays())
         self.collapse_btn.hide()
+        self.plus_btn = QtWidgets.QToolButton(self.glw)
+        self.plus_btn.setText("+")
+        self.plus_btn.setFixedSize(20, 20)
+        self.plus_btn.setToolTip("Add alert at this price")
+        self.plus_btn.setStyleSheet("QToolButton{background:#2a2e39;color:#fff;border:1px solid #434651;border-radius:10px;font-size:15px;padding:0;} QToolButton:hover{background:#2962ff;}")
+        self.plus_btn.clicked.connect(lambda: self.alertRequested.emit(float(self.iy(self._plus_y))))
+        self.plus_btn.hide()
+        self._plus_y = 0.0
         self.watermark = QtWidgets.QLabel(self.glw)
         self.watermark.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.watermark.setStyleSheet("background: transparent;")
@@ -316,6 +343,8 @@ class ChartWidget(QtWidgets.QWidget):
         self.price.vb.sigRangeChanged.connect(lambda *_: self._place_last_tag())
         self.glw.scene().sigMouseMoved.connect(self._mouse_moved)
         self.glw.scene().sigMouseClicked.connect(self._mouse_clicked)
+        self.corners = CornerOverlay(self.glw)
+        self.corners.show()
         self.glw.viewport().installEventFilter(self)
         self.glw.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.glw.viewport().setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
@@ -373,6 +402,8 @@ class ChartWidget(QtWidgets.QWidget):
 
     def eventFilter(self, obj, ev):
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.Resize:
+            self.corners.setGeometry(self.glw.rect())
+            self.corners.raise_()
             QtCore.QTimer.singleShot(0, self._place_overlays)
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.MouseButtonPress:
             self.activated.emit()
@@ -486,6 +517,8 @@ class ChartWidget(QtWidgets.QWidget):
             self.replay_bar = ReplayBar(self)
 
     def _place_overlays(self):
+        self.corners.setGeometry(self.glw.rect())
+        self.corners.raise_()
         if hasattr(self, "replay_bar") and self.replay_bar.isVisible():
             self.replay_bar.place()
         if self.df is not None:                                  # volume legend sits under the OHLC header
@@ -858,14 +891,31 @@ class ChartWidget(QtWidgets.QWidget):
     def _apply_style(self):
         if self.candles is None:
             return
-        is_candle = self.style in ("candles", "hollow")
+        is_candle = self.style in ("candles", "hollow", "bars", "heikin")
         if is_candle:
             self.candles.set_data(self.df, self.style, self.ty)
         self.candles.setVisible(is_candle)
         self.line_item.setVisible(not is_candle)
+        n = self._n()
+        close = self.ty(self.df["Close"].to_numpy(float))[:n]
+        self.line_item.setSymbol("o" if self.style == "linemark" else None)
+        if self.style == "linemark":
+            self.line_item.setSymbolSize(5)
+            self.line_item.setSymbolBrush(pg.mkBrush(theme.ACCENT))
+            self.line_item.setSymbolPen(pg.mkPen(theme.ACCENT))
+        if self.style == "step":
+            x = np.repeat(np.arange(n), 2)[1:]
+            y = np.repeat(close, 2)[:-1]
+            self.line_item.setData(x, y)
+        else:
+            self.line_item.setData(np.arange(n), close)
         if self.style == "area":
             self.line_item.setFillLevel(float(self.ty(np.nanmin(self._lows))))
             self.line_item.setBrush(pg.mkBrush(41, 98, 255, 55))
+        elif self.style == "baseline":
+            base = float(self.ty(float(self.df["Close"].iloc[0])))
+            self.line_item.setFillLevel(base)
+            self.line_item.setBrush(pg.mkBrush(8, 153, 129, 60))
         else:
             self.line_item.setFillLevel(None)
 
@@ -1090,6 +1140,8 @@ class ChartWidget(QtWidgets.QWidget):
                 p.ytag.hide()
             for o in plots:
                 o.dtag.hide()
+            if not self.plus_btn.underMouse():
+                self.plus_btn.hide()
             return
         mp = hovered.vb.mapSceneToView(pos)
         if hovered is self.price and not self.layer.tool and not self._panning():
@@ -1102,6 +1154,7 @@ class ChartWidget(QtWidgets.QWidget):
             p.hline.setVisible(p is hovered)
             p.ytag.setVisible(p is hovered)
         hovered.hline.setPos(mp.y())
+        self._place_plus(hovered, pos, mp.y())
         xr = hovered.vb.viewRange()[0][1]
         hovered.ytag.setText(f" {self.axis_label(mp.y()) if hovered is self.price else self.fp(mp.y())} ")
         hovered.ytag.setPos(xr, mp.y())
@@ -1174,6 +1227,19 @@ class ChartWidget(QtWidgets.QWidget):
         menu.addSeparator()
         menu.addAction("Settings…", self.settingsRequested.emit)
         menu.exec(QtGui.QCursor.pos())
+
+    def _place_plus(self, hovered, pos, y):
+        if hovered is not self.price or not settings.get().get("plus_button", True):
+            self.plus_btn.hide()
+            return
+        r = self.price.vb.sceneBoundingRect()
+        left = hovered.ytag.sceneBoundingRect().left() if hovered.ytag.isVisible() else r.right() - 50
+        pt = self.glw.mapFromScene(QtCore.QPointF(left, pos.y()))
+        self._plus_y = y
+        self.plus_btn.move(int(pt.x()) - 24, int(pt.y()) - 10)
+        self.plus_btn.show()
+        self.plus_btn.raise_()
+        self.corners.raise_()
 
     def _axis_menu(self):
         """TradingView's price-scale right-click menu."""

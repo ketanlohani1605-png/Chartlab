@@ -47,7 +47,8 @@ LAYOUT_COUNT = {"1": 1, "2h": 2, "2v": 2, "4": 4}
 DRAW_BUTTONS = [("trend", "╱"), ("ray", "↗"), ("hline", "—"), ("vline", "|"),
                 ("rect", "▭"), ("fib", "φ"), ("measure", "m"), ("text", "T"),
                 ("hray", "→"), ("crossline", "+")]
-STYLE_NAMES = {"candles": "Candles", "hollow": "Hollow candles", "line": "Line", "area": "Area"}
+STYLE_NAMES = {"candles": "Candles", "hollow": "Hollow candles", "bars": "Bars", "heikin": "Heikin Ashi", "line": "Line",
+               "linemark": "Line with markers", "step": "Step line", "area": "Area", "baseline": "Baseline"}
 
 
 def _safe_key(text: str) -> str:
