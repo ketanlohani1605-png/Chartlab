@@ -92,8 +92,11 @@ class TVViewBox(pg.ViewBox):
             ev.ignore()
             return
         horizontal = ev.orientation() == QtCore.Qt.Orientation.Horizontal
+        mods = ev.modifiers()
+        shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        focused = bool(mods & (QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier))
         x0, x1, _, _ = self._span()
-        if horizontal:                                   # trackpad swipe sideways
+        if horizontal or shift:                          # trackpad swipe sideways / Shift+wheel = pan in time
             self.pan_x(-d / 120.0 * (x1 - x0) * 0.06)
         else:
             pos = self.mapSceneToView(ev.scenePos())
@@ -101,7 +104,10 @@ class TVViewBox(pg.ViewBox):
             if axis == 1 and self.is_price:
                 self.zoom_y(factor, pos.y())
             else:
-                self.zoom_x(factor, pos.x(), smooth=True)
+                # TradingView: plain wheel zooms keeping the right edge (latest bars) in place;
+                # Cmd/Ctrl+wheel zooms around the bar under the cursor
+                anchor = pos.x() if focused else min(x1, self.chart.x_limit() + 2)
+                self.zoom_x(factor, anchor, smooth=True)
         ev.accept()
 
     def mouseDragEvent(self, ev, axis=None):

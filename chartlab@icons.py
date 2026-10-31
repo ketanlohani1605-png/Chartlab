@@ -89,13 +89,32 @@ def fib(p, r, c):
 
 
 def magnet(p, r, c):
-    path = QtGui.QPainterPath(QtCore.QPointF(7, 5))
-    path.lineTo(7, 12)
-    path.arcTo(QtCore.QRectF(7, 8, 10, 10), 180, 180)
-    path.lineTo(17, 5)
+    """Horseshoe magnet (TradingView's snap tool)."""
+    path = QtGui.QPainterPath(QtCore.QPointF(5, 5))
+    path.lineTo(5, 12)
+    path.arcTo(QtCore.QRectF(5, 5, 14, 14), 180, 180)
+    path.lineTo(19, 5)
+    path.lineTo(15, 5)
+    path.lineTo(15, 12)
+    path.arcTo(QtCore.QRectF(9, 9, 6, 6), 0, -180)
+    path.lineTo(9, 5)
+    path.closeSubpath()
     p.drawPath(path)
-    p.drawLine(QtCore.QPointF(5.5, 5), QtCore.QPointF(8.5, 5))
-    p.drawLine(QtCore.QPointF(15.5, 5), QtCore.QPointF(18.5, 5))
+    p.drawLine(QtCore.QPointF(5, 8.5), QtCore.QPointF(9, 8.5))
+    p.drawLine(QtCore.QPointF(15, 8.5), QtCore.QPointF(19, 8.5))
+
+
+def refresh(p, r, c):
+    p.drawArc(QtCore.QRectF(5, 5, 14, 14), 60 * 16, 290 * 16)
+    p.drawLine(QtCore.QPointF(17.5, 4.5), QtCore.QPointF(17.5, 8.8))
+    p.drawLine(QtCore.QPointF(17.5, 8.8), QtCore.QPointF(13.3, 8.8))
+
+
+def datawin(p, r, c):
+    p.drawRoundedRect(QtCore.QRectF(4.5, 4.5, 15, 15), 2, 2)
+    for y in (9, 12.5, 16):
+        p.drawLine(QtCore.QPointF(7.5, y), QtCore.QPointF(11, y))
+        p.drawLine(QtCore.QPointF(13.5, y), QtCore.QPointF(16.5, y))
 
 
 def eraser(p, r, c):
@@ -243,6 +262,11 @@ def zoom(p, r, c):
     p.drawLine(QtCore.QPointF(11, 8.5), QtCore.QPointF(11, 13.5))
 
 
+def search(p, r, c):
+    p.drawEllipse(QtCore.QPointF(10.5, 10.5), 6, 6)
+    p.drawLine(QtCore.QPointF(15, 15), QtCore.QPointF(20, 20))
+
+
 def plus(p, r, c):
     p.drawEllipse(QtCore.QPointF(12, 12), 8, 8)
     p.drawLine(QtCore.QPointF(12, 8), QtCore.QPointF(12, 16))
@@ -299,7 +323,7 @@ def gear(p, r, c):
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
-    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear")}
+    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin")}
 
 
 def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:

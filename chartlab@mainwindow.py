@@ -83,10 +83,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_results_dock()
         self._build_right_rail()
         self._build_menu()
+        hm = QtWidgets.QMenu(self)
+        for act in self.menuBar().actions():
+            if act.menu():
+                hm.addMenu(act.menu())
+        self.menu_btn.setMenu(hm)
         self.setStatusBar(QtWidgets.QStatusBar())
         self.api_label = QtWidgets.QLabel("")
         self.statusBar().addPermanentWidget(self.api_label)
         self._shortcuts()
+        QtWidgets.QApplication.instance().installEventFilter(self)
         self.apply_chart_settings()
         self._restore()
 
@@ -142,13 +148,17 @@ class MainWindow(QtWidgets.QMainWindow):
         gd.clicked.connect(self._goto_date)
         h.addWidget(gd)
         h.addStretch(1)
-        adj = QtWidgets.QLabel("ADJ  ")
-        adj.setToolTip("Prices are adjusted for splits / dividends")
-        adj.setStyleSheet(f"color:{theme.MUTED}; font-size:12px; font-weight:600;")
-        h.addWidget(adj)
         self.clock = QtWidgets.QLabel("")
-        self.clock.setStyleSheet(f"color:{theme.TEXT}; font-size:12px;")
+        self.clock.setStyleSheet(f"color:{theme.TEXT}; font-size:13px; padding-right:10px;")
         h.addWidget(self.clock)
+        sep = QtWidgets.QFrame()
+        sep.setObjectName("vsep")
+        sep.setFixedSize(1, 18)
+        h.addWidget(sep)
+        adj = QtWidgets.QLabel("  ADJ")
+        adj.setToolTip("Prices are adjusted for splits / dividends")
+        adj.setStyleSheet(f"color:{theme.TEXT}; font-size:13px;")
+        h.addWidget(adj)
         self._clock_timer = QtCore.QTimer(self)
         self._clock_timer.timeout.connect(self._tick_clock)
         self._clock_timer.start(1000)
@@ -201,10 +211,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_symbol_search(self, text: str = ""):
         from .tvui import SymbolSearch
-        d = SymbolSearch(self, list(self._symbol_model.stringList()), text)
+        d = SymbolSearch(self, self.watchlist.symbols() + list(self._symbol_model.stringList()), text)
         if d.exec() and d.chosen:
             self.symbol.setText(d.chosen)
             self.on_load()
+        self.focus_chart()
 
     def open_interval_popup(self, first: str):
         from .tvui import IntervalPopup
@@ -212,6 +223,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if d.exec() and d.code in self.interval_btns:
             self.interval_btns[d.code].click()
             self._sync_interval_label()
+        self.focus_chart()
 
     def _tick_clock(self):
         import datetime as _dt
@@ -226,78 +238,119 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setObjectName("topbar")
         tb.setMovable(False)
         tb.setIconSize(QtCore.QSize(22, 22))
-        self.symbol = QtWidgets.QLineEdit()
+        self.topbar = tb
+
+        def vsep():
+            s = QtWidgets.QFrame()
+            s.setObjectName("vsep")
+            s.setFixedSize(1, 22)
+            w = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(w)
+            lay.setContentsMargins(5, 0, 5, 0)
+            lay.addWidget(s)
+            tb.addWidget(w)
+
+        # ☰ main menu (TradingView keeps every app menu behind this button)
+        self.menu_btn = QtWidgets.QToolButton()
+        self.menu_btn.setIcon(icons.get("menu"))
+        self.menu_btn.setToolTip("Main menu")
+        self.menu_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(self.menu_btn)
+
+        # symbol pill: a button that opens Symbol Search (typing on the chart does the same)
+        self.symbol = QtWidgets.QLineEdit()                 # state holder (also used by the API / tests)
         self.symbol.setObjectName("symbolbox")
-        self.symbol.setPlaceholderText("Symbol")
-        self.symbol.setToolTip("Symbol: RELIANCE, NIFTY, BSE:SBIN, US:AAPL, BTC-USD  (Enter to load)")
-        self.symbol.setFixedWidth(130)
         self.symbol.returnPressed.connect(self.on_load)
+        self.symbol.setVisible(False)
+        self._symbol_model = QtCore.QStringListModel(self._suggestions())
         pill = QtWidgets.QFrame()
         pill.setObjectName("symbolpill")
         ph = QtWidgets.QHBoxLayout(pill)
-        ph.setContentsMargins(4, 0, 6, 0)
+        ph.setContentsMargins(0, 0, 0, 0)
         ph.setSpacing(0)
+        self.sym_btn = QtWidgets.QToolButton()
+        self.sym_btn.setObjectName("symbtn")
+        self.sym_btn.setIcon(icons.get("search"))
+        self.sym_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.sym_btn.setToolTip("Symbol Search  (just start typing on the chart)")
+        self.sym_btn.clicked.connect(lambda: self.open_symbol_search(""))
+        ph.addWidget(self.sym_btn)
         ph.addWidget(self.symbol)
-        cmp_ = QtWidgets.QLabel()
-        cmp_.setPixmap(icons.get("compare").pixmap(20, 20))
-        cmp_.setToolTip("Compare or add symbol")
-        ph.addWidget(cmp_)
+        self.symbol.textChanged.connect(lambda t: self.sym_btn.setText(" " + (t.strip().upper() or "Symbol")))
+        self.sym_btn.setText(" Symbol")
         tb.addWidget(pill)
-        tb.addWidget(self._gap(6))
-        self._symbol_model = QtCore.QStringListModel(self._suggestions())
-        comp = QtWidgets.QCompleter(self._symbol_model, self)
-        comp.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
-        comp.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
-        comp.setMaxVisibleItems(12)
-        comp.activated.connect(lambda _t: QtCore.QTimer.singleShot(0, self.on_load))
-        self.symbol.setCompleter(comp)
+        cmp_ = QtWidgets.QToolButton()
+        cmp_.setIcon(icons.get("compare"))
+        cmp_.setToolTip("Add symbol to the watchlist")
+        cmp_.clicked.connect(self._add_current_to_watchlist)
+        tb.addWidget(cmp_)
+        vsep()
 
+        # hidden state holders for the data source and history length (shown via the source button)
         self.source = QtWidgets.QComboBox()
         self.source.addItem("Yahoo", "yahoo")
         self.source.addItem("Local file", "file")
         for name in datamod.list_providers():
             self.source.addItem(f"Provider: {name}", f"provider:{name}")
         self._fill_api_sources()
-        self.source.setToolTip("Data source")
         self.source.currentIndexChanged.connect(self._source_changed)
-        tb.addWidget(self.source)
-        tb.addSeparator()
+        self.range = QtWidgets.QComboBox()
+        self.range.addItems(RANGES)
+        self.range.setCurrentText("2y")
+        for w_ in (self.source, self.range):
+            w_.setParent(self)
+            w_.hide()
 
         self.interval_group = QtWidgets.QButtonGroup(self)
         self.interval_btns = {}
         for val, text in INTERVALS:
-            b = QtWidgets.QToolButton()
+            b = QtWidgets.QToolButton(self)
             b.setText(text)
             b.setCheckable(True)
-            b.setToolTip(f"Timeframe {text}")
             self.interval_group.addButton(b)
             self.interval_btns[val] = b
             b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
-            b.setVisible(False)                        # kept for state/tests; TradingView shows just the current one
+            b.hide()                                     # TradingView shows only the current one
         self.interval_btns["1d"].setChecked(True)
         self.interval_btn = QtWidgets.QToolButton()
-        self.interval_btn.setToolTip("Time interval")
+        self.interval_btn.setToolTip("Time interval  (type a number on the chart)")
         self.interval_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         im = QtWidgets.QMenu(self)
-        for val, text in INTERVALS:
-            im.addAction(text, lambda v=val: self.interval_btns[v].click())
+        groups = (("MINUTES", [("1m", "1 minute"), ("3m", "3 minutes"), ("5m", "5 minutes"), ("15m", "15 minutes"),
+                               ("30m", "30 minutes")]),
+                  ("HOURS", [("1h", "1 hour")]),
+                  ("DAYS", [("1d", "1 day"), ("1wk", "1 week"), ("1mo", "1 month")]))
+        self.interval_menu_actions = {}
+        for title, items in groups:
+            if title != "MINUTES":
+                im.addSeparator()
+            theme.menu_section(im, title)
+            for val, text in items:
+                act = im.addAction(text, lambda v=val: self.interval_btns[v].click())
+                act.setCheckable(True)
+                self.interval_menu_actions[val] = act
+        im.aboutToShow.connect(lambda: [a_.setChecked(self.interval_btns[v].isChecked())
+                                        for v, a_ in self.interval_menu_actions.items()])
         self.interval_btn.setMenu(im)
         tb.addWidget(self.interval_btn)
         self.interval_group.buttonToggled.connect(lambda *_: self._sync_interval_label())
         self._sync_interval_label()
-        tb.addSeparator()
+        vsep()
 
         style_menu = QtWidgets.QMenu(self)
         self.style_group = QtGui.QActionGroup(self)
         self.style_actions = {}
         for key in STYLES:
-            a = style_menu.addAction(STYLE_NAMES[key])
+            a = style_menu.addAction(icons.get("candles_icon"), STYLE_NAMES[key])
             a.setCheckable(True)
             self.style_group.addAction(a)
             a.triggered.connect(lambda _=False, k=key: self._style_chosen(k))
             self.style_actions[key] = a
+            if key in ("heikin", "step"):
+                style_menu.addSeparator()
         self.style_actions["candles"].setChecked(True)
         self._menu_button(tb, "", style_menu, icon="candles_icon", tip="Chart type")
+        vsep()
 
         ind_menu = QtWidgets.QMenu(self)
         self.ind_actions = {}
@@ -306,25 +359,28 @@ class MainWindow(QtWidgets.QMainWindow):
             a.setCheckable(True)
             a.toggled.connect(lambda on, k=key: self._indicator_toggled(k, on))
             self.ind_actions[key] = a
-        self._menu_button(tb, " Indicators", ind_menu, icon="fx", tip="Indicators")
+        self.ind_btn = self._menu_button(tb, " Indicators", ind_menu, icon="fx", tip="Indicators  ( / )")
 
         layout_menu = QtWidgets.QMenu(self)
         self.layout_group = QtGui.QActionGroup(self)
         self.layout_actions = {}
         for key, text in LAYOUTS.items():
-            a = layout_menu.addAction(text)
+            a = layout_menu.addAction(icons.get("layout_icon"), text)
             a.setCheckable(True)
             self.layout_group.addAction(a)
             a.triggered.connect(lambda _=False, k=key: self.set_layout(k))
             self.layout_actions[key] = a
         self.layout_actions["1"].setChecked(True)
         self._menu_button(tb, "", layout_menu, icon="layout_icon", tip="Chart layout")
+        vsep()
 
-        latest = QtWidgets.QToolButton()
-        latest.setIcon(icons.get("latest"))
-        latest.setToolTip("Jump to the latest bar  (End)")
-        latest.clicked.connect(lambda: self.active.chart.go_latest())
-        tb.addWidget(latest)
+        self.alert_btn = QtWidgets.QToolButton()
+        self.alert_btn.setIcon(icons.get("bell"))
+        self.alert_btn.setText(" Alert")
+        self.alert_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.alert_btn.setToolTip("Create alert  (Alt+A)")
+        self.alert_btn.clicked.connect(lambda: self.create_alert())
+        tb.addWidget(self.alert_btn)
 
         self.replay_btn = QtWidgets.QToolButton()
         self.replay_btn.setIcon(icons.get("replay_icon"))
@@ -334,14 +390,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.replay_btn.setToolTip("Bar replay: pick a start bar, then play the market bar by bar")
         self.replay_btn.clicked.connect(self.toggle_replay)
         tb.addWidget(self.replay_btn)
+        vsep()
 
-        self.alert_btn = QtWidgets.QToolButton()
-        self.alert_btn.setIcon(icons.get("bell"))
-        self.alert_btn.setText(" Alert")
-        self.alert_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.alert_btn.setToolTip("Create alert  (Alt+A)")
-        self.alert_btn.clicked.connect(lambda: self.create_alert())
-        tb.addWidget(self.alert_btn)
+        def tbtn(icon, tip, fn):
+            b = QtWidgets.QToolButton()
+            b.setIcon(icons.get(icon))
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            tb.addWidget(b)
+            return b
+        tbtn("undo", "Undo  (Ctrl+Z)", lambda: self.active.chart.layer.undo())
+        tbtn("redo", "Redo  (Ctrl+Shift+Z)", lambda: self.active.chart.layer.redo())
+
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        # data source + history: one quiet button, like TradingView's data-type switch
+        self.src_btn = QtWidgets.QToolButton()
+        self.src_btn.setObjectName("srcbtn")
+        self.src_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.src_btn.setToolTip("Data source and history length")
+        self.src_menu = QtWidgets.QMenu(self)
+        self.src_menu.aboutToShow.connect(self._fill_src_menu)
+        self.src_btn.setMenu(self.src_menu)
+        tb.addWidget(self.src_btn)
+        self.source.currentIndexChanged.connect(lambda *_: self._sync_src_btn())
+        self.range.currentTextChanged.connect(lambda *_: self._sync_src_btn())
+        self._sync_src_btn()
 
         self.acct_btn = QtWidgets.QToolButton()
         self.acct_btn.setText("Accounts")
@@ -361,43 +437,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self._acct_timer.start(10 * 60 * 1000)
         QtCore.QTimer.singleShot(1500, lambda: self.acct_poller.refresh())
         self._update_acct_dot()
+        vsep()
 
-        spacer = QtWidgets.QWidget()
-        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
-        tb.addWidget(spacer)
-
-        def tbtn(icon, tip, fn):
-            b = QtWidgets.QToolButton()
-            b.setIcon(icons.get(icon))
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            tb.addWidget(b)
-            return b
-        tbtn("undo", "Undo  (Ctrl+Z)", lambda: self.active.chart.layer.undo())
-        tbtn("redo", "Redo  (Ctrl+Shift+Z)", lambda: self.active.chart.layer.redo())
-        tb.addSeparator()
+        tbtn("zoom", "Quick search  (Ctrl+K)", self.quick_search)
         tbtn("gear", "Settings", self.open_settings)
-        tbtn("fullscreen", "Full screen  (Ctrl+Cmd+F)", self.toggle_fullscreen)
+        tbtn("fullscreen", "Full screen  (Shift+F)", self.toggle_fullscreen)
         tbtn("camera", "Save chart image", self.save_chart_image)
-        tb.addSeparator()
-
-        self.range = QtWidgets.QComboBox()
-        self.range.addItems(RANGES)
-        self.range.setCurrentText("2y")
-        self.range.setToolTip("How much history to load")
-        self.range.activated.connect(lambda *_: self.on_load())
-        tb.addWidget(self.range)
-        self.load_btn = QtWidgets.QPushButton("Load")
-        self.load_btn.setObjectName("primary")
-        self.load_btn.clicked.connect(self.on_load)
-        tb.addWidget(self.load_btn)
-        tb.addWidget(self._gap(8))
+        tb.addWidget(self._gap(6))
+        self.load_btn = QtWidgets.QPushButton("Load", self)   # kept for state; loading happens on Enter / search
+        self.load_btn.hide()
         self.run_btn = QtWidgets.QPushButton("\u25b6  Run")
         self.run_btn.setObjectName("pill")
         self.run_btn.setToolTip("Run the strategy / script  (Cmd+R)")
         self.run_btn.clicked.connect(self.run_backtest)
         tb.addWidget(self.run_btn)
-        tb.addWidget(self._gap(4))
+        tb.addWidget(self._gap(6))
+
+    def _sync_src_btn(self):
+        if hasattr(self, "src_btn"):
+            name = self.source.currentText().replace("Provider: ", "")
+            self.src_btn.setText(f"{name} \u00b7 {self.range.currentText()}  \u25be")
+
+    def _fill_src_menu(self):
+        m = self.src_menu
+        m.clear()
+        theme.menu_section(m, "Data source")
+        g = QtGui.QActionGroup(m)
+        for i in range(self.source.count()):
+            a = m.addAction(self.source.itemText(i))
+            a.setCheckable(True)
+            a.setChecked(i == self.source.currentIndex())
+            g.addAction(a)
+            a.triggered.connect(lambda _=False, i=i: (self.source.setCurrentIndex(i), self.on_load()))
+        m.addAction("Connect a broker account…", self.manage_accounts)
+        m.addSeparator()
+        theme.menu_section(m, "History to load")
+        g2 = QtGui.QActionGroup(m)
+        for r in RANGES:
+            a = m.addAction(r)
+            a.setCheckable(True)
+            a.setChecked(r == self.range.currentText())
+            g2.addAction(a)
+            a.triggered.connect(lambda _=False, r=r: (self.range.setCurrentText(r), self.on_load()))
+
+    def _watchlist_add_search(self):
+        from .tvui import SymbolSearch
+        d = SymbolSearch(self, list(self._symbol_model.stringList()), "")
+        d.setWindowTitle("Add symbol to watchlist")
+        if d.exec() and d.chosen:
+            self.watchlist.add(d.chosen)
+
+    def _add_current_to_watchlist(self):
+        sym = self.symbol.text().strip().upper()
+        if sym and self.watchlist.add(sym):
+            self.statusBar().showMessage(f"{sym} added to the watchlist", 3000)
+        else:
+            self.open_symbol_search("")
 
     @staticmethod
     def _suggestions() -> list[str]:
@@ -506,15 +601,32 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setMovable(False)
         tb.setIconSize(QtCore.QSize(24, 24))
         self.addToolBar(QtCore.Qt.ToolBarArea.RightToolBarArea, tb)
+        self.right_docks = [self.watch_dock, self.alerts_dock, self.strategy_dock, self.data_dock]
+        self.rail_actions = {}
         for dock, ico, tip in ((self.watch_dock, "watchlist", "Watchlist"),
-                               (self.strategy_dock, "code", "Python strategy editor"),
-                               (self.results_dock, "table", "Backtest results"),
                                (self.alerts_dock, "bell", "Alerts"),
-                               (self.data_dock, "table", "Data window")):
-            act = dock.toggleViewAction()
-            act.setIcon(icons.get(ico))
+                               (self.strategy_dock, "code", "Python strategy editor"),
+                               (self.data_dock, "datawin", "Data window  (Alt+D)")):
+            act = tb.addAction(icons.get(ico), "")
+            act.setCheckable(True)
             act.setToolTip(tip)
-            tb.addAction(act)
+            act.triggered.connect(lambda _=False, d=dock: self.toggle_right_panel(d))
+            self.rail_actions[dock] = act
+        tb.addSeparator()
+        res = self.results_dock.toggleViewAction()
+        res.setIcon(icons.get("table"))
+        res.setToolTip("Backtest results")
+        tb.addAction(res)
+
+    def toggle_right_panel(self, dock):
+        """Click an icon: show that panel alone; click the active one again: hide the side panel."""
+        self.show_right_panel(None if dock.isVisible() else dock)
+
+    def show_right_panel(self, dock):
+        for d in self.right_docks:
+            d.setVisible(d is dock)
+        for d, a in self.rail_actions.items():
+            a.setChecked(d is dock)
 
     def _build_data_dock(self):
         self.data_lbl = QtWidgets.QLabel("Hover a bar")
@@ -556,7 +668,7 @@ class MainWindow(QtWidgets.QMainWindow):
             a = self.alerts.add(self._alert_key(panel), ch.label or panel.label, v["cond"], v["value"], last,
                                 v["message"], v["once"], v["expires"])
             self.statusBar().showMessage("Alert created: " + alertmod.describe(a))
-            self.alerts_dock.show()
+            self.show_right_panel(self.alerts_dock)
             self.poller.poll()
 
     def _refresh_alert_lines(self):
@@ -581,6 +693,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.watchlist = WatchlistWidget()
         self.watchlist.symbolChosen.connect(self._watchlist_chosen)
         self.watchlist.changed.connect(self._save_watchlist)
+        self.watchlist.addRequested.connect(self._watchlist_add_search)
         self.watch_dock = QtWidgets.QDockWidget("Watchlist", self)
         self.watch_dock.setWidget(self.watchlist)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.watch_dock)
@@ -668,22 +781,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results_dock = QtWidgets.QDockWidget("Backtest results", self)
         self.results_dock.setWidget(self.tabs)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
-        self.tabifyDockWidget(self.watch_dock, self.strategy_dock)
-        self.tabifyDockWidget(self.watch_dock, self.alerts_dock)
-        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock):
-            d.setTitleBarWidget(QtWidgets.QWidget())      # tabs already name them; the rail toggles them
+        # TradingView: one side panel at a time, chosen from the right icon rail; no tabs
+        self.watch_dock.setTitleBarWidget(QtWidgets.QWidget())          # the watchlist draws its own header
+        for d, title in ((self.strategy_dock, "Strategy (Python)"), (self.alerts_dock, "Alerts"),
+                         (self.data_dock, "Data window")):
+            lab = QtWidgets.QLabel(title)
+            lab.setObjectName("panelTitle")
+            d.setTitleBarWidget(lab)
+        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock, self.data_dock):
+            d.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+            d.setMinimumWidth(340)
         self.results_dock.hide()
-        self.watch_dock.raise_()
-        self.setTabPosition(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, QtWidgets.QTabWidget.TabPosition.North)
         self.watch_dock.setObjectName("dock_watchlist")
         self.strategy_dock.setObjectName("dock_strategy")
         self.alerts_dock.setObjectName("dock_alerts")
         self.results_dock.setObjectName("dock_results")
-        for tb_ in self.findChildren(QtWidgets.QToolBar):
-            tb_.setObjectName("tb_" + (tb_.windowTitle() or "main").replace(" ", "_"))
+        for tb_ in self.findChildren(QtWidgets.QToolBar):     # saveState needs names; keep the styled ones
+            if not tb_.objectName():
+                tb_.setObjectName("tb_" + (tb_.windowTitle() or "main").replace(" ", "_"))
         self._default_state = self.saveState(3)
         self.resizeDocks([self.strategy_dock], [480], QtCore.Qt.Orientation.Horizontal)
-        self.resizeDocks([self.watch_dock], [250], QtCore.Qt.Orientation.Horizontal)
+        self.resizeDocks([self.watch_dock], [350], QtCore.Qt.Orientation.Horizontal)
         self.resizeDocks([self.results_dock], [260], QtCore.Qt.Orientation.Vertical)
 
     def _build_menu(self):
@@ -710,16 +828,17 @@ class MainWindow(QtWidgets.QMainWindow):
         s.addAction("Run script on multiple accounts…", self.run_on_accounts)
         v = mb.addMenu("View")
         v.addAction("Reset layout", self.reset_layout)
-        v.addAction(self.watch_dock.toggleViewAction())
-        v.addAction(self.strategy_dock.toggleViewAction())
+        v.addAction("Watchlist", lambda: self.show_right_panel(self.watch_dock))
+        v.addAction("Alerts", lambda: self.show_right_panel(self.alerts_dock))
+        v.addAction("Strategy editor", lambda: self.show_right_panel(self.strategy_dock))
+        v.addAction("Data window\tAlt+D", lambda: self.show_right_panel(self.data_dock))
+        v.addAction("Hide side panel", lambda: self.show_right_panel(None))
+        v.addSeparator()
         v.addAction(self.results_dock.toggleViewAction())
         c = mb.addMenu("Claude")
         c.addAction("Connect to Claude…", self.show_connect_dialog)
 
     def _shortcuts(self):
-        for key in ("Delete", "Backspace"):
-            QtGui.QShortcut(QtGui.QKeySequence(key), self,
-                            activated=lambda: self.active.chart.layer.delete_selected())
         QtGui.QShortcut(QtGui.QKeySequence("Escape"), self, activated=self._escape)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self, activated=lambda: self.active.chart.layer.undo())
         for k in ("Ctrl+Shift+Z", "Ctrl+Y"):
@@ -732,12 +851,12 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+K"), self, activated=self.quick_search)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+H"), self, activated=lambda: [p.chart.layer.set_hidden(not p.chart.layer.hidden) for p in self.panels])
         QtGui.QShortcut(QtGui.QKeySequence("Alt+Return"), self, activated=lambda: self.statusBar().showMessage("Maximise chart: use the 1-chart layout", 3000))
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=lambda: self.statusBar().showMessage("Layout saved (auto)", 2000))
+
         QtGui.QShortcut(QtGui.QKeySequence("Alt+G"), self, activated=lambda: self._goto_date())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+I"), self, activated=lambda: self.active.chart.price.vb.invertY(not self.active.chart.price.vb.state["yInverted"]))
         QtGui.QShortcut(QtGui.QKeySequence("Alt+L"), self, activated=lambda: self._toggle_scale("log"))
         QtGui.QShortcut(QtGui.QKeySequence("Alt+P"), self, activated=lambda: self._toggle_scale("percent"))
-        QtGui.QShortcut(QtGui.QKeySequence("Alt+D"), self, activated=lambda: self.data_dock.setVisible(not self.data_dock.isVisible()))
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+D"), self, activated=lambda: self.toggle_right_panel(self.data_dock))
         QtGui.QShortcut(QtGui.QKeySequence("Shift+F"), self, activated=self.toggle_fullscreen)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+,"), self, activated=self.open_settings)
 
@@ -750,6 +869,54 @@ class MainWindow(QtWidgets.QMainWindow):
     def apply_chart_settings(self):
         for p in self.panels:
             p.chart.apply_settings()
+
+    # ------------------------------------------------------------------ TradingView keyboard model
+    _TEXT_INPUTS = (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit, QtWidgets.QAbstractSpinBox,
+                    QtWidgets.QKeySequenceEdit)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QtCore.QEvent.Type.KeyPress and self._route_key(ev, obj):
+            return True
+        return super().eventFilter(obj, ev)
+
+    def _route_key(self, ev, target=None) -> bool:
+        """Keys typed anywhere in the main window that is not a text field go to the chart, like TradingView:
+        a letter opens Symbol Search, a digit or ',' opens Change interval, '/' opens Indicators,
+        arrows / + / - / Home / End move and zoom the active chart."""
+        app = QtWidgets.QApplication
+        if app.activeModalWidget() is not None or app.activePopupWidget() is not None:
+            return False
+        fw = app.focusWidget() or (target if isinstance(target, QtWidgets.QWidget) else None)
+        if fw is None or fw.window() is not self:
+            return False
+        if isinstance(fw, self._TEXT_INPUTS) or (isinstance(fw, QtWidgets.QComboBox) and fw.isEditable()):
+            return False
+        M = QtCore.Qt.KeyboardModifier
+        mods = ev.modifiers()
+        txt = ev.text()
+        plain = not (mods & (M.ControlModifier | M.AltModifier | M.MetaModifier))
+        if plain and len(txt) == 1 and txt.isprintable():
+            if txt.isalpha():
+                QtCore.QTimer.singleShot(0, lambda t=txt.upper(): self.open_symbol_search(t))
+                return True
+            if txt.isdigit() or txt == ",":
+                QtCore.QTimer.singleShot(0, lambda t=("" if txt == "," else txt): self.open_interval_popup(t))
+                return True
+            if txt == "/":
+                QtCore.QTimer.singleShot(0, self.ind_btn.showMenu)
+                return True
+        if isinstance(fw, QtWidgets.QAbstractItemView):      # lists keep their own arrow / delete keys
+            return False
+        if self.active is None:
+            return False
+        if ev.key() in (QtCore.Qt.Key.Key_Delete, QtCore.Qt.Key.Key_Backspace) and plain:
+            self.active.chart.layer.delete_selected()
+            return True
+        return bool(self.active.chart.handle_key(ev))
+
+    def focus_chart(self):
+        if self.active is not None:
+            self.active.chart.glw.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def _chart_typed(self, ch: str):
         if ch.isalpha():
@@ -765,7 +932,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Ctrl+K: 'Search tool or function' – a filterable list of actions."""
         items = {"Settings": self.open_settings, "Go to date": self._goto_date, "Full screen": self.toggle_fullscreen,
                  "Save chart image": self.save_chart_image, "Reset chart view": lambda: self.active.chart.go_latest(),
-                 "Create alert": lambda: self.create_alert(), "Data window": lambda: self.data_dock.setVisible(not self.data_dock.isVisible()), "Symbol search": self.open_symbol_search,
+                 "Create alert": lambda: self.create_alert(), "Data window": lambda: self.toggle_right_panel(self.data_dock), "Symbol search": self.open_symbol_search,
                  "Change interval": lambda: self.open_interval_popup("")}
         for lbl, fn in getattr(self, "_extra_actions", {}).items():
             items[lbl] = fn
@@ -846,16 +1013,16 @@ class MainWindow(QtWidgets.QMainWindow):
         geo = st.value("geometry")
         if geo:
             self.restoreGeometry(geo)
-        state = st.value("dock_state_v3")
+        state = st.value("dock_state_v4")
         if state:
             self.restoreState(state, 3)
+        vis = [d for d in self.right_docks if d.isVisible()]
+        self.show_right_panel(vis[0] if vis else (None if state else self.watch_dock))
         self._source_changed()
 
     def reset_layout(self):
         self.restoreState(self._default_state, 3)
-        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock, self.results_dock):
-            d.show()
-        self.watch_dock.raise_()
+        self.show_right_panel(self.watch_dock)
 
     def closeEvent(self, e):
         st = self.settings
@@ -866,7 +1033,7 @@ class MainWindow(QtWidgets.QMainWindow):
         st.setValue("strategy", self.editor.toPlainText())
         st.setValue("layout", self.layout_name)
         st.setValue("geometry", self.saveGeometry())
-        st.setValue("dock_state_v3", self.saveState(3))
+        st.setValue("dock_state_v4", self.saveState(3))
         self._save_watchlist()
         if self.api is not None:
             self.api.stop()
@@ -960,6 +1127,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active = panel
         panel.set_active(True)
         self._sync_toolbar()
+        self.focus_chart()
         self._show_result(panel)
 
     def _current_interval(self) -> str:
@@ -1226,6 +1394,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel is self.active:
             self._sync_toolbar()
             self._show_result(panel)
+            self.watchlist.select(str(panel.params.get("symbol", "")).upper())
+            if QtWidgets.QApplication.activeModalWidget() is None:
+                self.focus_chart()
 
     def _on_load_failed(self, panel, msg):
         self.load_btn.setEnabled(True)

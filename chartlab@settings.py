@@ -57,13 +57,14 @@ class ColorBtn(QtWidgets.QPushButton):
 
     def __init__(self, color: str):
         super().__init__()
-        self.setFixedSize(28, 22)
+        self.setFixedSize(34, 30)
         self.set(color)
         self.clicked.connect(self._pick)
 
     def set(self, c: str):
         self.c = c
-        self.setStyleSheet(f"QPushButton{{background:{c};border:1px solid #434651;border-radius:4px;}}")
+        self.setStyleSheet(f"QPushButton{{background:{c};border:4px solid #1e1e1e;border-radius:7px;"
+                           f"outline:1px solid #4a4a4a;}} QPushButton{{border:1px solid #4a4a4a;}}")
 
     def _pick(self):
         col = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.c), self, "Colour")
@@ -87,24 +88,37 @@ class SettingsDialog(QtWidgets.QDialog):
         self.v = copy.deepcopy(_cur)
         self._ctl: dict[str, QtWidgets.QWidget] = {}
         self.setStyleSheet(
-            "QDialog,QScrollArea,QScrollArea>QWidget>QWidget{background:#1e222d;border:0;} QLabel{color:#d1d4dc;background:transparent;} "
-            "QCheckBox{color:#d1d4dc;spacing:8px;} QListWidget{background:#1e222d;border:0;border-right:1px solid #2a2e39;outline:0;} "
-            "QListWidget::item{padding:10px 14px;color:#d1d4dc;} QListWidget::item:selected{background:#2a2e39;color:#fff;} "
-            "QComboBox,QSpinBox{background:#131722;border:1px solid #434651;border-radius:4px;padding:4px 8px;min-height:22px;color:#d1d4dc;} "
-            "QPushButton{background:#2a2e39;border:1px solid #434651;border-radius:6px;padding:7px 18px;color:#d1d4dc;} "
-            "QPushButton:hover{background:#363a45;} QPushButton#ok{background:#d1d4dc;color:#131722;font-weight:600;}")
+            "QDialog{background:#1e1e1e;} QDialog QWidget{background:transparent;} "
+            "QLabel{color:#dbdbdb;font-size:14px;} QLabel#sec{color:#9598a1;font-size:11px;font-weight:600;} "
+            "QCheckBox{color:#dbdbdb;spacing:10px;font-size:14px;} "
+            "QCheckBox::indicator{width:16px;height:16px;border:1px solid #6a6d78;border-radius:4px;background:#1e1e1e;} "
+            "QCheckBox::indicator:checked{background:#ffffff;border-color:#ffffff;image:url(%s);} "
+            "QListWidget{border:0;outline:0;} "
+            "QListWidget::item{padding:9px 12px;color:#dbdbdb;border-radius:6px;margin:1px 0;} "
+            "QListWidget::item:selected{background:#2e2e2e;color:#fff;} QListWidget::item:hover{background:#262626;} "
+            "QComboBox,QSpinBox{background:#1e1e1e;border:1px solid #4a4a4a;border-radius:6px;padding:5px 10px;"
+            "min-height:22px;color:#dbdbdb;font-size:14px;} QComboBox:hover,QSpinBox:hover{border-color:#6a6d78;} "
+            "QComboBox QAbstractItemView{background:#1e1e1e;border:1px solid #2e2e2e;selection-background-color:#2e2e2e;} "
+            "QPushButton{background:transparent;border:1px solid #6a6d78;border-radius:8px;padding:7px 18px;color:#dbdbdb;"
+            "font-size:14px;} QPushButton:hover{background:#2e2e2e;} "
+            "QPushButton#ok{background:#ffffff;color:#000;font-weight:600;border-color:#ffffff;} "
+            "QPushButton#ok:hover{background:#e0e0e0;} QFrame#footline{background:#2e2e2e;}" % theme.check_icon_path())
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         body = QtWidgets.QHBoxLayout()
+        body.setContentsMargins(16, 16, 0, 0)
         self.tabs = QtWidgets.QListWidget()
-        self.tabs.setFixedWidth(200)
+        self.tabs.setFixedWidth(210)
+        self.tabs.setIconSize(QtCore.QSize(20, 20))
         self.stack = QtWidgets.QStackedWidget()
-        for name, builder in (("Symbol", self._symbol), ("Status line", self._status),
-                              ("Scales and lines", self._scales), ("Canvas", self._canvas)):
-            self.tabs.addItem(name)
+        from . import icons
+        for name, ico, builder in (("Symbol", "candles_icon", self._symbol), ("Status line", "menu", self._status),
+                                   ("Scales and lines", "measure", self._scales), ("Canvas", "rect", self._canvas)):
+            self.tabs.addItem(QtWidgets.QListWidgetItem(icons.get(ico, "#dbdbdb"), "  " + name))
             page = QtWidgets.QWidget()
             lay = QtWidgets.QVBoxLayout(page)
-            lay.setContentsMargins(22, 18, 22, 18)
+            lay.setContentsMargins(26, 4, 26, 18)
+            lay.setSpacing(10)
             builder(lay)
             lay.addStretch(1)
             sc = QtWidgets.QScrollArea()
@@ -117,8 +131,12 @@ class SettingsDialog(QtWidgets.QDialog):
         body.addWidget(self.tabs)
         body.addWidget(self.stack, 1)
         root.addLayout(body, 1)
+        fl = QtWidgets.QFrame()
+        fl.setObjectName("footline")
+        fl.setFixedHeight(1)
+        root.addWidget(fl)
         foot = QtWidgets.QHBoxLayout()
-        foot.setContentsMargins(16, 10, 16, 12)
+        foot.setContentsMargins(20, 12, 20, 14)
         tpl = QtWidgets.QPushButton("Template ▾")
         m = QtWidgets.QMenu(tpl)
         m.addAction("Reset settings", self._reset)
@@ -138,7 +156,8 @@ class SettingsDialog(QtWidgets.QDialog):
     # -- helpers
     def _head(self, lay, text):
         h = QtWidgets.QLabel(text.upper())
-        h.setStyleSheet("color:#787b86;font-size:11px;font-weight:600;margin-top:10px;")
+        h.setObjectName("sec")
+        lay.addSpacing(12)
         lay.addWidget(h)
 
     def _check(self, lay, key, text):
@@ -150,11 +169,23 @@ class SettingsDialog(QtWidgets.QDialog):
         return c
 
     def _row(self, lay, text, widgets):
+        """TradingView two-column row: label (or a checkbox) on the left, controls from a fixed column."""
         r = QtWidgets.QHBoxLayout()
-        r.addWidget(QtWidgets.QLabel(text), 1)
+        r.setSpacing(8)
+        first = text if isinstance(text, QtWidgets.QWidget) else QtWidgets.QLabel(text)
+        first.setFixedWidth(190)
+        r.addWidget(first)
         for w in widgets:
             r.addWidget(w)
+        r.addStretch(1)
         lay.addLayout(r)
+
+    def _cb(self, key, text):
+        c = QtWidgets.QCheckBox(text)
+        c.setChecked(bool(self.v[key]))
+        c.toggled.connect(lambda x, k=key: self.v.__setitem__(k, x))
+        self._ctl[key] = c
+        return c
 
     def _color(self, key):
         b = ColorBtn(self.v[key])
@@ -167,7 +198,7 @@ class SettingsDialog(QtWidgets.QDialog):
         c.addItems(items)
         c.setCurrentText(str(self.v[key]))
         c.currentTextChanged.connect(lambda t, k=key: self.v.__setitem__(k, t))
-        c.setMinimumWidth(150)
+        c.setMinimumWidth(180)
         self._ctl[key] = c
         return c
 
@@ -186,10 +217,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self._check(lay, "prev_close", "Color bars based on previous close")
         for k, label in (("body", "Body"), ("border", "Borders"), ("wick", "Wick")):
             ks = {"body": ("up", "down"), "border": ("border_up", "border_down"), "wick": ("wick_up", "wick_down")}[k]
-            c = QtWidgets.QCheckBox(label)
-            c.setChecked(bool(self.v[k]))
-            c.toggled.connect(lambda x, kk=k: self.v.__setitem__(kk, x))
-            self._row(lay, "", [c, self._color(ks[0]), self._color(ks[1])])
+            self._row(lay, self._cb(k, label), [self._color(ks[0]), self._color(ks[1])])
         self._head(lay, "Precision")
         self._row(lay, "Precision", [self._combo("precision", PRECISIONS)])
 
@@ -218,23 +246,18 @@ class SettingsDialog(QtWidgets.QDialog):
     def _canvas(self, lay):
         self._head(lay, "Chart basic styles")
         self._row(lay, "Background", [self._color("bg")])
-        c = QtWidgets.QCheckBox("Vertical grid lines")
-        c.setChecked(self.v["grid_v"])
-        c.toggled.connect(lambda x: self.v.__setitem__("grid_v", x))
-        self._row(lay, "", [c, self._color("grid_color")])
-        c = QtWidgets.QCheckBox("Horizontal grid lines")
-        c.setChecked(self.v["grid_h"])
-        c.toggled.connect(lambda x: self.v.__setitem__("grid_h", x))
-        self._row(lay, "", [c])
-        self._row(lay, "Crosshair colour", [self._color("crosshair")])
+        self._row(lay, self._cb("grid_v", "Vertical grid lines"), [self._color("grid_color")])
+        self._row(lay, self._cb("grid_h", "Horizontal grid lines"), [])
+        self._row(lay, "Crosshair", [self._color("crosshair")])
         self._row(lay, "Watermark", [self._combo("watermark", WATERMARKS), self._color("wm_color")])
         self._head(lay, "Scales")
-        self._row(lay, "Text colour", [self._color("text_color")])
-        self._row(lay, "Text size", [self._spin("text_size", 9, 20)])
+        self._row(lay, "Text", [self._color("text_color"), self._spin("text_size", 9, 20)])
         self._head(lay, "Margins")
-        self._row(lay, "Top %", [self._spin("margin_top", 0, 40)])
-        self._row(lay, "Bottom %", [self._spin("margin_bottom", 0, 40)])
-        self._row(lay, "Right (bars)", [self._spin("scale_right_bars", 0, 100)])
+        for key, lab, lo, hi, unit in (("margin_top", "Top", 0, 40, "%"), ("margin_bottom", "Bottom", 0, 40, "%"),
+                                       ("scale_right_bars", "Right", 0, 100, "bars")):
+            u = QtWidgets.QLabel(unit)
+            u.setStyleSheet("color:#9598a1;")
+            self._row(lay, lab, [self._spin(key, lo, hi), u])
 
     def _reset(self):
         self.v = copy.deepcopy(DEFAULTS)

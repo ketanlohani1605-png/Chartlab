@@ -254,6 +254,7 @@ class AlertsPanel(QtWidgets.QWidget):
 
     def __init__(self, mgr: AlertManager, parent=None):
         super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.mgr = mgr
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(10, 10, 10, 10)
@@ -276,6 +277,13 @@ class AlertsPanel(QtWidgets.QWidget):
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._menu)
         v.addWidget(self.table, 2)
+        self.empty = QtWidgets.QLabel(
+            "<div style='text-align:center'><span style='font-size:15px;color:#dbdbdb'>No alerts yet</span><br><br>"
+            f"<span style='color:{theme.MUTED}'>Press <b>Alt+A</b>, click the <b>+</b> next to the price scale,<br>"
+            "or right-click the chart to add one at a price.</span></div>")
+        self.empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.empty.setWordWrap(True)
+        v.addWidget(self.empty, 2)
         v.addWidget(QtWidgets.QLabel(f"<span style='color:{theme.MUTED}'>Log</span>"))
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -285,6 +293,8 @@ class AlertsPanel(QtWidgets.QWidget):
 
     def refresh(self):
         al = self.mgr.alerts
+        self.table.setVisible(bool(al))
+        self.empty.setVisible(not al)
         self.table.setRowCount(len(al))
         colors = {"active": theme.UP, "triggered": "#ff9800", "paused": theme.MUTED, "expired": theme.MUTED}
         for r, a in enumerate(al):

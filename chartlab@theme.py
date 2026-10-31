@@ -15,6 +15,39 @@ ACCENT = "#2962ff"
 LINE_COLORS = ["#f5a623", "#2196f3", "#e91e63", "#9c27b0", "#00bcd4", "#8bc34a", "#ffeb3b"]
 
 
+def menu_section(menu, title: str):
+    """TradingView-style small grey heading inside a menu (Qt's addSection is invisible with style sheets)."""
+    from PySide6 import QtWidgets
+    lab = QtWidgets.QLabel(title.upper())
+    lab.setStyleSheet("color:#787b86; font-size:11px; font-weight:600; padding:8px 16px 4px 16px; background:transparent;")
+    act = QtWidgets.QWidgetAction(menu)
+    act.setDefaultWidget(lab)
+    act.setEnabled(False)
+    menu.addAction(act)
+    return act
+
+
+def check_icon_path() -> str:
+    """A small black tick on transparent, used for checked checkboxes (Qt style sheets need a file)."""
+    import os
+    import tempfile
+    from PySide6 import QtCore, QtGui
+    path = os.path.join(tempfile.gettempdir(), "chartlab_check_v1.png")
+    if not os.path.exists(path):
+        img = QtGui.QImage(32, 32, QtGui.QImage.Format.Format_ARGB32)
+        img.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(img)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        pen = QtGui.QPen(QtGui.QColor("#000000"), 4)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline([QtCore.QPointF(8, 16.5), QtCore.QPointF(13.5, 22), QtCore.QPointF(24, 10)])
+        p.end()
+        img.save(path)
+    return path.replace("\\", "/")
+
+
 def apply_pg_config():
     pg.setConfigOptions(background=BG, foreground=TEXT, antialias=False)
 
@@ -43,7 +76,7 @@ QLabel#chartHeader {{ background: transparent; padding: 0; font-size: 12px; }}
 QFrame#stripbar {{ border-top: 4px solid {GUTTER}; }}
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{ background: {BG}; border: 1px solid {BORDER}; border-radius: 6px; padding: 4px 8px; selection-background-color: {ACCENT}; }}
 QLineEdit:focus {{ border-color: {ACCENT}; }}
-QFrame#symbolpill {{ background: #1a1a1a; border-radius: 17px; min-height: 34px; max-height: 34px; }}
+QFrame#symbolpill {{ background: #1a1a1a; border-radius: 17px; min-height: 34px; max-height: 34px; min-width: 120px; }}
 QFrame#symbolpill QLabel {{ background: transparent; }}
 QLineEdit#symbolbox {{ background: transparent; border: 0; border-radius: 0; padding: 5px 14px; font-weight: 700; font-size: 14px; color: white; }}
 QComboBox {{ background: transparent; border: 0; padding: 4px 6px; }}
@@ -66,10 +99,6 @@ QTabBar::tab {{ background: transparent; padding: 7px 14px; border: 0; border-bo
 QTabBar::tab:hover {{ color: {TEXT}; }}
 QTabBar::tab:selected {{ color: white; border-bottom: 2px solid white; }}
 QMenuBar {{ background: {BG}; }}
-QMenu {{ background: #1a1a1a; border: 1px solid {BORDER}; padding: 4px; }}
-QMenu::item {{ padding: 6px 22px; border-radius: 4px; }}
-QMenu::item:selected {{ background: {HOVER}; }}
-QStatusBar {{ background: {BG}; color: {MUTED}; border-top: 1px solid {BORDER}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QSplitter::handle {{ background: {BORDER}; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
@@ -90,5 +119,19 @@ QDialog {{ background: #1a1a1a; }}
 QDialog QLineEdit, QDialog QComboBox, QDialog QDoubleSpinBox, QDialog QDateTimeEdit {{ background: {BG}; border: 1px solid {BORDER}; }}
 QListWidget {{ outline: 0; }}
 QPushButton#primary:pressed {{ background: #1e53e5; }}
+QFrame#vsep {{ background: #2e2e2e; }}
+QLabel#panelTitle {{ background: {BG}; color: white; font-size: 15px; font-weight: 600; padding: 10px 14px 8px 14px; }}
+QToolButton#symbtn {{ background: transparent; color: white; font-size: 14px; font-weight: 600; padding: 4px 14px 4px 10px; border-radius: 17px; }}
+QToolButton#symbtn:hover {{ background: #2a2a2a; }}
+QToolButton#srcbtn {{ color: #b2b5be; font-size: 13px; padding: 5px 10px; }}
+QMenu {{ background: #1e1e1e; border: 1px solid #2e2e2e; border-radius: 8px; padding: 6px 0; }}
+QMenu::item {{ padding: 7px 28px 7px 16px; border-radius: 0; color: #dbdbdb; }}
+QMenu::item:selected {{ background: #2e2e2e; color: white; }}
+QMenu::item:disabled {{ color: #6a6d78; }}
+QMenu::separator {{ height: 1px; background: #2e2e2e; margin: 5px 0; }}
+QMenu::icon {{ padding-left: 10px; }}
+QMenu::indicator {{ width: 14px; height: 14px; left: 6px; }}
+QStatusBar {{ background: {BG}; color: {MUTED}; border-top: 4px solid {GUTTER}; min-height: 20px; font-size: 12px; }}
+QToolBar#rightrail QToolButton:checked {{ background: #2a2a2a; }}
 QToolTip {{ background: #1a1a1a; color: {TEXT}; border: 1px solid {BORDER}; padding: 4px 6px; }}
 """
