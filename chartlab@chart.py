@@ -12,6 +12,10 @@ from . import indicators as ta
 from . import settings, theme
 from .drawings import DrawingLayer
 from .gestures import TVViewBox
+
+# pyqtgraph drops mouse-move events that arrive faster than 100/s; Mac trackpads / ProMotion screens send
+# ~120/s, so crosshair and drags would skip. Qt already compresses moves when busy, so take every one.
+pg.setConfigOption("mouseRateLimit", 0)
 from .render import CandleItem, VolumeItem
 
 _QWIDGETSIZE_MAX = 16777215
@@ -20,17 +24,25 @@ INDICATOR_KEYS = ["sma20", "sma50", "sma200", "ema20", "ema50", "bb", "rsi"]
 
 
 class _DotGridMixin:
-    """pyqtgraph draws grid lines with the axis pen; give them a dotted style like TradingView."""
+    """pyqtgraph draws grid lines with the axis pen + alpha. Translucent / dotted lines are very slow to paint
+    on Retina screens, so the grid is drawn with an opaque, pre-blended colour (same look, ~10x cheaper)."""
+    grid_bg = "#000000"
 
     def generateDrawSpecs(self, p):
         specs = super().generateDrawSpecs(p)
         try:
             axisSpec, tickSpecs, textSpecs = specs
             out = []
+            bg = QtGui.QColor(self.grid_bg)
             for pen, a, b in tickSpecs:
-                if pen.style() == QtCore.Qt.PenStyle.SolidLine and pen.color().alpha() < 255 and pen.color().alpha() > 0:
-                    pen = QtGui.QPen(pen)
-                    pen.setStyle(QtCore.Qt.PenStyle.DotLine)
+                col = pen.color()
+                al = col.alphaF()
+                if 0 < al < 1:
+                    mixed = QtGui.QColor(int(col.red() * al + bg.red() * (1 - al)),
+                                         int(col.green() * al + bg.green() * (1 - al)),
+                                         int(col.blue() * al + bg.blue() * (1 - al)))
+                    pen = QtGui.QPen(mixed, 0)
+                    pen.setCosmetic(True)
                 out.append((pen, a, b))
             return axisSpec, out, textSpecs
         except Exception:  # noqa: BLE001
@@ -106,6 +118,15 @@ class CornerOverlay(QtWidgets.QWidget):
         super().__init__(parent)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def resizeEvent(self, ev):
+        # only the four corner squares exist for the window system: the overlay never repaints the chart area
+        r, w, h = self.R, self.width(), self.height()
+        reg = QtGui.QRegion()
+        for x, y in ((0, 0), (w - r, 0), (0, h - r), (w - r, h - r)):
+            reg = reg.united(QtGui.QRegion(x, y, r, r))
+        self.setMask(reg)
+        super().resizeEvent(ev)
 
     def paintEvent(self, _ev):
         p = QtGui.QPainter(self)
@@ -322,6 +343,11 @@ class ChartWidget(QtWidgets.QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         self.glw = pg.GraphicsLayoutWidget()
+        QGV = QtWidgets.QGraphicsView
+        self.glw.setOptimizationFlag(QGV.OptimizationFlag.DontSavePainterState, True)
+        self.glw.setOptimizationFlag(QGV.OptimizationFlag.DontAdjustForAntialiasing, True)
+        self.glw.viewport().setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.glw.viewport().setAttribute(QtCore.Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.glw.ci.layout.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.glw, 1)
         self.header = OverlayLabel(self.glw)
@@ -922,6 +948,7 @@ class ChartWidget(QtWidgets.QWidget):
 
         self.volbars = VolumeItem(df)
         self.volbars.overlay = self.price.vb
+        self.volbars.setZValue(-5)                     # behind candles, like TradingView
         self.price.addItem(self.volbars, ignoreBounds=True)
 
         self._lows = df["Low"].to_numpy(float)
@@ -1226,8 +1253,12 @@ class ChartWidget(QtWidgets.QWidget):
                                           if self.layer.hover_hit(mp.x(), mp.y())
                                           else QtCore.Qt.CursorShape.CrossCursor)
         i = int(round(mp.x()))
+        ix = float(min(max(i, 0), max(self._n() - 1, 0))) if 0 <= i < self._n() else mp.x()
+        new_bar = i != getattr(self, "_hover_i", None)
+        self._hover_i = i
         for p in plots:
-            p.vline.setPos(mp.x())
+            if new_bar:
+                p.vline.setPos(ix)                      # TradingView: the vertical line snaps to the bar
             p.hline.setVisible(p is hovered)
             p.ytag.setVisible(p is hovered)
         hovered.hline.setPos(mp.y())
@@ -1236,15 +1267,16 @@ class ChartWidget(QtWidgets.QWidget):
         hovered.ytag.setText(f" {self.axis_label(mp.y()) if hovered is self.price else self.axis_price(mp.y())} ")
         hovered.ytag.setPos(xr, mp.y())
         if 0 <= i < self._n():
-            self._update_header(i)
-            fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
             bp = self._bottom_plot()
-            for o in plots:
-                if o is not bp:
-                    o.dtag.hide()
-            bp.dtag.setText(f" {self.df.index[i].strftime(fmt)} ")
-            bp.dtag.setPos(mp.x(), bp.vb.viewRange()[1][0])
-            bp.dtag.show()
+            if new_bar or not bp.dtag.isVisible():       # header / date tag only change when the bar changes
+                self._update_header(i)
+                fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
+                for o in plots:
+                    if o is not bp:
+                        o.dtag.hide()
+                bp.dtag.setText(f" {self.df.index[i].strftime(fmt)} ")
+                bp.dtag.setPos(ix, bp.vb.viewRange()[1][0])
+                bp.dtag.show()
         else:
             for o in plots:
                 o.dtag.hide()
@@ -1464,4 +1496,7 @@ class ChartWidget(QtWidgets.QWidget):
         rs = getattr(self, "_rsi_arr", None)
         if rs is not None and i < len(rs) and np.isfinite(rs[i]):
             self.rsi_label.setText(f"<span style='color:#ffffff'>RSI 14</span> <span style='color:#b388ff'>{rs[i]:.2f}</span>")
-        self._place_overlays()
+        hs = (self.header.height(), self.header.isVisible(), self.vol_label.isVisible())
+        if hs != getattr(self, "_hdr_shape", None):        # only re-layout overlays when the legend's shape changed
+            self._hdr_shape = hs
+            self._place_overlays()

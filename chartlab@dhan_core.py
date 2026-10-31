@@ -27,12 +27,24 @@ def _http(url: str, body: dict | None, headers: dict, timeout=30) -> bytes:
         raise RuntimeError(f"Could not reach Dhan ({e.reason}). Check your internet.") from None
 
 
+_MASTER_MEM: dict = {}
+_MASTER_LOCK = threading.Lock()
+
+
 def _master() -> pd.DataFrame:
+    """Dhan's instrument list: downloaded once a week, parsed once per app session (it is large)."""
     cache = USER_DIR / "cache" / "dhan_master.csv"
-    if not cache.exists() or time.time() - cache.stat().st_mtime > 7 * 86400:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_bytes(_http(MASTER_URL, None, {}, timeout=120))
-    return pd.read_csv(cache, low_memory=False)
+    with _MASTER_LOCK:
+        if not cache.exists() or time.time() - cache.stat().st_mtime > 7 * 86400:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_suffix(".part")
+            tmp.write_bytes(_http(MASTER_URL, None, {}, timeout=120))
+            os.replace(tmp, cache)
+        key = cache.stat().st_mtime
+        if _MASTER_MEM.get("key") != key:
+            _MASTER_MEM["df"] = pd.read_csv(cache, low_memory=False)
+            _MASTER_MEM["key"] = key
+        return _MASTER_MEM["df"]
 
 
 def resolve_symbol(symbol: str) -> tuple[str, str, str, str]:

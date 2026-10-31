@@ -70,8 +70,17 @@ def _align(x, index: pd.DatetimeIndex) -> pd.Series:
     return pd.Series(np.asarray(x), index=index)
 
 
-def run_user_strategy(code: str, df: pd.DataFrame) -> Signals:
+def run_user_strategy(code: str, df: pd.DataFrame, out=None) -> Signals:
+    """Run the user's `def strategy(df)`. If `out` (a text buffer) is given, print() inside the strategy writes
+    there - safe to call from a worker thread (no global stdout redirection)."""
     ns = {"__name__": "user_strategy", "np": np, "pd": pd, "ta": indicators}
+    if out is not None:
+        import builtins
+
+        def _print(*a, **k):
+            k.pop("file", None)
+            builtins.print(*a, file=out, **k)
+        ns["print"] = _print
     exec(compile(code, "<strategy>", "exec"), ns)
     fn = ns.get("strategy")
     if not callable(fn):
@@ -110,6 +119,16 @@ def run_user_strategy(code: str, df: pd.DataFrame) -> Signals:
     return Signals(buy if buy is not None else false, sell if sell is not None else false, overlays,
                    long=b("long"), short=b("short"), exits=b("exits"), position=pos())
 # --------------------------------------------------------------------------- events
+def error_line(tb_text: str) -> int | None:
+    """Line number (1-based) in the user's strategy code from a traceback, or None."""
+    import re
+    hits = re.findall(r'File "<strategy>", line (\d+)', tb_text or "")
+    if hits:
+        return int(hits[-1])
+    m = re.search(r"\(<strategy>, line (\d+)\)", tb_text or "")      # SyntaxError message form
+    return int(m.group(1)) if m else None
+
+
 def to_events(sig: Signals, direction: str, n: int):
     """Normalise every supported strategy output into four boolean arrays: long entry/exit, short entry/exit."""
     z = np.zeros(n, bool)

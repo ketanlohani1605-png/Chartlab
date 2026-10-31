@@ -78,32 +78,78 @@ def _frame(js: dict) -> pd.DataFrame:
                          "Close": js["close"], "Volume": js.get("volume", [0] * len(t))})
 
 
+_CANDLE_DIR = datamod.USER_DIR / "cache" / "dhan_candles"
+_MEM: dict = {}                       # (sid, seg, interval, period) -> (time, DataFrame): instant re-open
+
+
+def _post_candles(path: str, body: dict, hdr: dict) -> pd.DataFrame:
+    return _frame(json.loads(_http(f"{DHAN}/charts/{path}", body, hdr)))
+
+
 def fetch_dhan(acct: dict, symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """Candles from Dhan. Fast paths: cached security-id lookup, intraday chunks fetched in parallel, and a
+    per-symbol disk cache so re-opening a chart only downloads the bars that are new since last time."""
+    import concurrent.futures as cf
+    import time as _time
+    from .dhan_core import instrument
     hdr = {"access-token": acct["access_token"], "client-id": acct["client_id"], "Accept": "application/json"}
-    sid, seg, inst, _ = resolve_symbol(symbol)
+    s = symbol.strip().upper()
+    ex, base = (s.split(":", 1) if ":" in s else ("NSE", s))
+    if base in INDEX_IDS:
+        sid, seg, inst = INDEX_IDS[base], "IDX_I", "INDEX"
+    else:
+        ins = instrument(base, ex)
+        sid, seg, inst = ins["security_id"], ins["segment"], ins["instrument"]
+    mkey = (sid, seg, interval, period)
+    hit = _MEM.get(mkey)
+    if hit and _time.time() - hit[0] < 20:                  # same chart re-opened within seconds
+        return hit[1].copy()
     end = dt.date.today() + dt.timedelta(days=1)
     start = end - dt.timedelta(days=_DAYS.get(period, 731))
-    if interval in _MIN:
-        frames, step = [], 85                    # Dhan allows ~90 days of intraday per request
+    intraday = interval in _MIN
+    if intraday:
         start = max(start, end - dt.timedelta(days=370))
-        cur = start
+    cfile = _CANDLE_DIR / f"{seg}_{sid}_{'m' + str(_MIN[interval]) if intraday else 'd'}.pkl"
+    cached = None
+    try:
+        cached = pd.read_pickle(cfile)
+    except Exception:  # noqa: BLE001 - no / unreadable cache: full download
+        cached = None
+    fetch_from = start
+    if cached is not None and len(cached) and cached["Date"].iloc[0].date() <= start + dt.timedelta(days=5):
+        fetch_from = max(start, cached["Date"].iloc[-1].date() - dt.timedelta(days=3))   # only the new bars
+    if intraday:
+        chunks, cur = [], fetch_from
         while cur < end:
-            nxt = min(cur + dt.timedelta(days=step), end)
-            body = {"securityId": sid, "exchangeSegment": seg, "instrument": inst, "interval": str(_MIN[interval]),
-                    "oi": False, "fromDate": f"{cur} 09:00:00", "toDate": f"{nxt} 15:30:00"}
-            frames.append(_frame(json.loads(_http(f"{DHAN}/charts/intraday", body, hdr))))
+            nxt = min(cur + dt.timedelta(days=85), end)     # Dhan allows ~90 days of intraday per request
+            chunks.append({"securityId": sid, "exchangeSegment": seg, "instrument": inst,
+                           "interval": str(_MIN[interval]), "oi": False,
+                           "fromDate": f"{cur} 09:00:00", "toDate": f"{nxt} 15:30:00"})
             cur = nxt
-        df = pd.concat([f for f in frames if len(f)] or [pd.DataFrame()])
+        with cf.ThreadPoolExecutor(max_workers=min(4, len(chunks) or 1)) as pool:    # Dhan data API: 5 req/s
+            frames = list(pool.map(lambda b: _post_candles("intraday", b, hdr), chunks))
+        new = pd.concat([f for f in frames if len(f)] or [pd.DataFrame()])
     else:
         body = {"securityId": sid, "exchangeSegment": seg, "instrument": inst, "expiryCode": 0, "oi": False,
-                "fromDate": str(start), "toDate": str(end)}
-        df = _frame(json.loads(_http(f"{DHAN}/charts/historical", body, hdr)))
-        if interval in ("1wk", "1mo") and len(df):
-            df = df.set_index("Date").resample("W-FRI" if interval == "1wk" else "ME").agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna().reset_index()
+                "fromDate": str(fetch_from), "toDate": str(end)}
+        new = _post_candles("historical", body, hdr)
+    parts = [x for x in (cached, new) if x is not None and len(x)]
+    df = pd.concat(parts) if parts else pd.DataFrame()
     if df.empty:
         raise RuntimeError(f"Dhan returned no candles for {symbol} ({interval}).")
-    return df.drop_duplicates("Date").sort_values("Date").reset_index(drop=True)
+    df = df.drop_duplicates("Date", keep="last").sort_values("Date").reset_index(drop=True)
+    try:
+        _CANDLE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(cfile)
+    except Exception:  # noqa: BLE001 - cache is optional
+        pass
+    if cached is not None:                                    # trim old cached bars to the asked range
+        df = df[df["Date"] >= pd.Timestamp(start)].reset_index(drop=True)
+    if not intraday and interval in ("1wk", "1mo") and len(df):
+        df = df.set_index("Date").resample("W-FRI" if interval == "1wk" else "ME").agg(
+            {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna().reset_index()
+    _MEM[mkey] = (_time.time(), df)
+    return df.copy()
 
 
 def test_account(acct: dict) -> str:

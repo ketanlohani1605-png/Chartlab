@@ -105,12 +105,13 @@ class CandleItem(pg.GraphicsObject):
                 continue
             if S["wick"]:
                 p.setPen(pg.mkPen(wick))
-                p.drawLines([QtCore.QLineF(a, b, a, d) for a, b, d in zip(x, ll, hh)])
+                QL = QtCore.QLineF
+                p.drawLines([QL(a, b, a, d) for a, b, d in zip(x.tolist(), ll.tolist(), hh.tolist())])
             p.setPen(pg.mkPen(brd) if S["border"] else QtCore.Qt.PenStyle.NoPen)
             fill = QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush) if ((hollow and is_up) or not S["body"]) else pg.mkBrush(body)
             p.setBrush(fill)
-            for a, b, d in zip(x, oo, cc):
-                p.drawRect(QtCore.QRectF(a - w, b, 2 * w, d - b))
+            QR = QtCore.QRectF
+            p.drawRects([QR(a - w, b, 2 * w, d - b) for a, b, d in zip(x.tolist(), oo.tolist(), cc.tolist())])
 
 
 class VolumeItem(pg.GraphicsObject):
@@ -123,11 +124,20 @@ class VolumeItem(pg.GraphicsObject):
         if df is not None:
             self.set_data(df)
 
+    _cache: dict = {}
+
     @staticmethod
     def _c(up):
-        c = QtGui.QColor(settings.get()['up' if up else 'down'])
-        c.setAlpha(110)
-        return c
+        """Volume colour = candle colour at ~43% over the chart background, pre-blended (opaque = fast)."""
+        S = settings.get()
+        key = (S['up' if up else 'down'], S.get('bg', '#000000'))
+        col = VolumeItem._cache.get(key)
+        if col is None:
+            a, b, al = QtGui.QColor(key[0]), QtGui.QColor(key[1]), 110 / 255
+            col = QtGui.QColor(int(a.red() * al + b.red() * (1 - al)), int(a.green() * al + b.green() * (1 - al)),
+                               int(a.blue() * al + b.blue() * (1 - al)))
+            VolumeItem._cache[key] = col
+        return col
 
     def set_data(self, df):
         self.v = df["Volume"].to_numpy(float)
@@ -163,8 +173,9 @@ class VolumeItem(pg.GraphicsObject):
             (y0, y1) = self.overlay.viewRange()[1]
             vmax = float(np.nanmax(v)) or 1.0
             base, k = y0, 0.16 * (y1 - y0) / vmax
+        QR = QtCore.QRectF
         for is_up, col in ((True, self._c(True)), (False, self._c(False))):
             p.setBrush(col)
             m = up == is_up
-            for a, b in zip(xs[m], v[m]):
-                p.drawRect(QtCore.QRectF(a - w, base, 2 * w, b * k))
+            if m.any():
+                p.drawRects([QR(a - w, base, 2 * w, b * k) for a, b in zip(xs[m].tolist(), v[m].tolist())])

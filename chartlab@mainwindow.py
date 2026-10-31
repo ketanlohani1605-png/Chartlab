@@ -55,6 +55,28 @@ def _safe_key(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", text)
 
 
+class BacktestWorker(QtCore.QThread):
+    """Runs the user's strategy + the backtest off the GUI thread."""
+    finished_ok = QtCore.Signal(object, object, str, float)
+    failed = QtCore.Signal(str, str)
+
+    def __init__(self, code, df, cfg, parent=None):
+        super().__init__(parent)
+        self.code, self.df, self.cfg = code, df, cfg
+
+    def run(self):
+        import time as _t
+        buf = io.StringIO()
+        t0 = _t.perf_counter()
+        try:
+            sig = bt.run_user_strategy(self.code, self.df, out=buf)
+            res = bt.run_backtest(self.df, sig, self.cfg)
+        except Exception:  # noqa: BLE001 - user code
+            self.failed.emit(traceback.format_exc(), buf.getvalue())
+            return
+        self.finished_ok.emit(sig, res, buf.getvalue(), _t.perf_counter() - t0)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, settings: QtCore.QSettings | None = None):
         super().__init__()
@@ -718,7 +740,13 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addLayout(row)
 
         self.editor = CodeEditor()
+        self.editor.runRequested.connect(self.run_backtest)
         v.addWidget(self.editor, 1)
+        self.strat_status = QtWidgets.QLabel("Cmd+Enter to run  \u00b7  Cmd+/ comment  \u00b7  Tab / Shift+Tab indent")
+        self.strat_status.setWordWrap(True)
+        self.strat_status.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.strat_status.setStyleSheet(f"color:{theme.MUTED}; font-size:12px; padding:2px 2px;")
+        v.addWidget(self.strat_status)
 
         row2 = QtWidgets.QHBoxLayout()
         row2.addWidget(QtWidgets.QLabel("Capital"))
@@ -741,6 +769,7 @@ class MainWindow(QtWidgets.QMainWindow):
         run2.setObjectName("primary")
         run2.clicked.connect(self.run_backtest)
         v.addWidget(run2)
+        self.run2_btn = run2
 
         self.strategy_dock = QtWidgets.QDockWidget("Strategy (Python)", self)
         self.strategy_dock.setWidget(w)
@@ -821,6 +850,7 @@ class MainWindow(QtWidgets.QMainWindow):
         run.triggered.connect(self.run_backtest)
         s.addAction(run)
         s.addAction("Backtest settings…", self.show_bt_settings)
+        s.addAction("Remove strategy from chart", self.remove_strategy)
         s.addAction("Stop script", self.stop_script, QtGui.QKeySequence("Ctrl+."))
         s.addAction("Choose Python for scripts…", self.choose_python)
         s.addSeparator()
@@ -1395,6 +1425,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sync_toolbar()
             self._show_result(panel)
             self.watchlist.select(str(panel.params.get("symbol", "")).upper())
+            if getattr(panel, "_strategy_on", False) and re.search(r"^def\s+strategy\s*\(", self.strategy_code(), re.M):
+                QtCore.QTimer.singleShot(0, self.run_backtest)
             if QtWidgets.QApplication.activeModalWidget() is None:
                 self.focus_chart()
 
@@ -1592,10 +1624,85 @@ class MainWindow(QtWidgets.QMainWindow):
             self.run_backtest()
 
     def run_backtest(self):
-        r = self.run_backtest_on(self.active)
-        if not r["ok"]:
-            self.statusBar().showMessage(r["error"].splitlines()[-1] if r["error"] else "Backtest failed")
-            self.tabs.setCurrentWidget(self.log_view)
+        """Run button / Cmd+Enter: the strategy runs in a background thread so the chart never freezes."""
+        panel = self.active
+        if panel.df is None:
+            self._strat_say("Load a chart first.", False)
+            return
+        code = self.strategy_code()
+        if not re.search(r"^def\s+strategy\s*\(", code, re.M):
+            r = self.run_backtest_on(panel)                 # script mode already runs as a separate process
+            if not r["ok"]:
+                self._strat_say(r["error"].splitlines()[-1] if r["error"] else "Script failed", False)
+            return
+        w = getattr(self, "_bt_worker", None)
+        if w is not None and w.isRunning():
+            self._bt_again = True                           # run once more with the newest code when this one ends
+            return
+        self.editor.set_error_line(None)
+        self._set_running(True)
+        cfg = self.bt_config(None, None)
+        self._bt_worker = BacktestWorker(code, panel.chart.effective_df(), cfg, self)
+        self._bt_worker.finished_ok.connect(lambda sig, res, log, dt, p=panel: self._bt_done(p, sig, res, log, dt))
+        self._bt_worker.failed.connect(lambda err, log, p=panel: self._bt_failed(p, err, log))
+        self._bt_worker.start()
+
+    def remove_strategy(self):
+        p = self.active
+        p._strategy_on = False
+        p.result = p.signals = None
+        p.chart.clear_strategy()
+        p.chart.set_trades(__import__("pandas").DataFrame())
+        self._show_result(p)
+        self._strat_say("Strategy removed from this chart.", None)
+
+    def _set_running(self, on: bool):
+        for b, txt in ((self.run_btn, "\u25b6  Run"), (self.run2_btn, "\u25b6  Run backtest")):
+            b.setEnabled(not on)
+            b.setText("Running\u2026" if on else txt)
+        if on:
+            self._strat_say("Running\u2026", None)
+
+    def _strat_say(self, html: str, ok):
+        col = theme.UP if ok else (theme.DOWN if ok is False else theme.MUTED)
+        self.strat_status.setText(f"<span style='color:{col}'>{html}</span>")
+        if ok is False:
+            self.statusBar().showMessage(QtGui.QTextDocumentFragment.fromHtml(html).toPlainText(), 8000)
+
+    def _bt_finished_common(self):
+        self._set_running(False)
+        if getattr(self, "_bt_again", False):
+            self._bt_again = False
+            QtCore.QTimer.singleShot(0, self.run_backtest)
+
+    def _bt_done(self, panel, sig, res, log, dt):
+        if log:
+            self.add_log(log)
+        panel.result, panel.signals = res, sig
+        panel._strategy_on = True
+        panel.chart.set_strategy_overlays(sig.overlays)
+        panel.chart.set_trades(res.trades)
+        if panel is self.active:
+            self._show_result(panel)
+            self.results_dock.show()
+            self.tabs.setCurrentWidget(self.summary)
+        mt = res.metrics
+        self._strat_say(f"\u2713 {mt['trades']} trades \u00b7 net {mt['total_return'] * 100:+.2f}% \u00b7 "
+                        f"max DD {mt['max_drawdown'] * 100:.2f}% \u00b7 {dt * 1000:.0f} ms", True)
+        self.statusBar().showMessage(
+            f"Backtest ({panel.params['symbol']}): {mt['trades']} trades, net {mt['total_return'] * 100:+.2f}% "
+            f"(buy & hold {mt['buy_hold'] * 100:+.2f}%), max drawdown {mt['max_drawdown'] * 100:.2f}%")
+        self._bt_finished_common()
+
+    def _bt_failed(self, panel, err, log):
+        self.add_log((log or "") + err)
+        line = bt.error_line(err)
+        last = err.strip().splitlines()[-1] if err.strip() else "Error"
+        if line is not None:
+            self.editor.set_error_line(line)
+        import html as _html
+        self._strat_say(("Line %d: " % line if line else "") + _html.escape(last), False)
+        self._bt_finished_common()
 
     def run_backtest_on(self, panel, capital: float | None = None, fee: float | None = None) -> dict:
         if panel.df is None:
@@ -1605,17 +1712,20 @@ class MainWindow(QtWidgets.QMainWindow):
         data = panel.chart.effective_df()
         buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(buf):
-                sig = bt.run_user_strategy(self.strategy_code(), data)
+            sig = bt.run_user_strategy(self.strategy_code(), data, out=buf)
             cfg = self.bt_config(capital, fee)
             res = bt.run_backtest(data, sig, cfg)
         except Exception:  # noqa: BLE001 - show user-code errors in the Log tab
             err = traceback.format_exc()
             self.add_log(buf.getvalue() + err)
+            line = bt.error_line(err)
+            if line is not None:
+                self.editor.set_error_line(line)
             return {"ok": False, "error": err, "log": buf.getvalue()}
         if buf.getvalue():
             self.add_log(buf.getvalue())
         panel.result, panel.signals = res, sig
+        panel._strategy_on = True
         panel.chart.set_strategy_overlays(sig.overlays)
         panel.chart.set_trades(res.trades)
         if panel is self.active:
