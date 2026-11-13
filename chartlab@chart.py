@@ -560,15 +560,53 @@ class ChartWidget(QtWidgets.QWidget):
                               else self.glw.viewport().mapFromGlobal(QtGui.QCursor.pos()))
             self._cross_key = None
             QtCore.QTimer.singleShot(0, self._refresh_crosshair)
+        if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.Wheel and self.df is not None:
+            if self._trackpad_scroll(ev):
+                return True
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.NativeGesture:
             if ev.gestureType() == QtCore.Qt.NativeGestureType.ZoomNativeGesture:
                 pos = self.price.vb.mapSceneToView(self.glw.mapToScene(ev.position().toPoint()))
-                self.price.vb.zoom_x(max(0.2, 1.0 - ev.value() * 1.5), pos.x())
+                self.price.vb._stop_anim()
+                self.price.vb.zoom_x(float(np.exp(-ev.value() * 1.6)), pos.x())    # pinch: around the fingers
                 return True
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.KeyPress:
             if self.handle_key(ev):
                 return True
         return super().eventFilter(obj, ev)
+
+    def _trackpad_scroll(self, ev) -> bool:
+        """Two fingers on a trackpad, like TradingView on a Mac: sideways drags the chart 1:1 with the fingers
+        (macOS adds the glide after you let go), up / down zooms continuously. Pixel-exact and applied at once -
+        no stepping, no restarted animations. A real mouse wheel has no pixel delta and keeps its eased zoom."""
+        pd_ = ev.pixelDelta()
+        if pd_.isNull():
+            return False
+        pt = self.glw.mapToScene(ev.position().toPoint())
+        plot = next((p for p in (self.price, self.vol, self.rsi)
+                     if p.isVisible() and p.vb.sceneBoundingRect().contains(pt)), None)
+        if plot is None:
+            return False                                   # over a scale: the normal handler scales that axis
+        vb = self.price.vb
+        mods = ev.modifiers()
+        if mods & QtCore.Qt.KeyboardModifier.ShiftModifier:
+            return False
+        vb._stop_anim()
+        vb._vel = 0.0
+        (x0, x1) = vb.viewRange()[0]
+        w = max(vb.width(), 1.0)
+        dx, dy = pd_.x(), pd_.y()
+        if abs(dx) >= abs(dy):                              # one direction at a time, whichever the fingers mean
+            dy = 0
+        else:
+            dx = 0
+        if dx:
+            vb.pan_x(-dx * (x1 - x0) / w)
+        if dy:
+            focused = bool(mods & (QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier))
+            anchor = vb.mapSceneToView(pt).x() if focused else min(x1, self.x_limit() + 2)
+            vb.zoom_x(float(np.exp(-dy / 240.0)), anchor)
+        ev.accept()
+        return True
 
     # ------------------------------------------------------------------ replay (TradingView "Bar Replay")
     def _apply_limit(self):

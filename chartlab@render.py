@@ -107,11 +107,19 @@ class CandleItem(pg.GraphicsObject):
                 p.setPen(pg.mkPen(wick))
                 QL = QtCore.QLineF
                 p.drawLines([QL(a, b, a, d) for a, b, d in zip(x.tolist(), ll.tolist(), hh.tolist())])
-            p.setPen(pg.mkPen(brd) if S["border"] else QtCore.Qt.PenStyle.NoPen)
-            fill = QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush) if ((hollow and is_up) or not S["body"]) else pg.mkBrush(body)
+            solid = not ((hollow and is_up) or not S["body"])
+            fill = pg.mkBrush(body) if solid else QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush)
+            # an outline in the body's own colour adds nothing visible but doubles the drawing work: skip it
+            same = solid and str(brd).lower() == str(body).lower()
+            p.setPen(pg.mkPen(brd) if (S["border"] and not same) else QtCore.Qt.PenStyle.NoPen)
             p.setBrush(fill)
             QR = QtCore.QRectF
-            p.drawRects([QR(a - w, b, 2 * w, d - b) for a, b, d in zip(x.tolist(), oo.tolist(), cc.tolist())])
+            hgt = cc - oo
+            if same:                                       # no outline: a doji still needs a 1 px body line
+                vb = self.getViewBox()
+                ph = abs(vb.viewPixelSize()[1]) if vb is not None else 0.0
+                hgt = np.where(np.abs(hgt) < ph, ph, hgt)
+            p.drawRects([QR(a - w, b, 2 * w, d) for a, b, d in zip(x.tolist(), oo.tolist(), hgt.tolist())])
 
 
 class VolumeItem(pg.GraphicsObject):

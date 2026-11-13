@@ -335,6 +335,10 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
             b.setText({"1D": "D", "1W": "W", "1M": "M"}.get(text, text))   # favourites row: 1m 5m 15m 1h D W M
             b.setObjectName("ivbtn")
+            f = b.font()
+            f.setPixelSize(14)
+            f.setWeight(QtGui.QFont.Weight.DemiBold)
+            b.setMinimumWidth(QtGui.QFontMetrics(f).horizontalAdvance(b.text()) + 22)    # never elide to "..."
             b.setToolTip({"m": " minute", "h": " hour", "D": " day", "W": " week", "M": " month"}
                          .get(text[-1], "").join([text[:-1], ""]).strip() + ("s" if text[:-1] not in ("1", "") else ""))
             tb.addWidget(b)
@@ -597,10 +601,11 @@ class MainWindow(QtWidgets.QMainWindow):
         SC = {"trend": "Alt+T", "hline": "Alt+H", "hray": "Alt+J", "vline": "Alt+V", "crossline": "Alt+C",
               "fib": "Alt+F", "rect": "Shift+Alt+R"}
         GROUPS = [("Trend lines", ["trend", "ray", "ext", "hray", "hline", "vline", "crossline"]),
-                  ("Fib", ["fib"]),
-                  ("Shapes", ["rect", "ellipse", "arrow"]),
-                  ("Forecasting and measurement", ["long", "short", "pricerange", "daterange", "measure"]),
-                  ("Annotation", ["text"])]
+                  ("Gann and Fibonacci", ["fib"]),
+                  ("Forecasting and measurement", ["long", "short", "pricerange", "daterange"]),
+                  ("Geometric shapes", ["rect", "ellipse", "arrow"]),
+                  ("Text and notes", ["text"]),
+                  ("Measure", ["measure"])]              # TradingView's order; the ruler is its own button
         self.tool_groups = {}
         for gname, keys in GROUPS:
             ga = tb.addAction(icons.get(ICON.get(keys[0], keys[0])), "")
