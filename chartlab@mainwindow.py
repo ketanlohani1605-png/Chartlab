@@ -140,6 +140,7 @@ class MainWindow(QtWidgets.QMainWindow):
             p.loadStarted.connect(self._on_load_started)
             p.loadFinished.connect(self._on_loaded)
             p.loadFailed.connect(self._on_load_failed)
+            p.refreshed.connect(self._on_refreshed)
             p.drawingsChanged.connect(self._save_drawings)
             p.toolChanged.connect(lambda panel, tool: self._tool_changed(tool))
             p.chart.replayChanged.connect(lambda: self.replay_btn.setChecked(self.active.chart.replay['active']))
@@ -194,10 +195,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return {"1D": "D", "1W": "W", "1M": "M"}.get(text, text[:-1] if text.endswith("m") else text)
 
     def _sync_interval_label(self):
-        for val, text in INTERVALS:
-            if self.interval_btns[val].isChecked():
-                self.interval_btn.setText(self._tv_interval(text))
-                return
+        self.interval_btn.setText("\u2304")              # the chevron after the favourites opens the full list
 
     def _zoom_x(self, f):
         vb = self.active.chart.price.vb
@@ -312,6 +310,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # hidden state holders for the data source and history length (shown via the source button)
         self.source = QtWidgets.QComboBox()
+        self.source.addItem("Auto", "auto")           # my data folder -> connected API -> Yahoo
         self.source.addItem("Yahoo", "yahoo")
         self.source.addItem("Local file", "file")
         for name in datamod.list_providers():
@@ -334,7 +333,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.interval_group.addButton(b)
             self.interval_btns[val] = b
             b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
-            b.hide()                                     # TradingView shows only the current one
+            b.setText({"1D": "D", "1W": "W", "1M": "M"}.get(text, text))   # favourites row: 1m 5m 15m 1h D W M
+            b.setObjectName("ivbtn")
+            b.setToolTip({"m": " minute", "h": " hour", "D": " day", "W": " week", "M": " month"}
+                         .get(text[-1], "").join([text[:-1], ""]).strip() + ("s" if text[:-1] not in ("1", "") else ""))
+            tb.addWidget(b)
         self.interval_btns["1d"].setChecked(True)
         self.interval_btn = QtWidgets.QToolButton()
         self.interval_btn.setToolTip("Time interval  (type a number on the chart)")
@@ -500,6 +503,24 @@ class MainWindow(QtWidgets.QMainWindow):
             g.addAction(a)
             a.triggered.connect(lambda _=False, i=i: (self.source.setCurrentIndex(i), self.on_load()))
         m.addAction("Connect a broker account…", self.manage_accounts)
+        m.addSeparator()
+        theme.menu_section(m, "Auto update")
+        g3 = QtGui.QActionGroup(m)
+        cur = int(self.settings.value("auto_refresh", 60))
+        for sec, lab in ((0, "Off"), (10, "Every 10 seconds"), (30, "Every 30 seconds"), (60, "Every minute"),
+                         (300, "Every 5 minutes")):
+            a = m.addAction("Live refresh: " + lab)
+            a.setCheckable(True)
+            a.setChecked(sec == cur)
+            g3.addAction(a)
+            a.triggered.connect(lambda _=False, s=sec: self.set_auto_refresh(s))
+        a = m.addAction("Download watchlist every day")
+        a.setCheckable(True)
+        a.setChecked(self.settings.value("daily_download", "true") == "true")
+        a.triggered.connect(lambda on: (self.settings.setValue("daily_download", "true" if on else "false"),
+                                        self._daily_download() if on else None))
+        m.addAction("Refresh now", self.refresh_now)
+        m.addAction("Open My data folder\u2026", self.open_my_data)
         m.addSeparator()
         theme.menu_section(m, "History to load")
         g2 = QtGui.QActionGroup(m)
@@ -1120,7 +1141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         iv = st.value("interval", "1d")
         if iv in self.interval_btns:
             self.interval_btns[iv].setChecked(True)
-        i = self.source.findData(st.value("source", "yahoo"))
+        i = self.source.findData(st.value("source", "auto"))
         self.source.setCurrentIndex(max(i, 0))
         code = st.value("strategy", "")
         if not code:
@@ -1505,7 +1526,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _watchlist_chosen(self, sym: str):
         self.symbol.setText(sym)
         if self.source.currentData() == "file":
-            self.source.setCurrentIndex(self.source.findData("yahoo"))
+            self.source.setCurrentIndex(self.source.findData("auto"))
         self.on_load()
 
     # ------------------------------------------------------------------ data loading
@@ -1547,6 +1568,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_loaded(self, panel):
         self.load_btn.setEnabled(True)
         self._load_drawings(panel)
+        self._watch_path(panel)
         df = panel.df
         self._refresh_alert_lines()
         if len(df):   # catch moves since last session; crossing alerts only arm on this first look
@@ -1562,6 +1584,116 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(0, self.run_backtest)
             if QtWidgets.QApplication.activeModalWidget() is None:
                 self.focus_chart()
+
+    # ------------------------------------------------------------------ auto update
+    def start_auto_update(self):
+        """Live refresh of the charts on screen, reload when a local file / My data changes, and a once-a-day
+        download of the whole watchlist into ~/ChartLab/data/downloads."""
+        self._auto_timer = QtCore.QTimer(self)
+        self._auto_timer.timeout.connect(self._auto_tick)
+        self.set_auto_refresh(int(self.settings.value("auto_refresh", 60)))
+        datamod.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._fs = QtCore.QFileSystemWatcher(self)
+        self._fs.addPath(str(datamod.DATA_DIR))
+        self._fs_debounce = QtCore.QTimer(self)
+        self._fs_debounce.setSingleShot(True)
+        self._fs_debounce.setInterval(1200)
+        self._fs_debounce.timeout.connect(self._files_changed)
+        self._fs.fileChanged.connect(lambda *_: self._fs_debounce.start())
+        self._fs.directoryChanged.connect(lambda *_: self._fs_debounce.start())
+        self._daily_timer = QtCore.QTimer(self)
+        self._daily_timer.timeout.connect(self._daily_download)
+        self._daily_timer.start(30 * 60 * 1000)
+        QtCore.QTimer.singleShot(20000, self._daily_download)
+
+    def set_auto_refresh(self, seconds: int):
+        self.settings.setValue("auto_refresh", int(seconds))
+        if seconds > 0:
+            self._auto_timer.start(int(seconds) * 1000)
+        else:
+            self._auto_timer.stop()
+
+    def _visible_panels(self):
+        return [p for p in self.panels if p.isVisible()]
+
+    def _auto_tick(self):
+        if QtWidgets.QApplication.activeModalWidget() is not None:
+            return
+        for p in self._visible_panels():
+            if p.params.get("source") != "file":
+                p.refresh()
+
+    def refresh_now(self):
+        n = sum(bool(p.refresh()) for p in self._visible_panels())
+        self.statusBar().showMessage("Refreshing\u2026" if n else "Nothing to refresh right now", 2500)
+        self.watchlist.refresh()
+
+    def _watch_path(self, panel):
+        path = panel.params.get("path") if panel.params.get("source") == "file" else ""
+        if path and hasattr(self, "_fs") and path not in self._fs.files() + self._fs.directories():
+            self._fs.addPath(path)
+
+    def _files_changed(self):
+        for p in self._visible_panels():
+            src = p.params.get("source")
+            if src in ("file", "auto"):
+                if src == "file":
+                    self._watch_path(p)                   # editors replace files: watch the new one again
+                p.refresh()
+
+    def open_my_data(self):
+        datamod.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(datamod.DATA_DIR)))
+        self.statusBar().showMessage(
+            "Put RELIANCE.csv / NIFTY.parquet here: with source Auto, your own file is used first", 8000)
+
+    def _daily_download(self):
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        if (self.settings.value("daily_download", "true") != "true"
+                or self.settings.value("daily_done", "") == today or getattr(self, "_daily_busy", False)):
+            return
+        syms = list(self.watchlist.symbols())
+        if not syms:
+            return
+        self._daily_busy = True
+        from .panel import ChartPanel, LoadWorker
+
+        def job():
+            ok = 0
+            for s in syms:
+                if QtCore.QThread.currentThread().isInterruptionRequested():
+                    break
+                try:
+                    df, _lab = ChartPanel._load_auto(s, "1d", "2y")
+                    datamod.save_daily(s, df, "1d")
+                    ok += 1
+                except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
+                    logging.exception("daily download %s", s)
+            return ok, len(syms)
+        w = self._daily_worker = LoadWorker(job, self)
+
+        def done(ok, total):
+            self._daily_busy = False
+            if ok:
+                self.settings.setValue("daily_done", today)
+            self.add_log(f"[daily download] saved {ok} of {total} watchlist symbols to {datamod.DATA_DIR / 'downloads'}")
+            self.statusBar().showMessage(f"Daily data saved for {ok} of {total} watchlist symbols", 5000)
+        w.done.connect(done)
+        w.failed.connect(lambda *_: setattr(self, "_daily_busy", False))
+        w.start()
+
+    def _on_refreshed(self, panel):
+        """New bars arrived from a quiet auto refresh: keep alerts, strategy and labels in step."""
+        df = panel.df
+        self._refresh_alert_lines()
+        if len(df):
+            last = float(df["Close"].iloc[-1])
+            self.alerts.check(self._alert_key(panel), last, last, last)
+        if panel is self.active and getattr(panel, "_strategy_on", False) \
+                and re.search(r"^def\s+strategy\s*\(", self.strategy_code(), re.M) \
+                and QtWidgets.QApplication.activeModalWidget() is None:
+            QtCore.QTimer.singleShot(0, self.run_backtest)
 
     def _on_load_failed(self, panel, msg):
         self.load_btn.setEnabled(True)
@@ -2057,8 +2189,9 @@ def main():
         win.api_label.setText("Claude link: off  ")
         win.add_log(f"Claude link could not start: {e}")
     QtCore.QTimer.singleShot(300, win.on_load)
-    if win.source.currentData() == "yahoo":
+    if win.source.currentData() in ("yahoo", "auto"):
         QtCore.QTimer.singleShot(2500, win.watchlist.refresh)
+    win.start_auto_update()
     rc = app.exec()
     quit_cleanly(win, rc)
 

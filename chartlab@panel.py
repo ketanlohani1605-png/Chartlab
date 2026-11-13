@@ -65,7 +65,7 @@ class ChartPanel(QtWidgets.QFrame):
             self.setStyleSheet("ChartPanel { border: 0; }")
         else:
             self.setStyleSheet(
-                f"ChartPanel {{ border: 1px solid {theme.ACCENT if on else theme.BORDER}; }}")
+                f"ChartPanel {{ border: 1px solid {"#d1d4dc" if on else theme.BORDER}; }}")
 
     @property
     def symbol_key(self) -> str:
@@ -75,11 +75,34 @@ class ChartPanel(QtWidgets.QFrame):
         return datamod.normalize_symbol(sym) if self.params.get("source") == "yahoo" else sym.upper()
 
     # ------------------------------------------------------------------ loading
-    def load(self, source: str, symbol: str, interval: str, rng: str, path: str = ""):
+    refreshed = QtCore.Signal(object)
+
+    @staticmethod
+    def _load_auto(symbol, interval, rng):
+        from . import accounts
+        loaders = [(f"API {a['name']}", lambda s, i, r, n=a["name"]: accounts.load_api(n, s, i, r))
+                   for a in accounts.load_accounts() if a.get("broker") == "dhan" and a.get("access_token")]
+        return datamod.load_auto(symbol, interval, rng, loaders)
+
+    def refresh(self) -> bool:
+        """Quietly fetch the same symbol again (live / daily auto update). The view, drawings and zoom stay put;
+        nothing happens on screen unless new bars or a changed last bar arrive."""
+        ch = self.chart
+        if (self.loading or self.df is None or ch.replay["active"] or ch._panning() or ch.layer.tool
+                or ch.layer.pending or ch.layer._drag
+                or QtWidgets.QApplication.mouseButtons() != QtCore.Qt.MouseButton.NoButton):
+            return False
+        prm = self.params
+        self.load(prm["source"], prm["symbol"], prm["interval"], prm["range"], prm.get("path", ""), quiet=True)
+        return True
+
+    def load(self, source: str, symbol: str, interval: str, rng: str, path: str = "", quiet: bool = False):
         self._prev_params = dict(self.params)
         self.params = {"source": source, "symbol": symbol, "interval": interval, "range": rng, "path": path}
         if source == "file":
             fn = lambda: self._load_local(path, interval)  # noqa: E731
+        elif source == "auto":
+            fn = lambda: self._load_auto(symbol, interval, rng)  # noqa: E731
         elif source == "yahoo":
             fn = lambda: datamod.load_yahoo(symbol, interval, rng)  # noqa: E731
         elif source.startswith("provider:"):
@@ -95,8 +118,10 @@ class ChartPanel(QtWidgets.QFrame):
         self.loading = True
         self.last_error = ""
         self.load_event.clear()
-        self.chart.header.setText(f"Loading {symbol} …")
-        self.loadStarted.emit(self)
+        self._quiet = quiet
+        if not quiet:
+            self.chart.header.setText(f"Loading {symbol} …")
+            self.loadStarted.emit(self)
         self._worker = LoadWorker(fn, self)
         self._worker.done.connect(self._on_done)
         self._worker.failed.connect(self._fail)
@@ -123,14 +148,50 @@ class ChartPanel(QtWidgets.QFrame):
 
     def _on_done(self, df, label):
         self.loading = False
+        if getattr(self, "_quiet", False) and self.df is not None:
+            self._quiet = False
+            self.load_event.set()
+            self._apply_refresh(df, label)
+            return
         self.df, self.label, self.result, self.signals = df, label, None, None
         self.chart.set_data(df, label)
         self.last_error = ""
         self.load_event.set()
         self.loadFinished.emit(self)
 
+    def _apply_refresh(self, df, label):
+        old, ch = self.df, self.chart
+        try:
+            same = (len(df) == len(old) and df.index[-1] == old.index[-1]
+                    and bool((df.iloc[-1] == old.iloc[-1]).all()))
+        except Exception:  # noqa: BLE001
+            same = False
+        if same or df is None or not len(df) or ch.replay["active"] or ch.layer._drag or ch.layer.pending:
+            return
+        (x0, x1), auto_y = ch.price.vb.viewRange()[0], ch.auto_y
+        yr = ch.price.vb.viewRange()[1]
+        grew = len(df) - len(old)
+        at_edge = x1 >= len(old) - 1                       # looking at the newest bars -> keep following them
+        drawings, sel = ch.layer.to_json(), ch.layer.selected
+        self.df, self.label = df, label
+        ch.set_data(df, label)
+        ch.layer.load_json(drawings)
+        ch.layer.selected = sel
+        shift = grew if (at_edge and 0 < grew < 500) else 0
+        ch.price.setXRange(x0 + shift, x1 + shift, padding=0)
+        ch.auto_y = auto_y
+        if auto_y:
+            ch._autoscale()
+        else:
+            ch.price.setYRange(yr[0], yr[1], padding=0)
+        self.refreshed.emit(self)
+
     def _fail(self, msg: str):
         self.loading = False
+        if getattr(self, "_quiet", False):                 # a background refresh that failed: keep the chart as is
+            self._quiet = False
+            self.load_event.set()
+            return
         self.last_error = msg
         if self.df is not None:
             self.params = getattr(self, "_prev_params", self.params)   # keep describing what is on screen

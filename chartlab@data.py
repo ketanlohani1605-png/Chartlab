@@ -12,6 +12,7 @@ Open, High, Low, Close, Volume (sorted, de-duplicated, timezone-naive).
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -48,6 +49,10 @@ def standardise(raw: pd.DataFrame) -> pd.DataFrame:
         df.index = pd.DatetimeIndex(idx)
     else:
         time_col = next((lower[k] for k in _TIME_NAMES if k in lower), None)
+        if time_col is None and len(df.columns) and (str(df.columns[0]).startswith("Unnamed") or not df.columns[0]):
+            first = pd.to_datetime(df.iloc[:, 0].head(20), errors="coerce")     # a saved index without a name
+            if first.notna().all():
+                time_col = df.columns[0]
         if time_col is not None:
             s = df[time_col]
             if pd.api.types.is_numeric_dtype(s):
@@ -304,3 +309,74 @@ def load_provider(name: str, symbol: str, interval: str, period: str) -> tuple[p
                 raise ValueError(f"Provider '{name}' must define fetch(symbol, interval, period).")
             return standardise(mod.fetch(symbol, interval, period)), f"{symbol} · {interval} · {name}"
     raise FileNotFoundError(f"Provider '{name}' not found in {', '.join(map(str, provider_dirs()))}")
+
+
+# --------------------------------------------------------------------------- "Auto" source + my data folder
+DATA_DIR = USER_DIR / "data"       # drop RELIANCE.csv / NIFTY.parquet / a NIFTY folder here: it is used first
+
+
+def _plain(symbol: str) -> str:
+    return re.sub(r"[^A-Z0-9&-]", "", symbol.upper().split(":")[-1])
+
+
+def find_local(symbol: str, folder: Path | None = None) -> Path | None:
+    """The file (or folder of files) in My data whose name matches the symbol, e.g. NIFTY.csv, nifty_5m.parquet."""
+    folder = Path(folder) if folder else DATA_DIR
+    if not folder.exists():
+        return None
+    want = _plain(symbol)
+    best = None
+    for p in sorted(folder.iterdir()):
+        if p.name.startswith("."):
+            continue
+        if p.is_file() and p.suffix.lower() not in (".csv", ".tsv", ".txt", ".parquet"):
+            continue
+        stem = _plain(p.stem)
+        if stem == want:
+            return p
+        if best is None and re.match(rf"^{re.escape(want)}[-_ ]", p.stem.upper()):
+            best = p
+    return best
+
+
+def load_auto(symbol: str, interval: str = "1d", period: str = "2y", api_loaders=()) -> tuple[pd.DataFrame, str]:
+    """Best available data without choosing a source: your own file in My data, else a connected broker API,
+    else Yahoo. Each failure falls through to the next one; the label says where the bars came from."""
+    errors = []
+    p = find_local(symbol)
+    if p is not None:
+        try:
+            raw, label = load_file(p)
+            df, note = to_timeframe(raw, interval)
+            if not note:                                   # the file can really give this interval
+                return df, f"{symbol.upper()} \u00b7 {interval} \u00b7 my data"
+            errors.append(f"my data: {note}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"my data: {e}")
+    for name, fn in api_loaders:
+        try:
+            return fn(symbol, interval, period)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{name}: {e}")
+    try:
+        return load_yahoo(symbol, interval, period)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"Yahoo: {e}")
+    raise RuntimeError("No source could load it  \u2014  " + "  |  ".join(str(x)[:90] for x in errors))
+
+
+def save_daily(symbol: str, df: pd.DataFrame, interval: str = "1d") -> Path:
+    """Keep a copy of downloaded bars in ~/ChartLab/data/downloads (merged with what is already there)."""
+    out = USER_DIR / "data" / "downloads"
+    out.mkdir(parents=True, exist_ok=True)
+    f = out / (re.sub(r"[^A-Za-z0-9_.&-]", "_", f"{symbol.upper()}_{interval}") + ".parquet")
+    if f.exists():
+        try:
+            old = pd.read_parquet(f)
+            df = pd.concat([old[~old.index.isin(df.index)], df]).sort_index()
+        except Exception:  # noqa: BLE001 - unreadable old copy: replace it
+            pass
+    tmp = f.with_suffix(".part")
+    df.to_parquet(tmp)
+    os.replace(tmp, f)
+    return f

@@ -448,6 +448,9 @@ class ChartWidget(QtWidgets.QWidget):
         # tags: last price, crosshair price (per pane) and crosshair date
         self.last_tag = AxisTag(self, self.price, "y", theme.UP)
         self.cd_tag = AxisTag(self, self.price, "below", "#2a2a2a", under=self.last_tag)
+        self.name_tag = QtWidgets.QLabel(self.glw)
+        self.name_tag.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.name_tag.hide()
         self._cd_timer = QtCore.QTimer(self)
         self._cd_timer.timeout.connect(self._update_countdown)
         self._cd_timer.start(1000)
@@ -852,7 +855,7 @@ class ChartWidget(QtWidgets.QWidget):
         return 2
 
     def axis_price(self, x: float) -> str:
-        return f"{x:.{self.decimals()}f}"
+        return f"{x:,.{self.decimals()}f}"                 # 25,282.50 like TradingView's scale
 
     def axis_label(self, v: float) -> str:
         if self.scale_mode == "percent":
@@ -1386,6 +1389,12 @@ class ChartWidget(QtWidgets.QWidget):
         self.last_line.setPos(float(self.ty(last)))
         self.last_tag.setVisible(bool(settings.get()['last_label']))
         self.last_line.setVisible(bool(settings.get()['last_line']))
+        nt = self.name_tag                                 # TradingView: the symbol name sits left of the price
+        name = str(self.label).split(" \u00b7 ")[0].split(".")[0].lstrip("^") or ""
+        nt.setText(name)
+        nt.setStyleSheet(f"QLabel {{ background: {color}; color: #ffffff; font-size: 12px; font-weight: 500;"
+                         f" padding: 2px 5px; border-radius: 2px; }}")
+        nt.adjustSize()
         self._place_last_tag()
 
     def _place_last_tag(self):
@@ -1395,6 +1404,13 @@ class ChartWidget(QtWidgets.QWidget):
         y = float(self.ty(float(self.df["Close"].iloc[self._n() - 1])))
         self.last_tag.setPos(xr, y)
         self.cd_tag.setPos(xr, y)
+        nt = self.name_tag
+        show = not self.last_tag.isHidden() and bool(settings.get().get("sym_label", True)) and bool(nt.text())
+        nt.setVisible(show)
+        if show:
+            g = self.last_tag.geometry()
+            nt.setFixedHeight(g.height())
+            nt.move(g.x() - nt.width() - 1, g.y())
 
     def bar_seconds(self) -> float:
         if self.df is None or len(self.df) < 3:

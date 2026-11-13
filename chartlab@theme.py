@@ -101,6 +101,9 @@ QToolBar#topbar QToolButton:checked {{ background: #262626; color: #fff; }}
 QToolBar#topbar QComboBox {{ font-size: 14px; color: #d1d4dc; }}
 QFrame#stripbar QToolButton {{ font-size: 13px; font-weight: 400; color: #d1d4dc; padding: 5px 8px; }}
 QToolButton::menu-indicator {{ image: none; width: 0px; }}
+QToolButton#ivbtn {{ padding: 5px 7px; border-radius: 6px; color: #dbdbdb; font-size: 14px; min-width: 14px; }}
+QToolButton#ivbtn:hover {{ background: #2a2a2a; }}
+QToolButton#ivbtn:checked {{ background: #2e2e2e; color: #ffffff; font-weight: 600; }}
 QPushButton::menu-indicator {{ image: none; width: 0px; }}
 QToolBar#leftrail QToolButton, QToolBar#rightrail QToolButton {{ padding: 7px; border-radius: 6px; }}
 QToolBar#leftrail QToolButton:checked {{ background: {HOVER}; }}
