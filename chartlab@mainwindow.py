@@ -458,6 +458,7 @@ class MainWindow(QtWidgets.QMainWindow):
         m_ = QtWidgets.QMenu(self.acct_btn)
         m_.addAction("Manage broker accounts…", self.manage_accounts)
         m_.addAction("Run script on multiple accounts…", self.run_on_accounts)
+        self.auto_act = m_.addAction("Auto-trade strategy on accounts…", self.toggle_auto_trade)
         m_.addAction("Stop all runs", self.stop_script)
         self.acct_btn.setMenu(m_)
         self.acct_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -935,6 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s.addSeparator()
         s.addAction("Manage broker accounts…", self.manage_accounts)
         s.addAction("Run script on multiple accounts…", self.run_on_accounts)
+        s.addAction("Auto-trade strategy on accounts…", self.toggle_auto_trade)
         v = mb.addMenu("View")
         v.addAction("Reset layout", self.reset_layout)
         v.addAction("Watchlist", lambda: self.show_right_panel(self.watch_dock))
@@ -1346,6 +1348,52 @@ class MainWindow(QtWidgets.QMainWindow):
             self.source.setCurrentIndex(self.source.findData(f"api:{added}"))
             self.statusBar().showMessage(f"Data source set to API: {added}", 5000)
 
+    # ------------------------------------------------------------------ auto-trade on all accounts
+    def _auto_trader(self):
+        if not hasattr(self, "auto"):
+            from .autotrade import AutoTrader
+            self.auto = AutoTrader(self)
+            self.auto.log.connect(self.add_log)
+            self.auto.changed.connect(self._auto_changed)
+            self.auto.traded.connect(lambda t, x: alertmod.Toast(self, t, x, "#2962ff"))
+        return self.auto
+
+    def _auto_changed(self):
+        on = self.auto.active
+        self.auto_act.setText("Stop auto-trade" if on else "Auto-trade strategy on accounts\u2026")
+        self.acct_btn.setText(f"AUTO \u00b7 {self.auto.symbol} \u00b7 {len(self.auto.names)}" if on else "Accounts")
+        self.acct_btn.setStyleSheet("QToolButton { color: #f23645; font-weight: 700; }" if on else "")
+        self.statusBar().showMessage(
+            f"Auto-trade is ON for {self.auto.symbol} on {len(self.auto.names)} accounts" if on else "Auto-trade is off")
+
+    def toggle_auto_trade(self):
+        auto = self._auto_trader()
+        if auto.active:
+            auto.stop()
+            return
+        panel = self.active
+        code = self.strategy_code()
+        if panel.df is None or panel.params.get("source") == "file":
+            self.statusBar().showMessage("Auto-trade needs a live chart (source Auto / API / Yahoo), not a local file")
+            return
+        if not re.search(r"^def\s+strategy\s*\(", code, re.M):
+            self.statusBar().showMessage("Auto-trade needs a strategy with  def strategy(df):  in the editor")
+            return
+        accts = [a for a in acctmod.load_accounts() if a.get("broker") == "dhan"]
+        if not accts:
+            self.statusBar().showMessage("Connect at least one broker account first")
+            self.manage_accounts()
+            return
+        from .autotrade import AutoTradeDialog
+        dlg = AutoTradeDialog(self, accts, str(panel.params.get("symbol", "")).upper(), self._current_interval())
+        if not dlg.exec() or not dlg.chosen():
+            return
+        if int(self.settings.value("auto_refresh", 60)) <= 0:
+            self.set_auto_refresh(60)                         # it needs fresh bars to act on
+        self.tabs.setCurrentWidget(self.log_view)
+        self.results_dock.show()
+        auto.start(panel, code, dlg.chosen(), dlg.qty.value(), dlg.product.currentData(), dlg.exchange.currentText())
+
     def run_on_accounts(self):
         """Run the editor's script once per chosen account, all at the same time."""
         accts = acctmod.load_accounts()
@@ -1670,7 +1718,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     ok += 1
                 except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
                     logging.exception("daily download %s", s)
-            return ok, len(syms)
+            return ok, str(len(syms))
         w = self._daily_worker = LoadWorker(job, self)
 
         def done(ok, total):
@@ -1686,6 +1734,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_refreshed(self, panel):
         """New bars arrived from a quiet auto refresh: keep alerts, strategy and labels in step."""
         df = panel.df
+        if hasattr(self, "auto"):
+            self.auto.on_bars(panel)
         self._refresh_alert_lines()
         if len(df):
             last = float(df["Close"].iloc[-1])
