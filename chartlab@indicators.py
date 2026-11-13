@@ -40,6 +40,46 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
+def supertrend(df: pd.DataFrame, n: int = 10, mult: float = 3.0) -> pd.DataFrame:
+    """Supertrend (ATR based). Returns columns: st (the line), dir (+1 up-trend / -1 down-trend)."""
+    h, l, c = df["High"].to_numpy(float), df["Low"].to_numpy(float), df["Close"].to_numpy(float)
+    a = atr(df, n).to_numpy(float)
+    hl2 = (h + l) / 2
+    up, dn = hl2 - mult * a, hl2 + mult * a
+    st = np.full(len(c), np.nan)
+    d = np.ones(len(c))
+    for k in range(1, len(c)):
+        if np.isnan(a[k]):
+            continue
+        if not np.isnan(up[k - 1]) and c[k - 1] > up[k - 1]:
+            up[k] = max(up[k], up[k - 1])
+        if not np.isnan(dn[k - 1]) and c[k - 1] < dn[k - 1]:
+            dn[k] = min(dn[k], dn[k - 1])
+        prev = d[k - 1]
+        if prev < 0 and c[k] > dn[k - 1]:
+            d[k] = 1
+        elif prev > 0 and c[k] < up[k - 1]:
+            d[k] = -1
+        else:
+            d[k] = prev
+        st[k] = up[k] if d[k] > 0 else dn[k]
+    return pd.DataFrame({"st": st, "dir": d}, index=df.index)
+
+
+def vwap(df: pd.DataFrame) -> pd.Series:
+    """Volume-weighted average price. Intraday data: resets every day (session VWAP); daily data: rolling 20."""
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    v = df["Volume"].astype(float).replace(0, np.nan)
+    idx = df.index
+    intraday = isinstance(idx, pd.DatetimeIndex) and len(idx) > 1 and bool(((idx.hour != 0) | (idx.minute != 0)).any())
+    if intraday:
+        day = idx.normalize()
+        pv = (tp * v).groupby(day).cumsum()
+        vv = v.groupby(day).cumsum()
+        return (pv / vv).ffill()
+    return ((tp * v).rolling(20).sum() / v.rolling(20).sum()).ffill()
+
+
 def highest(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).max()
 

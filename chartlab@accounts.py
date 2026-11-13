@@ -140,7 +140,9 @@ def fetch_dhan(acct: dict, symbol: str, interval: str, period: str) -> pd.DataFr
     df = df.drop_duplicates("Date", keep="last").sort_values("Date").reset_index(drop=True)
     try:
         _CANDLE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_pickle(cfile)
+        tmp = cfile.with_suffix(".part")                     # write-then-rename: a quit mid-write never
+        df.to_pickle(tmp)                                    # leaves a half-written cache behind
+        os.replace(tmp, cfile)
     except Exception:  # noqa: BLE001 - cache is optional
         pass
     if cached is not None:                                    # trim old cached bars to the asked range
@@ -291,8 +293,8 @@ class _AccountCard(QtWidgets.QStyledItemDelegate):
         r = option.rect.adjusted(4, 3, -4, -3)
         sel = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
         hov = bool(option.state & QtWidgets.QStyle.StateFlag.State_MouseOver)
-        p.setPen(QtGui.QPen(QtGui.QColor(theme.ACCENT if sel else theme.BORDER), 1.3 if sel else 1))
-        p.setBrush(QtGui.QColor("#1e2a55" if sel else ("#222633" if hov else "#1a1e2a")))
+        p.setPen(QtGui.QPen(QtGui.QColor("#868993" if sel else "#2a2a2a"), 1.3 if sel else 1))
+        p.setBrush(QtGui.QColor("#262626" if sel else ("#202020" if hov else "#1a1a1a")))
         p.drawRoundedRect(r, 10, 10)
         av = QtCore.QRect(r.left() + 12, r.center().y() - 16, 32, 32)
         p.setPen(QtCore.Qt.PenStyle.NoPen)
@@ -318,7 +320,7 @@ class _AccountCard(QtWidgets.QStyledItemDelegate):
                    f"{BROKERS.get(a['broker'], a['broker'])}  ·  {cid}")
         st = STATUS.get(a["name"])
         dc = QtGui.QColor(STATE_COLOR.get(st["state"] if st else None))
-        p.setPen(QtGui.QPen(QtGui.QColor("#1a1e2a"), 2))
+        p.setPen(QtGui.QPen(QtGui.QColor("#1a1a1a"), 2))
         p.setBrush(dc)
         p.drawEllipse(QtCore.QPoint(av.right() - 2, av.bottom() - 2), 6, 6)
         live = bool(a.get("live"))
@@ -343,9 +345,9 @@ class AccountsDialog(QtWidgets.QDialog):
         self.path = path
         self.setWindowTitle("Broker accounts")
         self.resize(860, 540)
-        self.setStyleSheet(f"QDialog {{ background: {theme.BG}; }} QLabel#h {{ font-size: 15px; font-weight: 700; color: white; }} "
+        self.setStyleSheet(f"QDialog {{ background: #1e1e1e; }} QLabel#h {{ font-size: 15px; font-weight: 700; color: white; }} "
                            f"QLabel#sub {{ color: {theme.MUTED}; font-size: 12px; }} QLabel#lbl {{ color: {theme.MUTED}; font-size: 11px; }} "
-                           f"QLineEdit, QDoubleSpinBox, QComboBox {{ background: #1e222d; border: 1px solid {theme.BORDER}; "
+                           f"QLineEdit, QDoubleSpinBox, QComboBox {{ background: #121212; border: 1px solid #3a3a3a; "
                            f"border-radius: 8px; padding: 8px 10px; min-height: 18px; }} "
                            f"QLineEdit:focus, QDoubleSpinBox:focus {{ border-color: {theme.ACCENT}; }} "
                            f"QPushButton#danger {{ background: transparent; color: {theme.DOWN}; }} "
@@ -361,7 +363,7 @@ class AccountsDialog(QtWidgets.QDialog):
         left = QtWidgets.QFrame()
         left.setFixedWidth(300)
         left.setObjectName("leftpane")
-        left.setStyleSheet(f"QFrame#leftpane {{ background: #0f121a; border-right: 1px solid {theme.BORDER}; }} QLabel {{ border: 0; background: transparent; }} "
+        left.setStyleSheet(f"QFrame#leftpane {{ background: #161616; border-right: 1px solid #2a2a2a; }} QLabel {{ border: 0; background: transparent; }} "
                            "QListWidget { border: 0; background: transparent; }")
         lv = QtWidgets.QVBoxLayout(left)
         lv.setContentsMargins(14, 16, 14, 14)
@@ -403,7 +405,7 @@ class AccountsDialog(QtWidgets.QDialog):
         self.card = QtWidgets.QLabel("")
         self.card.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.card.setWordWrap(True)
-        self.card.setStyleSheet("background:#131722;border:1px solid #2a2e39;border-radius:10px;padding:10px 12px;")
+        self.card.setStyleSheet("background:#121212;border:1px solid #2a2a2a;border-radius:10px;padding:10px 12px;")
         rv.addWidget(self.card)
         rv.addSpacing(6)
 
@@ -543,6 +545,7 @@ class AccountsDialog(QtWidgets.QDialog):
             self.broker.setCurrentIndex(max(0, self.broker.findData(a["broker"])))
             self.client.setText(a.get("client_id", ""))
             self.token.setText(a.get("access_token", ""))
+            self.token.setCursorPosition(0)                 # show the token from its start, not a clipped tail
             self.live.setChecked(bool(a.get("live")))
             self.mult.setValue(float(a.get("qty_mult", 1) or 1))
             self._say("")
@@ -614,12 +617,18 @@ class PickAccountsDialog(QtWidgets.QDialog):
     def __init__(self, parent, accts: list[dict]):
         super().__init__(parent)
         self.setWindowTitle("Run on accounts")
+        self.setMinimumWidth(560)
         v = QtWidgets.QVBoxLayout(self)
-        v.addWidget(QtWidgets.QLabel(
+        v.setContentsMargins(22, 18, 22, 16)
+        v.setSpacing(10)
+        v.addWidget(QtWidgets.QLabel("<span style='font-size:17px;font-weight:600;color:#fff'>Run script on accounts</span>"))
+        info = QtWidgets.QLabel(
             "The script runs <b>once per ticked account, all at the same time</b>. Each copy can read its own "
             "credentials with <code>chartlab.account()</code>.<br>"
             f"<span style='color:{theme.DOWN}'>If your script places orders, they will be REAL orders on every "
-            "ticked account.</span>"))
+            "ticked account.</span>")
+        info.setWordWrap(True)
+        v.addWidget(info)
         self.one = QtWidgets.QRadioButton("One script, orders sent to ALL ticked accounts at the same instant (fastest)")
         self.one.setChecked(True)
         self.sep = QtWidgets.QRadioButton("A separate copy of the script per account (independent runs)")
@@ -631,6 +640,7 @@ class PickAccountsDialog(QtWidgets.QDialog):
                                         + ("LIVE orders" if a.get("live") else "paper"))
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            it.setSizeHint(QtCore.QSize(0, 34))
             it.setData(QtCore.Qt.ItemDataRole.UserRole, a["name"])
             self.list.addItem(it)
         v.addWidget(self.list)

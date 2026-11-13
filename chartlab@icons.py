@@ -320,10 +320,124 @@ def gear(p, r, c):
     p.drawEllipse(QtCore.QPointF(12, 12), 3, 3)
 
 
+# ---- chart-type icons (TradingView shows one per style)
+def st_bars(p, r, c):
+    for x, top, bot, o, cl in ((7, 6, 17, 9, 14), (13, 9, 20, 17, 11), (19, 4, 13, 6, 11)):
+        p.drawLine(QtCore.QPointF(x, top), QtCore.QPointF(x, bot))
+        p.drawLine(QtCore.QPointF(x - 3, o), QtCore.QPointF(x, o))
+        p.drawLine(QtCore.QPointF(x, cl), QtCore.QPointF(x + 3, cl))
+
+
+def st_candles(p, r, c):
+    p.setBrush(c)
+    for x, top, bot in ((7, 6, 15), (13, 9, 19), (19, 4, 12)):
+        p.drawLine(QtCore.QPointF(x, top - 2), QtCore.QPointF(x, bot + 2))
+        p.drawRect(QtCore.QRectF(x - 2, top + 2, 4, bot - top - 4))
+
+
+def st_hollow(p, r, c):
+    candles_icon(p, r, c)
+
+
+def st_heikin(p, r, c):
+    p.setBrush(c)
+    for x, top, bot in ((6, 12, 19), (12, 8, 16), (18, 4, 12)):
+        p.drawLine(QtCore.QPointF(x, top - 2), QtCore.QPointF(x, bot + 2))
+        p.drawRect(QtCore.QRectF(x - 2, top + 1, 4, bot - top - 2))
+
+
+def st_line(p, r, c):
+    p.drawPolyline([QtCore.QPointF(4, 17), QtCore.QPointF(9, 11), QtCore.QPointF(13, 14), QtCore.QPointF(20, 6)])
+
+
+def st_linemark(p, r, c):
+    pts = [QtCore.QPointF(4, 17), QtCore.QPointF(9, 11), QtCore.QPointF(13, 14), QtCore.QPointF(20, 6)]
+    p.drawPolyline(pts)
+    p.setBrush(c)
+    for q in pts:
+        p.drawEllipse(q, 1.6, 1.6)
+
+
+def st_step(p, r, c):
+    p.drawPolyline([QtCore.QPointF(4, 17), QtCore.QPointF(9, 17), QtCore.QPointF(9, 11), QtCore.QPointF(14, 11),
+                    QtCore.QPointF(14, 7), QtCore.QPointF(20, 7)])
+
+
+def st_area(p, r, c):
+    path = QtGui.QPainterPath(QtCore.QPointF(4, 19))
+    for x, y in ((4, 16), (9, 10), (13, 13), (20, 6), (20, 19)):
+        path.lineTo(x, y)
+    path.closeSubpath()
+    fill = QtGui.QColor(c)
+    fill.setAlpha(70)
+    p.fillPath(path, fill)
+    p.drawPolyline([QtCore.QPointF(4, 16), QtCore.QPointF(9, 10), QtCore.QPointF(13, 13), QtCore.QPointF(20, 6)])
+
+
+def st_baseline(p, r, c):
+    pen = QtGui.QPen(p.pen())
+    dash = QtGui.QPen(pen)
+    dash.setStyle(QtCore.Qt.PenStyle.DashLine)
+    p.setPen(dash)
+    p.drawLine(QtCore.QPointF(3, 12), QtCore.QPointF(21, 12))
+    p.setPen(pen)
+    p.drawPolyline([QtCore.QPointF(4, 16), QtCore.QPointF(9, 8), QtCore.QPointF(14, 15), QtCore.QPointF(20, 7)])
+
+
+# ---- drawing-tool icons
+def t_ext(p, r, c):
+    p.drawLine(QtCore.QPointF(3, 20), QtCore.QPointF(21, 4))
+    _dot(p, 8, 15.5)
+    _dot(p, 16, 8.5)
+
+
+def t_arrow(p, r, c):
+    p.drawLine(QtCore.QPointF(5, 19), QtCore.QPointF(18, 6))
+    p.drawPolyline([QtCore.QPointF(11, 6), QtCore.QPointF(18, 6), QtCore.QPointF(18, 13)])
+
+
+def t_ellipse(p, r, c):
+    p.drawEllipse(QtCore.QRectF(4, 7, 16, 11))
+
+
+def t_long(p, r, c):
+    p.drawRect(QtCore.QRectF(5, 4, 14, 8))
+    pen = QtGui.QPen(p.pen())
+    p.drawRect(QtCore.QRectF(5, 12, 14, 7))
+    p.setPen(pen)
+    p.drawLine(QtCore.QPointF(8, 9), QtCore.QPointF(12, 6))
+    p.drawLine(QtCore.QPointF(12, 6), QtCore.QPointF(16, 9))
+
+
+def t_short(p, r, c):
+    p.drawRect(QtCore.QRectF(5, 5, 14, 7))
+    p.drawRect(QtCore.QRectF(5, 12, 14, 8))
+    p.drawLine(QtCore.QPointF(8, 14), QtCore.QPointF(12, 17))
+    p.drawLine(QtCore.QPointF(12, 17), QtCore.QPointF(16, 14))
+
+
+def t_pricerange(p, r, c):
+    p.drawLine(QtCore.QPointF(5, 5), QtCore.QPointF(19, 5))
+    p.drawLine(QtCore.QPointF(5, 19), QtCore.QPointF(19, 19))
+    p.drawLine(QtCore.QPointF(12, 6), QtCore.QPointF(12, 18))
+    p.drawPolyline([QtCore.QPointF(9.5, 8.5), QtCore.QPointF(12, 6), QtCore.QPointF(14.5, 8.5)])
+    p.drawPolyline([QtCore.QPointF(9.5, 15.5), QtCore.QPointF(12, 18), QtCore.QPointF(14.5, 15.5)])
+
+
+def t_daterange(p, r, c):
+    p.drawLine(QtCore.QPointF(5, 5), QtCore.QPointF(5, 19))
+    p.drawLine(QtCore.QPointF(19, 5), QtCore.QPointF(19, 19))
+    p.drawLine(QtCore.QPointF(6, 12), QtCore.QPointF(18, 12))
+    p.drawPolyline([QtCore.QPointF(8.5, 9.5), QtCore.QPointF(6, 12), QtCore.QPointF(8.5, 14.5)])
+    p.drawPolyline([QtCore.QPointF(15.5, 9.5), QtCore.QPointF(18, 12), QtCore.QPointF(15.5, 14.5)])
+
+
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
-    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin")}
+    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin", "st_bars", "st_candles", "st_hollow", "st_heikin", "st_line",
+    "st_linemark", "st_step", "st_area", "st_baseline", "t_ext", "t_arrow", "t_ellipse", "t_long", "t_short",
+    "t_pricerange", "t_daterange")}
 
 
 def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:

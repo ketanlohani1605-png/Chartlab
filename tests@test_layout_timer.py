@@ -31,3 +31,5 @@ w.set_layout("1"); w.set_layout("4"); app.processEvents()
 assert w.panels[0].height() > w.panels[2].height() * 1.8, "sizes should be remembered"
 w.set_layout("2h"); app.processEvents(); assert w.split_root.orientation() == QtCore.Qt.Orientation.Horizontal
 print("LAYOUT+TIMER OK")
+from chartlab.mainwindow import quit_cleanly
+quit_cleanly(w, 0)        # like the app: no abort from loader threads still fetching

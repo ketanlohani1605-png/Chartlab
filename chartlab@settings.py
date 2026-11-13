@@ -194,10 +194,20 @@ class SettingsDialog(QtWidgets.QDialog):
         return b
 
     def _combo(self, key, items):
+        """items: plain strings, or (shown text, stored value) pairs."""
         c = QtWidgets.QComboBox()
-        c.addItems(items)
-        c.setCurrentText(str(self.v[key]))
-        c.currentTextChanged.connect(lambda t, k=key: self.v.__setitem__(k, t))
+        vals = []
+        for it in items:
+            lab, val = it if isinstance(it, tuple) else (it, it)
+            c.addItem(lab, val)
+            vals.append(val)
+        i = c.findData(self.v[key])
+        c.setCurrentIndex(i if i >= 0 else max(0, c.findText(str(self.v[key]))))
+
+        def picked(i, k=key, vals=vals):          # (never touches the combo: it may be mid-destruction)
+            if 0 <= i < len(vals):
+                self.v[k] = vals[i]
+        c.currentIndexChanged.connect(picked)
         c.setMinimumWidth(180)
         self._ctl[key] = c
         return c
@@ -241,7 +251,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self._head(lay, "Time scale")
         self._check(lay, "dow", "Day of week on labels")
         self._check(lay, "h24", "24-hour format")
-        self._row(lay, "Date format", [self._combo("date_format", ["%d %b '%y", "%b %d, %Y", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"])])
+        import datetime as _dt
+        today = _dt.date.today()                           # show what each format looks like, not "%d %b"
+        fmts = ["%d %b '%y", "%b %d, %Y", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"]
+        self._row(lay, "Date format", [self._combo("date_format", [(today.strftime(f), f) for f in fmts])])
 
     def _canvas(self, lay):
         self._head(lay, "Chart basic styles")
@@ -268,7 +281,8 @@ class SettingsDialog(QtWidgets.QDialog):
             elif isinstance(w, ColorBtn):
                 w.set(val)
             elif isinstance(w, QtWidgets.QComboBox):
-                w.setCurrentText(str(val))
+                i = w.findData(val)
+                w.setCurrentIndex(i if i >= 0 else max(0, w.findText(str(val))))
             elif isinstance(w, QtWidgets.QSpinBox):
                 w.setValue(int(val))
 

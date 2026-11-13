@@ -2,6 +2,8 @@
 smart indent (Enter / Tab / Shift+Tab / Backspace), Cmd+/ to toggle comments, Cmd+Enter to run."""
 from __future__ import annotations
 
+import re
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 _KEYWORDS = ("and as assert break class continue def del elif else except finally for from global if "
@@ -9,6 +11,24 @@ _KEYWORDS = ("and as assert break class continue def del elif else except finall
              "await").split()
 _BUILTINS = ("print len range enumerate zip min max abs sum round int float str bool list dict set tuple isinstance "
              "sorted reversed any all map filter open getattr setattr hasattr").split()
+
+# what pops up after "ta." (name, signature, what it is) - the functions strategies get as `ta`
+TA_FUNCS = [
+    ("sma", "sma(s, n)", "simple moving average"),
+    ("ema", "ema(s, n)", "exponential moving average"),
+    ("rsi", "rsi(s, n=14)", "relative strength index 0-100"),
+    ("macd", "macd(s, fast=12, slow=26, signal=9)", "DataFrame: macd, signal, hist"),
+    ("bollinger", "bollinger(s, n=20, k=2.0)", "DataFrame: mid, upper, lower"),
+    ("atr", "atr(df, n=14)", "average true range"),
+    ("supertrend", "supertrend(df, n=10, mult=3.0)", "DataFrame: st, dir (+1 / -1)"),
+    ("vwap", "vwap(df)", "volume weighted average price"),
+    ("highest", "highest(s, n)", "highest value of the last n bars"),
+    ("lowest", "lowest(s, n)", "lowest value of the last n bars"),
+    ("crossover", "crossover(a, b)", "True where a crosses above b"),
+    ("crossunder", "crossunder(a, b)", "True where a crosses below b"),
+]
+DF_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+_INSERT = QtCore.Qt.ItemDataRole.UserRole + 1
 
 BG = "#0b0b0b"
 GUTTER_BG = "#0b0b0b"
@@ -86,6 +106,109 @@ class CodeEditor(QtWidgets.QPlainTextEdit):
         self.textChanged.connect(self._text_changed)
         self._update_margins()
         self._highlight()
+        self._setup_completer()
+
+    # ------------------------------------------------------------------ autocomplete
+    def _setup_completer(self):
+        """ta.<...> lists the indicator functions (with their arguments), df["<...> the price columns;
+        Ctrl+Space (Control+Space on a Mac) completes any word. Enter / Tab accepts, Esc closes."""
+        self._model = QtGui.QStandardItemModel(self)
+        self._comp = QtWidgets.QCompleter(self._model, self)
+        self._comp.setWidget(self)
+        self._comp.setCompletionMode(QtWidgets.QCompleter.CompletionMode.PopupCompletion)
+        self._comp.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        self._comp.setCompletionRole(_INSERT)
+        self._comp.setMaxVisibleItems(9)
+        self._comp.activated[QtCore.QModelIndex].connect(self._insert_completion)
+        pop = self._comp.popup()
+        pop.setStyleSheet("QListView { background:#1e1e1e; color:#dbdbdb; border:1px solid #2e2e2e; outline:0;"
+                          " font-size:13px; padding:2px; } QListView::item { padding:4px 8px; }"
+                          " QListView::item:selected { background:#2962ff; color:#ffffff; }")
+        self._ctx = None
+
+    def _context(self):
+        """-> (kind, prefix): 'ta' after `ta.`, 'col' inside `df["`, 'word' for any identifier."""
+        cur = self.textCursor()
+        line = cur.block().text()[: cur.positionInBlock()]
+        m = re.search(r"\bta\.(\w*)$", line)
+        if m:
+            return "ta", m.group(1)
+        m = re.search(r"\bdf\[(['\"])(\w*)$", line)
+        if m:
+            return "col", m.group(2)
+        m = re.search(r"(\w+)$", line)
+        return ("word", m.group(1)) if m else (None, "")
+
+    def _fill_model(self, kind, prefix=""):
+        self._model.clear()
+
+        def add(insert, shown, tip=""):
+            it = QtGui.QStandardItem(shown)
+            it.setData(insert, _INSERT)
+            if tip:
+                it.setToolTip(tip)
+            self._model.appendRow(it)
+        if kind == "ta":
+            for name, sig, what in TA_FUNCS:
+                add(name, f"{sig}   \u2014  {what}", what)
+        elif kind == "col":
+            for col in DF_COLUMNS:
+                add(col, col)
+        else:
+            words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", self.toPlainText()))
+            words |= set(_KEYWORDS) | set(_BUILTINS) | {"df", "ta", "np", "pd", "strategy", "return", "buy", "sell",
+                                                      "long", "short", "exits", "position"}
+            words.discard(prefix)                            # (the half-typed word itself is not a suggestion)
+            for w in sorted(words, key=str.lower):
+                add(w, w)
+
+    def _maybe_complete(self, force=False):
+        kind, prefix = self._context()
+        auto = kind in ("ta", "col")
+        if kind is None or not (auto or (force and prefix)):
+            self._comp.popup().hide()
+            return
+        if kind != self._ctx or kind == "word":
+            self._fill_model(kind, prefix)
+            self._ctx = kind
+        self._comp.setCompletionPrefix(prefix)
+        if self._comp.completionCount() == 0 or (not force and self._comp.completionCount() == 1
+                                                 and self._comp.currentCompletion() == prefix):
+            self._comp.popup().hide()
+            return
+        self._comp.popup().setCurrentIndex(self._comp.completionModel().index(0, 0))
+        r = self.cursorRect()
+        r.setWidth(min(520, max(240, self._comp.popup().sizeHintForColumn(0) + 28)))
+        r.translate(self.viewportMargins().left(), 4)
+        self._comp.complete(r)
+
+    def _insert_completion(self, index):
+        text = index.data(_INSERT)
+        if not text:
+            return
+        kind, prefix = self._context()
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        cur.movePosition(QtGui.QTextCursor.MoveOperation.Left, QtGui.QTextCursor.MoveMode.KeepAnchor, len(prefix))
+        cur.insertText(text)
+        after = cur.block().text()[cur.positionInBlock():]
+        if kind == "ta" and not after.startswith("("):
+            cur.insertText("(")
+        elif kind == "col":
+            before = cur.block().text()[: cur.positionInBlock()]
+            q = before[: len(before) - len(text)][-1:]                       # the quote the user opened
+            if after.startswith(q):
+                cur.movePosition(QtGui.QTextCursor.MoveOperation.Right)
+                after = after[1:]
+            else:
+                cur.insertText(q)
+            if after.startswith("]"):
+                cur.movePosition(QtGui.QTextCursor.MoveOperation.Right)
+            else:
+                cur.insertText("]")
+        cur.endEditBlock()
+        self.setTextCursor(cur)
+        self._comp.popup().hide()
 
     # ------------------------------------------------------------------ gutter
     def gutter_width(self) -> int:
@@ -204,6 +327,20 @@ class CodeEditor(QtWidgets.QPlainTextEdit):
     def keyPressEvent(self, e: QtGui.QKeyEvent):
         K, M = QtCore.Qt.Key, QtCore.Qt.KeyboardModifier
         key, mods = e.key(), e.modifiers()
+        pop = self._comp.popup()
+        if pop.isVisible():
+            if key in (K.Key_Return, K.Key_Enter, K.Key_Tab):
+                idx = pop.currentIndex()
+                if idx.isValid():
+                    self._insert_completion(idx)
+                    return
+                pop.hide()
+            elif key in (K.Key_Escape, K.Key_Backtab):
+                pop.hide()
+                return
+        if key == K.Key_Space and mods & (M.ControlModifier | M.MetaModifier):   # complete any word on demand
+            self._maybe_complete(force=True)
+            return
         ctrl = bool(mods & M.ControlModifier)
         if ctrl and key in (K.Key_Return, K.Key_Enter):
             self.runRequested.emit()
@@ -240,3 +377,9 @@ class CodeEditor(QtWidgets.QPlainTextEdit):
             self.insertPlainText(indent)
             return
         super().keyPressEvent(e)
+        if e.text() and (e.text().isprintable() or key == K.Key_Backspace):
+            self._maybe_complete(force=pop.isVisible())
+        elif key == K.Key_Backspace:
+            self._maybe_complete(force=pop.isVisible())
+        elif key in (K.Key_Left, K.Key_Right, K.Key_Home, K.Key_End):
+            pop.hide()

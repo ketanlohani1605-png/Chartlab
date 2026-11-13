@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import settings, theme
 
@@ -179,3 +179,73 @@ class VolumeItem(pg.GraphicsObject):
             m = up == is_up
             if m.any():
                 p.drawRects([QR(a - w, base, 2 * w, b * k) for a, b in zip(xs[m].tolist(), v[m].tolist())])
+
+
+class TradeMarkers(pg.GraphicsObject):
+    """Strategy fills drawn TradingView-style in screen pixels: an arrow under the low (buy / cover) or above the
+    high (sell / short) with a small label ('Long', 'Short', 'Close'). One item for all trades = cheap."""
+    ARROW = [(0, 0), (6, 6), (2.4, 6), (2.4, 13), (-2.4, 13), (-2.4, 6), (-6, 6)]
+
+    def __init__(self):
+        super().__init__()
+        self.x = np.zeros(0)
+        self.y = np.zeros(0)
+        self.up = np.zeros(0, bool)
+        self.colors: list = []
+        self.labels: list = []
+        self.font = QtGui.QFont()
+        self.font.setPixelSize(11)
+        self.font.setWeight(QtGui.QFont.Weight.DemiBold)
+        self._vb = None
+
+    def set_points(self, x, y, up, colors, labels):
+        self.x, self.y, self.up = np.asarray(x, float), np.asarray(y, float), np.asarray(up, bool)
+        self.colors, self.labels = list(colors), list(labels)
+        self.prepareGeometryChange()
+        self.update()
+
+    def itemChange(self, change, value):
+        if change == QtWidgets.QGraphicsItem.GraphicsItemChange.ItemParentHasChanged:
+            vb = self.getViewBox()
+            if isinstance(vb, pg.ViewBox) and vb is not self._vb:
+                self._vb = vb
+                vb.sigRangeChanged.connect(lambda *_: self.prepareGeometryChange())
+        return super().itemChange(change, value)
+
+    def boundingRect(self):
+        vb = self.getViewBox()
+        return vb.viewRect() if isinstance(vb, pg.ViewBox) else QtCore.QRectF()
+
+    def paint(self, p, *args):
+        if not len(self.x):
+            return
+        vb = self.getViewBox()
+        if not isinstance(vb, pg.ViewBox):
+            return
+        (x0, x1), _ = vb.viewRange()
+        vis = np.nonzero((self.x >= x0 - 1) & (self.x <= x1 + 1))[0]
+        if not len(vis):
+            return
+        tr = p.transform()
+        show_text = len(vis) <= 120
+        p.save()
+        p.resetTransform()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setFont(self.font)
+        fm = QtGui.QFontMetrics(self.font)
+        for k in vis.tolist():
+            pt = tr.map(QtCore.QPointF(self.x[k], self.y[k]))
+            s = 1 if self.up[k] else -1                  # up arrow sits below the point, down arrow above
+            base = QtCore.QPointF(pt.x(), pt.y() + s * 4)
+            poly = QtGui.QPolygonF([QtCore.QPointF(base.x() + ax, base.y() + s * ay) for ax, ay in self.ARROW])
+            col = QtGui.QColor(self.colors[k])
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawPolygon(poly)
+            if show_text and self.labels[k]:
+                t = self.labels[k]
+                w = fm.horizontalAdvance(t)
+                ty = base.y() + s * 15 + (fm.ascent() if s > 0 else -fm.descent())
+                p.setPen(col)
+                p.drawText(QtCore.QPointF(pt.x() - w / 2, ty), t)
+        p.restore()

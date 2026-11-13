@@ -5,6 +5,9 @@ from pathlib import Path
 from PySide6 import QtWidgets, QtCore
 app = QtWidgets.QApplication([])
 from chartlab import accounts as A
+import tempfile as _tf
+A._CANDLE_DIR = Path(_tf.mkdtemp())          # tests never read / leave the real candle cache
+
 import pandas as pd
 
 tmp = Path(tempfile.mkdtemp()) / "accounts.json"

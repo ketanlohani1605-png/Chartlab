@@ -134,6 +134,7 @@ class SymbolSearch(QtWidgets.QDialog):
 
     def __init__(self, parent, symbols: list[str], text: str = ""):
         super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("Symbol Search")
         self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
         self.setStyleSheet(DARK)
@@ -294,6 +295,7 @@ def parse_interval(text: str) -> tuple[str | None, str]:
 class IntervalPopup(QtWidgets.QDialog):
     def __init__(self, parent, first: str):
         super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
         self.setStyleSheet(DARK)
         self.setFixedWidth(280)
@@ -331,6 +333,7 @@ class GoTo(QtWidgets.QDialog):
         pl = QtWidgets.QVBoxLayout(page)
         row = QtWidgets.QHBoxLayout()
         self.date = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        self.date.setDisplayFormat("dd MMM yyyy")
         self.date.setCalendarPopup(False)
         self.time = QtWidgets.QTimeEdit(QtCore.QTime(0, 0))
         row.addWidget(self.date)
@@ -338,6 +341,16 @@ class GoTo(QtWidgets.QDialog):
         pl.addLayout(row)
         self.cal = QtWidgets.QCalendarWidget()
         self.cal.setGridVisible(False)
+        self.cal.setVerticalHeaderFormat(QtWidgets.QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.cal.setHorizontalHeaderFormat(QtWidgets.QCalendarWidget.HorizontalHeaderFormat.ShortDayNames)
+        self.cal.setFirstDayOfWeek(QtCore.Qt.DayOfWeek.Monday)
+        wk = QtGui.QTextCharFormat()
+        wk.setForeground(QtGui.QColor("#dbdbdb"))
+        for d in (QtCore.Qt.DayOfWeek.Saturday, QtCore.Qt.DayOfWeek.Sunday):
+            self.cal.setWeekdayTextFormat(d, wk)
+        hdr = QtGui.QTextCharFormat()
+        hdr.setForeground(QtGui.QColor("#787b86"))
+        self.cal.setHeaderTextFormat(hdr)
         self.cal.clicked.connect(self.date.setDate)
         self.date.dateChanged.connect(self.cal.setSelectedDate)
         pl.addWidget(self.cal)
@@ -346,6 +359,9 @@ class GoTo(QtWidgets.QDialog):
         p2 = QtWidgets.QFormLayout(page2)
         self.d0 = QtWidgets.QDateEdit(QtCore.QDate.currentDate().addMonths(-1))
         self.d1 = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        for de in (self.d0, self.d1):
+            de.setDisplayFormat("dd MMM yyyy")
+            de.setCalendarPopup(True)
         p2.addRow("Start", self.d0)
         p2.addRow("End", self.d1)
         self.tabs.addTab(page2, "Custom range")
@@ -360,3 +376,238 @@ class GoTo(QtWidgets.QDialog):
         foot.addWidget(c)
         foot.addWidget(ok)
         lay.addLayout(foot)
+
+
+class _QuickDelegate(QtWidgets.QStyledItemDelegate):
+    def sizeHint(self, option, index):
+        return QtCore.QSize(option.rect.width(), 38)
+
+    def paint(self, p, option, index):
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        r = option.rect
+        if option.state & QtWidgets.QStyle.StateFlag.State_Selected:
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor("#2e2e2e"))
+            p.drawRoundedRect(QtCore.QRectF(r).adjusted(6, 1, -6, -1), 7, 7)
+        title, cat, sc, checked = index.data(ROLE)
+        f = QtGui.QFont(option.font)
+        f.setPixelSize(14)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("#ffffff" if checked else "#dbdbdb"))
+        al = QtCore.Qt.AlignmentFlag
+        p.drawText(r.adjusted(18, 0, -200, 0), al.AlignVCenter | al.AlignLeft, ("\u2713  " if checked else "") + title)
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("#787b86"))
+        if sc and " " not in sc:                       # a real key sequence (not "type a letter")
+            from .theme import sc as _native
+            sc = _native(sc)
+        right = cat + (f"     {sc}" if sc else "")
+        p.drawText(r.adjusted(0, 0, -20, 0), al.AlignVCenter | al.AlignRight, right)
+        p.restore()
+
+
+class QuickSearch(QtWidgets.QDialog):
+    """Cmd/Ctrl+K: search every tool and function, like TradingView's quick search."""
+
+    def __init__(self, parent, actions: list):
+        """actions: [(title, category, shortcut, callable, checked)]"""
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet(DARK)
+        self.resize(640, 480)
+        self.actions_ = actions
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 10)
+        top = QtWidgets.QHBoxLayout()
+        ic = QtWidgets.QLabel()
+        ic.setPixmap(icons.get("search", "#dbdbdb").pixmap(20, 20))
+        top.addWidget(ic)
+        self.edit = QtWidgets.QLineEdit()
+        self.edit.setPlaceholderText("Search tool or function")
+        self.edit.setStyleSheet("QLineEdit{background:transparent;border:0;font-size:17px;padding:6px 4px;color:#fff;}")
+        top.addWidget(self.edit, 1)
+        lay.addLayout(top)
+        line = QtWidgets.QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background:#2e2e2e;")
+        lay.addWidget(line)
+        self.lst = QtWidgets.QListWidget()
+        self.lst.setItemDelegate(_QuickDelegate(self.lst))
+        self.lst.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.lst.setMouseTracking(True)
+        self.lst.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lay.addWidget(self.lst, 1)
+        self.edit.textChanged.connect(self._fill)
+        self.edit.returnPressed.connect(self._go)
+        self.lst.itemClicked.connect(lambda *_: self._go())
+        self._fill()
+        if parent is not None:
+            g = parent.geometry()
+            self.move(g.x() + (g.width() - self.width()) // 2, g.y() + 90)
+        QtCore.QTimer.singleShot(0, self.edit.setFocus)
+
+    def _fill(self, *_):
+        words = self.edit.text().lower().split()
+        self.lst.clear()
+        for a in self.actions_:
+            hay = (a[0] + " " + a[1]).lower()
+            if all(w in hay for w in words):
+                it = QtWidgets.QListWidgetItem()
+                it.setData(ROLE, (a[0], a[1], a[2], a[4]))
+                it.setData(ROLE + 1, a[3])
+                self.lst.addItem(it)
+        if self.lst.count():
+            self.lst.setCurrentRow(0)
+
+    def keyPressEvent(self, ev):
+        K = QtCore.Qt.Key
+        if ev.key() in (K.Key_Down, K.Key_Up):
+            r = self.lst.currentRow() + (1 if ev.key() == K.Key_Down else -1)
+            self.lst.setCurrentRow(max(0, min(r, self.lst.count() - 1)))
+            return
+        super().keyPressEvent(ev)
+
+    def _go(self):
+        it = self.lst.currentItem()
+        if it is None:
+            return
+        fn = it.data(ROLE + 1)
+        self.accept()
+        QtCore.QTimer.singleShot(0, fn)
+
+
+class IndicatorsDialog(QtWidgets.QDialog):
+    """TradingView's "Indicators, metrics & strategies": a search box, categories on the left, and a list where a
+    click adds / removes an indicator (the dialog stays open so several can be added, like TradingView).
+    A strategy loads into the Python editor and runs.
+
+    items: [{"key", "title", "category", "on", "kind": "indicator" | "strategy", "search"}]
+    toggle(key) -> new on/off state;  run_strategy(key) loads + runs it."""
+
+    ALL = "All"
+
+    def __init__(self, parent, items: list, toggle, run_strategy, text: str = ""):
+        super().__init__(parent)
+        self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet(DARK + " QListWidget#cats::item{padding:8px 12px;border-radius:6px;color:#dbdbdb;}"
+                           " QListWidget#cats::item:selected{background:#2e2e2e;color:#ffffff;}"
+                           " QListWidget#cats::item:hover{background:#262626;}"
+                           " QToolButton{background:transparent;border:0;border-radius:6px;padding:4px;}"
+                           " QToolButton:hover{background:#2e2e2e;}")
+        self.resize(760, 520)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.items, self._toggle, self._run = items, toggle, run_strategy
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 12, 12)
+        lay.setSpacing(10)
+        head = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Indicators, metrics & strategies")
+        title.setStyleSheet("font-size:17px;font-weight:600;color:#ffffff;")
+        head.addWidget(title, 1)
+        close = QtWidgets.QToolButton()
+        close.setIcon(icons.get("close", "#b2b5be"))
+        close.setToolTip("Close  (Esc)")
+        close.clicked.connect(self.reject)
+        head.addWidget(close)
+        lay.addLayout(head)
+        top = QtWidgets.QHBoxLayout()
+        ic = QtWidgets.QLabel()
+        ic.setPixmap(icons.get("search", "#9598a1").pixmap(18, 18))
+        top.addWidget(ic)
+        self.edit = QtWidgets.QLineEdit(text)
+        self.edit.setPlaceholderText("Search")
+        self.edit.setStyleSheet("QLineEdit{background:transparent;border:0;font-size:16px;padding:6px 4px;color:#fff;}")
+        top.addWidget(self.edit, 1)
+        lay.addLayout(top)
+        line = QtWidgets.QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background:#2e2e2e;")
+        lay.addWidget(line)
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(10)
+        self.cats = QtWidgets.QListWidget()
+        self.cats.setObjectName("cats")
+        self.cats.setFixedWidth(190)
+        self.cats.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        cats = [self.ALL] + list(dict.fromkeys(it["category"] for it in items))
+        for c in cats:
+            self.cats.addItem(c)
+        self.cats.setCurrentRow(0)
+        body.addWidget(self.cats)
+        sep = QtWidgets.QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background:#2e2e2e;")
+        body.addWidget(sep)
+        self.lst = QtWidgets.QListWidget()
+        self.lst.setItemDelegate(_QuickDelegate(self.lst))
+        self.lst.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.lst.setMouseTracking(True)
+        self.lst.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body.addWidget(self.lst, 1)
+        lay.addLayout(body, 1)
+        hint = QtWidgets.QLabel("Click to add or remove  ·  ↑↓ Enter  ·  Esc to close")
+        hint.setStyleSheet("color:#6a6d78;font-size:12px;")
+        lay.addWidget(hint)
+        self.edit.textChanged.connect(self._fill)
+        self.edit.returnPressed.connect(self._go)
+        self.cats.currentRowChanged.connect(self._fill)
+        self.lst.itemClicked.connect(lambda *_: self._go())
+        self._fill()
+        if parent is not None:
+            g = parent.geometry()
+            self.move(g.x() + (g.width() - self.width()) // 2, g.y() + 90)
+        QtCore.QTimer.singleShot(0, self.edit.setFocus)
+
+    def _fill(self, *_):
+        keep = self.lst.currentItem().data(ROLE + 1) if self.lst.currentItem() else None
+        words = self.edit.text().lower().split()
+        cat = self.cats.currentItem().text() if self.cats.currentItem() else self.ALL
+        self.lst.clear()
+        row = 0
+        for it in self.items:
+            if cat != self.ALL and it["category"] != cat and not words:
+                continue
+            hay = (it["title"] + " " + it["category"] + " " + it.get("search", "")).lower()
+            if not all(w in hay for w in words):
+                continue
+            li = QtWidgets.QListWidgetItem()
+            right = "Strategy" if it["kind"] == "strategy" else it["category"]
+            li.setData(ROLE, (it["title"], right, "", bool(it.get("on"))))
+            li.setData(ROLE + 1, it["key"])
+            li.setSizeHint(QtCore.QSize(0, 38))
+            self.lst.addItem(li)
+            if it["key"] == keep:
+                row = self.lst.count() - 1
+        if self.lst.count():
+            self.lst.setCurrentRow(row)
+
+    def keyPressEvent(self, ev):
+        K = QtCore.Qt.Key
+        if ev.key() in (K.Key_Down, K.Key_Up):
+            r = self.lst.currentRow() + (1 if ev.key() == K.Key_Down else -1)
+            self.lst.setCurrentRow(max(0, min(r, self.lst.count() - 1)))
+            return
+        super().keyPressEvent(ev)
+
+    def done(self, r):
+        for w in (self.edit, self.cats, self.lst):     # no _fill() calls while Qt tears the lists down
+            w.blockSignals(True)
+        super().done(r)
+
+    def _go(self):
+        li = self.lst.currentItem()
+        if li is None:
+            return
+        key = li.data(ROLE + 1)
+        it = next((x for x in self.items if x["key"] == key), None)
+        if it is None:
+            return
+        if it["kind"] == "strategy":
+            self.accept()
+            QtCore.QTimer.singleShot(0, lambda: self._run(key))
+            return
+        it["on"] = bool(self._toggle(key))
+        self._fill()

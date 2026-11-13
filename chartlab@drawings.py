@@ -51,6 +51,8 @@ class DrawingLayer(QtCore.QObject):
         self._undo: list = []
         self._redo: list = []
         self._drag = None
+        self._tags: dict = {}          # id -> price-scale label of a horizontal line / ray (TradingView shows it)
+        self._tag_y: dict = {}
 
     # ------------------------------------------------------------------ undo / redo
     def _snapshot(self):
@@ -93,6 +95,7 @@ class DrawingLayer(QtCore.QObject):
         for items in self._items.values():
             for it in items:
                 it.setVisible(not on)
+        self.place_tags()
 
     def begin_drag(self, x: float, y: float) -> bool:
         if self.tool or self.locked or not self.chart.has_data():
@@ -139,6 +142,8 @@ class DrawingLayer(QtCore.QObject):
                 nx = self.chart.time_to_x(t) + (0 if d["type"] == "hline" else dx)
                 new.append([self.chart.x_to_time(nx), p if d["type"] == "vline" else float(self.chart.iy(self.chart.ty(p) + dy))])
             d["pts"] = new
+        if d["type"] in ("long", "short") and len(d["pts"]) == 3:
+            d["pts"][2][0] = d["pts"][1][0]
         self._drop_items(d["id"])
         self._build(d)
 
@@ -186,8 +191,12 @@ class DrawingLayer(QtCore.QObject):
         if dtype not in TOOLS or len(pts) < TOOLS[dtype]:
             raise ValueError(f"'{dtype}' needs {TOOLS.get(dtype, '?')} point(s)")
         self._push_undo()
-        d = {"id": self._next_id, "type": dtype, "pts": [[float(t), float(p)] for t, p in pts[:TOOLS[dtype]]],
+        n = 3 if dtype in ("long", "short") and len(pts) >= 3 else TOOLS[dtype]
+        d = {"id": self._next_id, "type": dtype, "pts": [[float(t), float(p)] for t, p in pts[:n]],
              "color": color}
+        if dtype in ("long", "short") and len(d["pts"]) == 2:      # stop starts mirrored; drag its handle to change R/R
+            (t0, p0), (t1, p1) = d["pts"]
+            d["pts"].append([t1, p0 - (p1 - p0)])
         self._next_id += 1
         self.drawings.append(d)
         self._build(d)
@@ -202,6 +211,7 @@ class DrawingLayer(QtCore.QObject):
                 self._drop_items(did)
                 if self.selected == did:
                     self.selected = None
+                self._sync_tags()
                 self.changed.emit()
                 return True
         return False
@@ -217,6 +227,7 @@ class DrawingLayer(QtCore.QObject):
             self._drop_items(did)
         self.drawings = []
         self.selected = None
+        self._sync_tags()
         self.cancel()
         self.changed.emit()
 
@@ -251,6 +262,7 @@ class DrawingLayer(QtCore.QObject):
             self._drop_items(did)
         self.drawings, self.selected, self.pending = [], None, []
         self._clear_preview()
+        self._sync_tags()
 
     # ------------------------------------------------------------------ mouse input (view coordinates)
     def handle_click(self, x: float, y: float):
@@ -300,12 +312,53 @@ class DrawingLayer(QtCore.QObject):
             self._drop_items(did)
         for d in self.drawings:
             self._build(d)
+        self._sync_tags()
 
     def _build(self, d):
         items = self._make_items(d)
         for it in items:
             self.chart.price.addItem(it, ignoreBounds=True)
         self._items[d["id"]] = items
+        if d["type"] in ("hline", "hray") and self.chart.has_data():
+            self._set_tag(d)
+
+    # -- price labels on the scale for horizontal lines (kept and re-used while a line is dragged)
+    def _set_tag(self, d):
+        did, color = d["id"], d.get("color", DEFAULT_COLOR)
+        tag = self._tags.get(did)
+        if tag is None:
+            tag = self._tags[did] = self.chart.make_axis_tag(color)
+        tag.fill = color
+        price = float(d["pts"][0][1])
+        tag.setText(f" {self.chart.axis_price(price)} ")
+        self._tag_y[did] = float(self.chart.ty(price))
+        self.place_tags()
+
+    def _sync_tags(self):
+        keep = {d["id"] for d in self.drawings if d["type"] in ("hline", "hray")}
+        for did in [k for k in self._tags if k not in keep]:
+            tag = self._tags.pop(did)
+            self._tag_y.pop(did, None)
+            tag.hide()
+            tag.deleteLater()
+        self.place_tags()
+
+    def place_tags(self):
+        if not self._tags:
+            return
+        ch = self.chart
+        if not ch.has_data():
+            for tag in self._tags.values():
+                tag.hide()
+            return
+        (_x0, x1), (y0, y1) = ch.price.vb.viewRange()
+        for did, tag in self._tags.items():
+            y = self._tag_y.get(did)
+            ok = y is not None and y0 <= y <= y1 and not self.hidden and did in self._items
+            tag.setVisible(ok)
+            if ok:
+                tag.setPos(x1, y)
+        ch.last_tag.raise_()                    # the live price label stays on top, like TradingView
 
     def _drop_items(self, did):
         for it in self._items.pop(did, []):
@@ -343,10 +396,7 @@ class DrawingLayer(QtCore.QObject):
                 ey = y1 + (y2 - y1) * (ex - x1) / (x2 - x1)
             items.append(pg.PlotDataItem([x1, ex], [y1, ey], pen=pen))
         elif t == "hline" and pts:
-            items.append(pg.InfiniteLine(pos=pts[0][1], angle=0, movable=False, pen=pen,
-                                         label=f"{self.chart.iy(pts[0][1]):,.2f}",
-                                         labelOpts={"position": 0.04, "color": color,
-                                                    "fill": (19, 23, 34, 200)}))
+            items.append(pg.InfiniteLine(pos=pts[0][1], angle=0, movable=False, pen=pen))
         elif t == "vline" and pts:
             items.append(pg.InfiniteLine(pos=pts[0][0], angle=90, movable=False, pen=pen))
         elif t == "hray" and pts:
@@ -409,29 +459,56 @@ class DrawingLayer(QtCore.QObject):
             tx = pg.TextItem(txt, color="#ffffff", anchor=(0.5, 1), fill=pg.mkBrush(col))
             tx.setPos((x1 + x2) / 2, max(y1, y2))
             items.append(tx)
-        elif t in ("long", "short") and len(pts) == 2:
-            (x1, y1), (x2, y2) = pts                      # entry price = y1, target = y2, stop mirrored
-            sgn = 1 if t == "long" else -1
+        elif t in ("long", "short") and len(pts) >= 2:
+            # TradingView's position tool: entry line, green target zone, red stop zone, labels with % and R/R
+            (x1, y1), (x2, y2) = pts[0], pts[1]
             tgt = y2
-            stop = y1 - (tgt - y1)
+            stop = pts[2][1] if len(pts) >= 3 else y1 - (tgt - y1)
             xa, xb = min(x1, x2), max(x1, x2, min(x1, x2) + 1)
             for lo, hi, col in ((min(y1, tgt), max(y1, tgt), theme.UP), (min(y1, stop), max(y1, stop), theme.DOWN)):
-                c = QtGui.QColor(col); c.setAlpha(55)
+                c = QtGui.QColor(col)
+                c.setAlpha(55)
                 r = QtWidgets.QGraphicsRectItem(QtCore.QRectF(xa, lo, xb - xa, hi - lo))
-                r.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen)); r.setBrush(QtGui.QBrush(c))
+                r.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
+                r.setBrush(QtGui.QBrush(c))
                 items.append(r)
             items.append(pg.PlotDataItem([xa, xb], [y1, y1], pen=pg.mkPen("#d1d4dc", width=1.2)))
-            rr = abs(tgt - y1) / abs(stop - y1) if stop != y1 else 0
-            tx = pg.TextItem(f"{'Long' if sgn > 0 else 'Short'}  R/R {rr:.2f}", color="#ffffff", anchor=(0, 1), fill=pg.mkBrush("#2a2e39"))
-            tx.setPos(xa, y1)
-            items.append(tx)
+            if not preview or len(pts) >= 2:
+                iy = self.chart.iy
+                pe, pt_, ps = float(iy(y1)), float(iy(tgt)), float(iy(stop))
+                rr = abs(pt_ - pe) / abs(ps - pe) if ps != pe else 0.0
+                tp = abs(pt_ / pe - 1) * 100 if pe else 0.0
+                sp = abs(ps / pe - 1) * 100 if pe else 0.0
+                fp = self.chart.fp
+                mid = (xa + xb) / 2
+                up_t = tgt >= y1                              # target above entry (a long) -> its label at the top
+                lab_t = pg.TextItem(f"Target: {fp(pt_)} ({tp:.2f}%)", color="#ffffff", anchor=(0.5, 0 if up_t else 1),
+                                    fill=pg.mkBrush(theme.UP))
+                lab_t.setPos(mid, tgt)
+                lab_s = pg.TextItem(f"Stop: {fp(ps)} ({sp:.2f}%)", color="#ffffff", anchor=(0.5, 1 if up_t else 0),
+                                    fill=pg.mkBrush(theme.DOWN))
+                lab_s.setPos(mid, stop)
+                lab_m = pg.TextItem(f"{'Long' if t == 'long' else 'Short'}  \u00b7  Risk/Reward {rr:.2f}",
+                                    color="#ffffff", anchor=(0.5, 0.5), fill=pg.mkBrush("#2a2e39"))
+                lab_m.setPos(mid, y1)
+                items += [lab_t, lab_s, lab_m]
         elif t == "fib" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             xa, xb = min(x1, x2), max(x1, x2, min(x1, x2) + 1)
             items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pg.mkPen("#787b86", width=1,
                                                                          style=QtCore.Qt.PenStyle.DashLine)))
+            prev = None
             for lvl, col in zip(FIB_LEVELS, FIB_COLORS):
                 price = y2 + (y1 - y2) * lvl
+                if prev is not None and not preview:           # soft band between this level and the last one
+                    c = QtGui.QColor(col)
+                    c.setAlpha(26)
+                    band = QtWidgets.QGraphicsRectItem(QtCore.QRectF(xa, min(prev, price), xb - xa, abs(price - prev)))
+                    band.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
+                    band.setBrush(QtGui.QBrush(c))
+                    band.setZValue(-2)
+                    items.append(band)
+                prev = price
                 items.append(pg.PlotDataItem([xa, xb], [price, price], pen=pg.mkPen(col, width=1.4 if sel else 1)))
                 tx = pg.TextItem(f"{lvl:g}  ({self.chart.iy(price):,.2f})", color=col, anchor=(0, 1))
                 tx.setPos(xa, price)
@@ -458,7 +535,10 @@ class DrawingLayer(QtCore.QObject):
             tx.setPos((x1 + x2) / 2, y2)
             items.append(tx)
         elif t == "text" and pts:
-            tx = pg.TextItem(d.get("text", "Text"), color="#ffffff", anchor=(0, 1), fill=pg.mkBrush(color))
+            q = QtGui.QColor(color)
+            light = 0.2126 * q.redF() + 0.7152 * q.greenF() + 0.0722 * q.blueF() > 0.7
+            tx = pg.TextItem(d.get("text", "Text"), color="#000000" if light else "#ffffff", anchor=(0, 1),
+                             fill=pg.mkBrush(color))
             tx.setPos(*pts[0])
             items.append(tx)
         if sel:
@@ -491,7 +571,11 @@ class DrawingLayer(QtCore.QObject):
         if t == "vline":
             lo, hi = self.chart.y_range()
             return [((pts[0][0], lo), (pts[0][0], hi))]
-        if t in ("rect", "ellipse", "pricerange", "daterange", "long", "short") and len(pts) == 2:
+        if t in ("long", "short") and len(pts) >= 2:
+            (x1, y1), (x2, y2) = pts[0], pts[1]
+            ys = y1 - (y2 - y1) if len(pts) < 3 else pts[2][1]
+            return [((x1, y), (x2, y)) for y in (y1, y2, ys)] + [((x, y2), (x, ys)) for x in (x1, x2)]
+        if t in ("rect", "ellipse", "pricerange", "daterange") and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             return [((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)), ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))]
         if t == "arrow" and len(pts) == 2:

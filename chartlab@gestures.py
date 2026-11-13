@@ -6,7 +6,7 @@ import os
 import time
 
 import pyqtgraph as pg
-from PySide6 import QtCore
+from PySide6 import QtCore, QtGui
 
 # Smooth motion is on for the real app; headless tests need instant results.
 ANIMATE = os.environ.get("QT_QPA_PLATFORM") != "offscreen" or os.environ.get("CHARTLAB_ANIM") == "1"
@@ -25,6 +25,68 @@ class TVViewBox(pg.ViewBox):
         self._anim = None
         self._vel = 0.0            # bars / second, for kinetic pan
         self._last_t = 0.0
+
+    # --- grid (drawn here, behind the series, instead of by the axes)
+    plot_item = None          # the PlotItem this ViewBox belongs to (set by the chart)
+
+    def _grid_pen(self):
+        from . import settings
+        S = settings.get()
+        key = (S.get("grid_color", "#262626"), S.get("bg", "#000000"))
+        if getattr(self, "_gp_key", None) != key:
+            c, b, a = QtGui.QColor(key[0]), QtGui.QColor(key[1]), 0.35
+            col = QtGui.QColor(int(c.red() * a + b.red() * (1 - a)), int(c.green() * a + b.green() * (1 - a)),
+                               int(c.blue() * a + b.blue() * (1 - a)))
+            pen = QtGui.QPen(col, 0)
+            pen.setCosmetic(True)
+            self._gp, self._gp_key = pen, key
+        return self._gp, S
+
+    @staticmethod
+    def _grid_values(axis, lo, hi, size_px):
+        """Tick positions to draw grid lines at: the finest tick level that is still >= ~45 px apart."""
+        try:
+            levels = axis.tickValues(lo, hi, size_px)
+        except Exception:  # noqa: BLE001
+            return []
+        span = (hi - lo) or 1.0
+        out = []
+        for spacing, vals in levels:
+            if spacing / span * size_px < 45 and out:
+                break
+            out = list(vals)
+        return out
+
+    def paint(self, p, opt, widget):
+        super().paint(p, opt, widget)
+        pl = self.plot_item
+        if pl is None or getattr(self.chart, "df", None) is None:
+            return
+        pen, S = self._grid_pen()
+        gv, gh = bool(S.get("grid_v", True)), bool(S.get("grid_h", True))
+        if not (gv or gh):
+            return
+        (x0, x1), (y0, y1) = self.viewRange()
+        w, h = self.width(), self.height()
+        if w <= 2 or h <= 2 or x1 <= x0 or y1 <= y0:
+            return
+        inv = bool(self.state.get("yInverted"))
+        lines = []
+        if gh:
+            for y in self._grid_values(pl.getAxis("right"), y0, y1, h):
+                fy = (y - y0) / (y1 - y0)
+                ly = round((fy if inv else 1 - fy) * h) + 0.5
+                if 0 <= ly <= h:
+                    lines.append(QtCore.QLineF(0, ly, w, ly))
+        if gv:
+            for x in self._grid_values(pl.getAxis("bottom"), x0, x1, w):
+                lx = round((x - x0) / (x1 - x0) * w) + 0.5
+                if 0 <= lx <= w:
+                    lines.append(QtCore.QLineF(lx, 0, lx, h))
+        if lines:
+            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            p.setPen(pen)
+            p.drawLines(lines)
 
     # --- smooth motion
     def _stop_anim(self):

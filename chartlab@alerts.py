@@ -204,16 +204,22 @@ class Poller(QtCore.QObject):
 
 # ---------------------------------------------------------------------- UI
 class AlertDialog(QtWidgets.QDialog):
+    """TradingView-style 'Create alert on SYMBOL' dialog."""
+
     def __init__(self, parent, label: str, price: float, value: float | None = None):
         super().__init__(parent)
         self.setWindowTitle("Create alert")
-        self.setMinimumWidth(380)
-        f = QtWidgets.QFormLayout(self)
-        f.setContentsMargins(18, 16, 18, 16)
-        f.setSpacing(10)
-        title = QtWidgets.QLabel(f"<b style='font-size:15px'>{label}</b> &nbsp;<span style='color:{theme.MUTED}'>"
-                                 f"last {price:,.2f}</span>")
-        f.addRow(title)
+        self.setMinimumWidth(460)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(22, 18, 22, 16)
+        v.setSpacing(12)
+        title = QtWidgets.QLabel(f"<span style='font-size:17px;font-weight:600;color:#ffffff'>Create alert on {label}</span>"
+                                 f"<br><span style='color:{theme.MUTED};font-size:12px'>Last price {price:,.2f}</span>")
+        v.addWidget(title)
+        g = QtWidgets.QGridLayout()
+        g.setHorizontalSpacing(14)
+        g.setVerticalSpacing(10)
+        g.setColumnMinimumWidth(0, 96)
         self.cond = QtWidgets.QComboBox()
         for key, text in CONDITIONS:
             self.cond.addItem(text, key)
@@ -227,26 +233,107 @@ class AlertDialog(QtWidgets.QDialog):
         self.expiry = QtWidgets.QCheckBox("Expires on")
         self.when = QtWidgets.QDateTimeEdit(QtCore.QDateTime.currentDateTime().addDays(30))
         self.when.setCalendarPopup(True)
+        self.when.setDisplayFormat("dd MMM yyyy  HH:mm")
         self.when.setEnabled(False)
         self.expiry.toggled.connect(self.when.setEnabled)
         self.message = QtWidgets.QLineEdit()
-        self.message.setPlaceholderText("Optional message")
-        f.addRow("Condition", self.cond)
-        f.addRow("Value", self.value)
-        f.addRow("Trigger", self.mode)
-        f.addRow(self.expiry, self.when)
-        f.addRow("Message", self.message)
-        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        ok = bb.addButton("Create", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        self.message.setPlaceholderText("Optional message shown when it fires")
+
+        def lab(t):
+            w = QtWidgets.QLabel(t)
+            w.setStyleSheet(f"color:{theme.MUTED};")
+            return w
+        cond_row = QtWidgets.QHBoxLayout()
+        price_lbl = QtWidgets.QLabel("Price")
+        price_lbl.setStyleSheet("background:#2a2a2a;border-radius:6px;padding:6px 10px;")
+        cond_row.addWidget(price_lbl)
+        cond_row.addWidget(self.cond, 1)
+        g.addWidget(lab("Condition"), 0, 0)
+        g.addLayout(cond_row, 0, 1)
+        g.addWidget(lab("Value"), 1, 0)
+        g.addWidget(self.value, 1, 1)
+        g.addWidget(lab("Trigger"), 2, 0)
+        g.addWidget(self.mode, 2, 1)
+        g.addWidget(self.expiry, 3, 0)
+        g.addWidget(self.when, 3, 1)
+        g.addWidget(lab("Message"), 4, 0)
+        g.addWidget(self.message, 4, 1)
+        v.addLayout(g)
+        foot = QtWidgets.QHBoxLayout()
+        foot.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QtWidgets.QPushButton("Create")
         ok.setObjectName("primary")
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        f.addRow(bb)
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        foot.addWidget(cancel)
+        foot.addWidget(ok)
+        v.addSpacing(4)
+        v.addLayout(foot)
+        QtCore.QTimer.singleShot(0, lambda: (self.value.setFocus(), self.value.selectAll()))
 
     def result_values(self) -> dict:
         return {"cond": self.cond.currentData(), "value": self.value.value(), "once": self.mode.currentData(),
                 "message": self.message.text().strip(),
                 "expires": self.when.dateTime().toString("yyyy-MM-ddTHH:mm:ss") if self.expiry.isChecked() else ""}
+
+
+class _AlertCard(QtWidgets.QStyledItemDelegate):
+    """One alert as a TradingView-style card: 'NIFTY  Crossing  32,000.00' + status pill, details underneath."""
+    COLORS = {"active": "#089981", "triggered": "#ff9800", "paused": "#787b86", "expired": "#787b86"}
+
+    def sizeHint(self, option, index):
+        return QtCore.QSize(option.rect.width(), 60)
+
+    def paint(self, p, option, index):
+        a = index.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        if not a:
+            return
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        r = option.rect.adjusted(6, 3, -6, -3)
+        sel = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
+        hov = bool(option.state & QtWidgets.QStyle.StateFlag.State_MouseOver)
+        p.setPen(QtGui.QPen(QtGui.QColor("#5d606b" if sel else "#262626"), 1))
+        p.setBrush(QtGui.QColor("#1e1e1e" if (sel or hov) else "#121212"))
+        p.drawRoundedRect(QtCore.QRectF(r), 8, 8)
+        al = QtCore.Qt.AlignmentFlag
+        f = QtGui.QFont(option.font)
+        f.setPixelSize(14)
+        f.setWeight(QtGui.QFont.Weight.DemiBold)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("#ffffff"))
+        head = f"{a.get('label', '')}   {COND_TEXT.get(a.get('cond'), a.get('cond'))}   {a.get('value', 0):,.2f}"
+        p.drawText(r.adjusted(12, 8, -90, 0), al.AlignLeft | al.AlignTop, head)
+        st = str(a.get("status", "active"))
+        col = QtGui.QColor(self.COLORS.get(st, "#787b86"))
+        f.setPixelSize(11)
+        p.setFont(f)
+        pill_w = p.fontMetrics().horizontalAdvance(st.capitalize()) + 16
+        pill = QtCore.QRectF(r.right() - pill_w - 10, r.top() + 8, pill_w, 18)
+        bg = QtGui.QColor(col)
+        bg.setAlpha(45)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(pill, 9, 9)
+        p.setPen(col)
+        p.drawText(pill, al.AlignCenter, st.capitalize())
+        f.setPixelSize(12)
+        f.setWeight(QtGui.QFont.Weight.Normal)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("#787b86"))
+        bits = ["Only once" if a.get("once", True) else "Every time"]
+        if a.get("last_fired"):
+            bits.append("fired " + a["last_fired"][5:16].replace("T", " "))
+        if a.get("expires"):
+            bits.append("expires " + a["expires"][5:10])
+        if a.get("message"):
+            bits.append(a["message"])
+        sub = "  \u00b7  ".join(bits)
+        p.drawText(r.adjusted(12, 0, -12, -8), al.AlignLeft | al.AlignBottom,
+                   p.fontMetrics().elidedText(sub, QtCore.Qt.TextElideMode.ElideRight, r.width() - 24))
+        p.restore()
 
 
 class AlertsPanel(QtWidgets.QWidget):
@@ -270,7 +357,14 @@ class AlertsPanel(QtWidgets.QWidget):
         self.table = QtWidgets.QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Alert", "Status", "Last"])
         self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnHidden(1, True)
+        self.table.setColumnHidden(2, True)
+        self.table.verticalHeader().setDefaultSectionSize(62)
+        self.table.setItemDelegateForColumn(0, _AlertCard(self.table))
+        self.table.setMouseTracking(True)
+        self.table.setStyleSheet("QTableWidget { background: transparent; border: 0; }")
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setShowGrid(False)
@@ -279,7 +373,7 @@ class AlertsPanel(QtWidgets.QWidget):
         v.addWidget(self.table, 2)
         self.empty = QtWidgets.QLabel(
             "<div style='text-align:center'><span style='font-size:15px;color:#dbdbdb'>No alerts yet</span><br><br>"
-            f"<span style='color:{theme.MUTED}'>Press <b>Alt+A</b>, click the <b>+</b> next to the price scale,<br>"
+            f"<span style='color:{theme.MUTED}'>Press <b>{theme.sc('Alt+A')}</b>, click the <b>+</b> next to the price scale,<br>"
             "or right-click the chart to add one at a price.</span></div>")
         self.empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.empty.setWordWrap(True)
@@ -300,6 +394,7 @@ class AlertsPanel(QtWidgets.QWidget):
         for r, a in enumerate(al):
             it = QtWidgets.QTableWidgetItem(describe(a))
             it.setData(QtCore.Qt.ItemDataRole.UserRole, a["id"])
+            it.setData(QtCore.Qt.ItemDataRole.UserRole + 1, dict(a))
             st = QtWidgets.QTableWidgetItem(a["status"].capitalize())
             st.setForeground(QtGui.QColor(colors.get(a["status"], theme.TEXT)))
             last = QtWidgets.QTableWidgetItem(a["last_fired"][5:16].replace("T", " ") if a["last_fired"] else "—")
@@ -325,12 +420,15 @@ class AlertsPanel(QtWidgets.QWidget):
 
 
 class Toast(QtWidgets.QFrame):
-    """Slide-in notification pill, top-right of the window."""
+    """Slide-in notification pill, top-right of the chart area (left of the right toolbar); several alerts that
+    fire together stack below each other instead of on top of each other."""
+
+    _live: list = []
 
     def __init__(self, parent: QtWidgets.QWidget, title: str, text: str, color: str = "#ff9800"):
         super().__init__(parent)
         self.setObjectName("toast")
-        self.setStyleSheet(f"QFrame#toast {{ background: rgba(24,26,33,245); border: 1px solid {color}; "
+        self.setStyleSheet(f"QFrame#toast {{ background: #1e1e1e; border: 1px solid {color}; "
                            f"border-radius: 12px; }} QLabel {{ background: transparent; }}")
         h = QtWidgets.QHBoxLayout(self)
         h.setContentsMargins(14, 10, 16, 10)
@@ -346,7 +444,14 @@ class Toast(QtWidgets.QFrame):
         shadow.setOffset(0, 6)
         shadow.setColor(QtGui.QColor(0, 0, 0, 210))
         self.setGraphicsEffect(shadow)
-        end = QtCore.QPoint(parent.width() - self.width() - 24, 64)
+        rail = parent.findChild(QtWidgets.QToolBar, "rightrail")
+        right = (rail.mapTo(parent, QtCore.QPoint(0, 0)).x() if rail is not None and rail.isVisible()
+                 else parent.width())
+        import shiboken6
+        Toast._live = [t for t in Toast._live if shiboken6.isValid(t) and t.parent() is parent]
+        y = 64 + sum(t.height() + 10 for t in Toast._live)
+        Toast._live.append(self)
+        end = QtCore.QPoint(right - self.width() - 16, y)
         self.move(end.x(), end.y() - 30)
         self.show()
         self.raise_()
@@ -359,6 +464,8 @@ class Toast(QtWidgets.QFrame):
         QtCore.QTimer.singleShot(6500, self._leave)
 
     def _leave(self):
+        if self in Toast._live:
+            Toast._live.remove(self)
         a = QtCore.QPropertyAnimation(self, b"pos", self)
         a.setDuration(260)
         a.setStartValue(self.pos())

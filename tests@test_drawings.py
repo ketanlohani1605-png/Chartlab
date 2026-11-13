@@ -19,13 +19,24 @@ vb = w.price.vb
 def px(x, y):
     sp = vb.mapViewToScene(QtCore.QPointF(x, y)); return w.glw.mapFromScene(sp)
 vp = w.glw.viewport()
-def drag(a, b):
-    QtTest.QTest.qWait(500)
-    QtTest.QTest.mousePress(vp, QtCore.Qt.MouseButton.LeftButton, pos=a)
-    for i in range(1, 11):
-        QtTest.QTest.mouseMove(vp, a + (b - a) * (i / 10)); app.processEvents()
-    QtTest.QTest.mouseRelease(vp, QtCore.Qt.MouseButton.LeftButton, pos=b)
+def _send(kind, p, buttons):
+    from PySide6 import QtGui
+    pf = QtCore.QPointF(p)
+    ev = QtGui.QMouseEvent(kind, pf, pf, vp.mapToGlobal(p).toPointF() if hasattr(vp.mapToGlobal(p), "toPointF") else pf,
+                           QtCore.Qt.MouseButton.LeftButton if kind != QtCore.QEvent.Type.MouseMove else QtCore.Qt.MouseButton.NoButton,
+                           buttons, QtCore.Qt.KeyboardModifier.NoModifier)
+    QtWidgets.QApplication.sendEvent(vp, ev)
     app.processEvents()
+
+def drag(a, b):
+    """A real press-move-release with the left button held on every move (QTest.mouseMove can drop it)."""
+    QtTest.QTest.qWait(500)
+    L_ = QtCore.Qt.MouseButton.LeftButton
+    _send(QtCore.QEvent.Type.MouseMove, a, QtCore.Qt.MouseButton.NoButton)
+    _send(QtCore.QEvent.Type.MouseButtonPress, a, L_)
+    for i in range(1, 11):
+        _send(QtCore.QEvent.Type.MouseMove, a + (b - a) * (i / 10), L_)
+    _send(QtCore.QEvent.Type.MouseButtonRelease, b, QtCore.Qt.MouseButton.NoButton)
 # drag the middle of the line -> whole line moves, view must NOT pan
 x0 = vb.viewRange()[0]
 mid = px(n - 55, 130.)

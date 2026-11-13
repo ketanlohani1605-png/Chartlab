@@ -40,7 +40,8 @@ INTERVALS = [("1m", "1m"), ("3m", "3m"), ("5m", "5m"), ("15m", "15m"), ("30m", "
              ("1d", "1D"), ("1wk", "1W"), ("1mo", "1M")]
 RANGES = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
 INDICATORS = {"sma20": "SMA 20", "sma50": "SMA 50", "sma200": "SMA 200", "ema20": "EMA 20", "ema50": "EMA 50",
-              "bb": "Bollinger Bands (20, 2)", "rsi": "RSI (14)  —  separate pane"}
+              "bb": "Bollinger Bands (20, 2)", "supertrend": "Supertrend (10, 3)", "vwap": "VWAP",
+              "rsi": "RSI (14)  —  separate pane"}
 LAYOUTS = {"1": "Single chart", "2h": "Two charts — side by side", "2v": "Two charts — stacked",
            "4": "Four charts"}
 LAYOUT_COUNT = {"1": 1, "2h": 2, "2v": 2, "4": 4}
@@ -83,6 +84,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("ChartLab")
         self.setUnifiedTitleAndToolBarOnMac(True)
         self.settings = settings or QtCore.QSettings("ChartLab", "ChartLab")
+        theme.check_icon_path()                       # tick image used by checkboxes in the style sheet
         from . import settings as _cs
         _cs.load(self.settings)
         self.layout_name = "1"
@@ -363,7 +365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.style_group = QtGui.QActionGroup(self)
         self.style_actions = {}
         for key in STYLES:
-            a = style_menu.addAction(icons.get("candles_icon"), STYLE_NAMES[key])
+            a = style_menu.addAction(icons.get("st_" + key), STYLE_NAMES[key])
             a.setCheckable(True)
             self.style_group.addAction(a)
             a.triggered.connect(lambda _=False, k=key: self._style_chosen(k))
@@ -371,17 +373,23 @@ class MainWindow(QtWidgets.QMainWindow):
             if key in ("heikin", "step"):
                 style_menu.addSeparator()
         self.style_actions["candles"].setChecked(True)
-        self._menu_button(tb, "", style_menu, icon="candles_icon", tip="Chart type")
+        self.style_btn = self._menu_button(tb, "", style_menu, icon="st_candles", tip="Chart type")
         vsep()
 
-        ind_menu = QtWidgets.QMenu(self)
+        self.ind_menu = QtWidgets.QMenu(self)                # (state holder; the button opens the dialog)
         self.ind_actions = {}
         for key, text in INDICATORS.items():
-            a = ind_menu.addAction(text)
+            a = self.ind_menu.addAction(text)
             a.setCheckable(True)
             a.toggled.connect(lambda on, k=key: self._indicator_toggled(k, on))
             self.ind_actions[key] = a
-        self.ind_btn = self._menu_button(tb, " Indicators", ind_menu, icon="fx", tip="Indicators  ( / )")
+        self.ind_btn = QtWidgets.QToolButton()
+        self.ind_btn.setIcon(icons.get("fx"))
+        self.ind_btn.setText(" Indicators")
+        self.ind_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.ind_btn.setToolTip("Indicators, metrics & strategies  ( / )")
+        self.ind_btn.clicked.connect(lambda: self.open_indicators())
+        tb.addWidget(self.ind_btn)
 
         layout_menu = QtWidgets.QMenu(self)
         self.layout_group = QtGui.QActionGroup(self)
@@ -400,7 +408,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alert_btn.setIcon(icons.get("bell"))
         self.alert_btn.setText(" Alert")
         self.alert_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.alert_btn.setToolTip("Create alert  (Alt+A)")
+        self.alert_btn.setToolTip(f"Create alert  ({theme.sc('Alt+A')})")
         self.alert_btn.clicked.connect(lambda: self.create_alert())
         tb.addWidget(self.alert_btn)
 
@@ -421,8 +429,8 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(fn)
             tb.addWidget(b)
             return b
-        tbtn("undo", "Undo  (Ctrl+Z)", lambda: self.active.chart.layer.undo())
-        tbtn("redo", "Redo  (Ctrl+Shift+Z)", lambda: self.active.chart.layer.redo())
+        tbtn("undo", f"Undo  ({theme.sc('Ctrl+Z')})", lambda: self.active.chart.layer.undo())
+        tbtn("redo", f"Redo  ({theme.sc('Ctrl+Shift+Z')})", lambda: self.active.chart.layer.redo())
 
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
@@ -461,9 +469,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_acct_dot()
         vsep()
 
-        tbtn("zoom", "Quick search  (Ctrl+K)", self.quick_search)
+        tbtn("zoom", f"Quick search  ({theme.sc('Ctrl+K')})", self.quick_search)
         tbtn("gear", "Settings", self.open_settings)
-        tbtn("fullscreen", "Full screen  (Shift+F)", self.toggle_fullscreen)
+        tbtn("fullscreen", f"Full screen  ({theme.sc('Shift+F')})", self.toggle_fullscreen)
         tbtn("camera", "Save chart image", self.save_chart_image)
         tb.addWidget(self._gap(6))
         self.load_btn = QtWidgets.QPushButton("Load", self)   # kept for state; loading happens on Enter / search
@@ -562,8 +570,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cur.triggered.connect(lambda: self._tool_clicked(None))
         self.draw_actions[None] = cur
         tb.addSeparator()
-        ICON = {"hray": "ray", "crossline": "cross", "ext": "trend", "arrow": "ray", "ellipse": "rect",
-                "pricerange": "measure", "daterange": "measure", "long": "measure", "short": "measure"}
+        ICON = {"hray": "ray", "crossline": "cross", "ext": "t_ext", "arrow": "t_arrow", "ellipse": "t_ellipse",
+                "pricerange": "t_pricerange", "daterange": "t_daterange", "long": "t_long", "short": "t_short"}
         SC = {"trend": "Alt+T", "hline": "Alt+H", "hray": "Alt+J", "vline": "Alt+V", "crossline": "Alt+C",
               "fib": "Alt+F", "rect": "Shift+Alt+R"}
         GROUPS = [("Trend lines", ["trend", "ray", "ext", "hray", "hline", "vline", "crossline"]),
@@ -586,7 +594,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             menu = QtWidgets.QMenu(self)
             for k in keys:
-                act = menu.addAction(icons.get(ICON.get(k, k)), TOOL_LABELS[k] + (f"\t{SC[k]}" if k in SC else ""))
+                act = menu.addAction(icons.get(ICON.get(k, k)), TOOL_LABELS[k] + (f"\t{theme.sc(SC[k])}" if k in SC else ""))
                 act.triggered.connect(lambda _=False, k=k, ga=ga: (ga.setIcon(icons.get(ICON.get(k, k))), ga.setData(k), self._tool_clicked(k)))
             ga.setMenu(menu)
             btn = tb.widgetForAction(ga)
@@ -628,7 +636,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for dock, ico, tip in ((self.watch_dock, "watchlist", "Watchlist"),
                                (self.alerts_dock, "bell", "Alerts"),
                                (self.strategy_dock, "code", "Python strategy editor"),
-                               (self.data_dock, "datawin", "Data window  (Alt+D)")):
+                               (self.data_dock, "datawin", f"Data window  ({theme.sc('Alt+D')})")):
             act = tb.addAction(icons.get(ico), "")
             act.setCheckable(True)
             act.setToolTip(tip)
@@ -637,7 +645,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addSeparator()
         res = self.results_dock.toggleViewAction()
         res.setIcon(icons.get("table"))
-        res.setToolTip("Backtest results")
+        res.setToolTip("Strategy Tester")
         tb.addAction(res)
 
     def toggle_right_panel(self, dock):
@@ -649,12 +657,17 @@ class MainWindow(QtWidgets.QMainWindow):
             d.setVisible(d is dock)
         for d, a in self.rail_actions.items():
             a.setChecked(d is dock)
+        if dock is getattr(self, "data_dock", None):          # open on the bar the legend shows, not "Hover a bar"
+            ch = self.active.chart
+            if ch.df is not None and ch._n():
+                self._update_data_window(self.active, min(getattr(ch, "_hdr_i", ch._n() - 1), ch._n() - 1))
 
     def _build_data_dock(self):
         self.data_lbl = QtWidgets.QLabel("Hover a bar")
         self.data_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         self.data_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self.data_lbl.setStyleSheet("padding:8px;")
+        self.data_lbl.setWordWrap(True)                      # lets the table span the whole panel width
+        self.data_lbl.setStyleSheet("padding:8px 12px; font-size:13px;")
         self.data_dock = QtWidgets.QDockWidget("Data window", self)
         self.data_dock.setObjectName("data_dock")
         self.data_dock.setWidget(self.data_lbl)
@@ -742,7 +755,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.editor = CodeEditor()
         self.editor.runRequested.connect(self.run_backtest)
         v.addWidget(self.editor, 1)
-        self.strat_status = QtWidgets.QLabel("Cmd+Enter to run  \u00b7  Cmd+/ comment  \u00b7  Tab / Shift+Tab indent")
+        suggest = "\u2303Space" if sys.platform == "darwin" else "Ctrl+Space"
+        dot = "  \u00b7  "
+        self.strat_status = QtWidgets.QLabel(
+            theme.sc("Ctrl+Return") + " run" + dot + theme.sc("Ctrl+/") + " comment" + dot + suggest
+            + " suggestions" + dot + "type ta. or df[\" to complete")
         self.strat_status.setWordWrap(True)
         self.strat_status.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.strat_status.setStyleSheet(f"color:{theme.MUTED}; font-size:12px; padding:2px 2px;")
@@ -777,6 +794,42 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_results_dock(self):
         self.tabs = QtWidgets.QTabWidget()
+        # Overview: TradingView's headline numbers + equity curve
+        ov = QtWidgets.QWidget()
+        ovl = QtWidgets.QVBoxLayout(ov)
+        ovl.setContentsMargins(12, 10, 12, 6)
+        ovl.setSpacing(8)
+        cards = QtWidgets.QHBoxLayout()
+        cards.setSpacing(28)
+        self.ov_cards = {}
+        for key, title in (("net", "Net Profit"), ("trades", "Total Closed Trades"), ("win", "Percent Profitable"),
+                           ("pf", "Profit Factor"), ("dd", "Max Drawdown"), ("avg", "Avg Trade"),
+                           ("bars", "Avg # Bars in Trades")):
+            lab = QtWidgets.QLabel("")
+            lab.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            lab._title = title
+            cards.addWidget(lab)
+            self.ov_cards[key] = lab
+        cards.addStretch(1)
+        ovl.addLayout(cards)
+        self.equity_axis = DateAxis("bottom")
+        self.equity_plot = pg.PlotWidget(axisItems={"bottom": self.equity_axis})
+        self.equity_plot.setBackground(theme.BG)
+        self.equity_plot.showGrid(x=False, y=True, alpha=0.15)
+        self.equity_plot.hideButtons()
+        self.equity_plot.setMenuEnabled(False)
+        self.equity_plot.showAxis("right")
+        self.equity_plot.hideAxis("left")
+        for a in ("right", "bottom"):
+            ax = self.equity_plot.getAxis(a)
+            ax.setTextPen(pg.mkPen("#b2b5be"))
+            ax.setPen(pg.mkPen("#2a2a2a"))
+        self.equity_plot.addLegend(offset=(10, 6), labelTextColor="#b2b5be", brush=pg.mkBrush(0, 0, 0, 0),
+                                   pen=pg.mkPen(None))
+        ovl.addWidget(self.equity_plot, 1)
+        self.tabs.addTab(ov, "Overview")
+        self._clear_overview()
+
         self.summary = QtWidgets.QTableWidget(0, 4)
         self.summary.horizontalHeader().setVisible(False)
         self.summary.verticalHeader().setVisible(False)
@@ -784,30 +837,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.summary.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.summary.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.summary.setShowGrid(False)
-        self.tabs.addTab(self.summary, "Summary")
+        self.tabs.addTab(self.summary, "Performance Summary")
 
-        cols = ["#", "Entry time", "Exit time", "Entry", "Exit", "Qty", "P&L", "P&L %", "Bars"]
+        cols = ["#", "Type", "Signal", "Entry time", "Exit time", "Entry", "Exit", "Qty", "P&L", "P&L %",
+                "Cum. P&L", "Bars"]
         self.trades_tbl = QtWidgets.QTableWidget(0, len(cols))
         self.trades_tbl.setHorizontalHeaderLabels(cols)
         self.trades_tbl.verticalHeader().setVisible(False)
-        self.trades_tbl.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.trades_tbl.verticalHeader().setDefaultSectionSize(30)
+        hh = self.trades_tbl.horizontalHeader()
+        hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for c in (0, 1, 2, 3, 4):
+            hh.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        AL = QtCore.Qt.AlignmentFlag
+        for c in range(len(cols)):                          # numbers right-aligned under right-aligned headings
+            self.trades_tbl.horizontalHeaderItem(c).setTextAlignment(
+                (AL.AlignRight if c >= 5 else AL.AlignLeft) | AL.AlignVCenter)
+        self.trades_tbl.setShowGrid(False)
         self.trades_tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.trades_tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.trades_tbl.setAlternatingRowColors(True)
         self.trades_tbl.cellClicked.connect(self._trade_clicked)
-        self.tabs.addTab(self.trades_tbl, "Trades")
-
-        self.equity_axis = DateAxis("bottom")
-        self.equity_plot = pg.PlotWidget(axisItems={"bottom": self.equity_axis})
-        self.equity_plot.showGrid(x=True, y=True, alpha=0.12)
-        self.equity_plot.addLegend(offset=(10, 10))
-        self.tabs.addTab(self.equity_plot, "Equity curve")
+        self.tabs.addTab(self.trades_tbl, "List of Trades")
 
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("print() output of your strategy and run messages appear here.")
         self.tabs.addTab(self.log_view, "Log")
 
-        self.results_dock = QtWidgets.QDockWidget("Backtest results", self)
+        self.results_dock = QtWidgets.QDockWidget("Strategy Tester", self)
         self.results_dock.setWidget(self.tabs)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
         # TradingView: one side panel at a time, chosen from the right icon rail; no tabs
@@ -861,7 +919,7 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addAction("Watchlist", lambda: self.show_right_panel(self.watch_dock))
         v.addAction("Alerts", lambda: self.show_right_panel(self.alerts_dock))
         v.addAction("Strategy editor", lambda: self.show_right_panel(self.strategy_dock))
-        v.addAction("Data window\tAlt+D", lambda: self.show_right_panel(self.data_dock))
+        v.addAction("Data window\t" + theme.sc("Alt+D"), lambda: self.show_right_panel(self.data_dock))
         v.addAction("Hide side panel", lambda: self.show_right_panel(None))
         v.addSeparator()
         v.addAction(self.results_dock.toggleViewAction())
@@ -905,8 +963,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     QtWidgets.QKeySequenceEdit)
 
     def eventFilter(self, obj, ev):
-        if ev.type() == QtCore.QEvent.Type.KeyPress and self._route_key(ev, obj):
+        t = ev.type()
+        if t == QtCore.QEvent.Type.KeyPress and self._route_key(ev, obj):
             return True
+        if t == QtCore.QEvent.Type.Polish and isinstance(obj, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+            le = obj.findChild(QtWidgets.QLineEdit)        # Qt drops a spin box's left padding when its arrow
+            if le is not None and le.textMargins().left() == 0:   # buttons are hidden: indent the text like
+                le.setTextMargins(7, 0, 0, 0)                     # every other input field
         return super().eventFilter(obj, ev)
 
     def _route_key(self, ev, target=None) -> bool:
@@ -933,7 +996,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(0, lambda t=("" if txt == "," else txt): self.open_interval_popup(t))
                 return True
             if txt == "/":
-                QtCore.QTimer.singleShot(0, self.ind_btn.showMenu)
+                QtCore.QTimer.singleShot(0, self.open_indicators)
                 return True
         if isinstance(fw, QtWidgets.QAbstractItemView):      # lists keep their own arrow / delete keys
             return False
@@ -958,43 +1021,64 @@ class MainWindow(QtWidgets.QMainWindow):
         ch = self.active.chart
         ch.set_scale_mode("regular" if ch.scale_mode == mode else mode)
 
-    def quick_search(self):
-        """Ctrl+K: 'Search tool or function' – a filterable list of actions."""
-        items = {"Settings": self.open_settings, "Go to date": self._goto_date, "Full screen": self.toggle_fullscreen,
-                 "Save chart image": self.save_chart_image, "Reset chart view": lambda: self.active.chart.go_latest(),
-                 "Create alert": lambda: self.create_alert(), "Data window": lambda: self.toggle_right_panel(self.data_dock), "Symbol search": self.open_symbol_search,
-                 "Change interval": lambda: self.open_interval_popup("")}
+    def quick_actions(self) -> list:
+        """Everything the app can do, for Cmd/Ctrl+K (title, category, shortcut, callable, checked)."""
+        ch = self.active.chart
+        A = []
+        add = lambda title, cat, fn, sc="", checked=False: A.append((title, cat, sc, fn, checked))  # noqa: E731
+        add("Symbol search", "Chart", self.open_symbol_search, "type a letter")
+        add("Change interval", "Chart", lambda: self.open_interval_popup(""), "type a number")
+        add("Go to date", "Chart", self._goto_date, "Alt+G")
+        add("Reset chart view", "Chart", lambda: ch.go_latest(), "Alt+R")
+        add("Invert scale", "Price scale", lambda: ch.price.vb.invertY(not ch.price.vb.state["yInverted"]), "Alt+I",
+            bool(ch.price.vb.state["yInverted"]))
+        add("Logarithmic scale", "Price scale", lambda: self._toggle_scale("log"), "Alt+L", ch.scale_mode == "log")
+        add("Percent scale", "Price scale", lambda: self._toggle_scale("percent"), "Alt+P", ch.scale_mode == "percent")
+        add("Regular scale", "Price scale", lambda: ch.set_scale_mode("regular"), "", ch.scale_mode == "regular")
+        add("Settings", "Chart", self.open_settings, "Ctrl+,")
+        add("Save chart image", "Chart", self.save_chart_image)
+        add("Full screen", "View", self.toggle_fullscreen, "Shift+F")
+        add("Create alert", "Alerts", lambda: self.create_alert(), "Alt+A")
+        add("Bar replay", "Replay", self.toggle_replay, "", bool(ch.replay["active"]))
+        for key in STYLES:
+            add(STYLE_NAMES[key], "Chart type", lambda k=key: self._style_chosen(k), "", ch.style == key)
+        cur = self._current_interval()
+        for val, text in INTERVALS:
+            add(f"Interval {text}", "Interval", lambda v=val: self.interval_btns[v].click(), "", val == cur)
+        for key, text in INDICATORS.items():
+            on = key in ch._enabled
+            add(text, "Indicator", lambda k=key, o=on: self.ind_actions[k].setChecked(not o), "", on)
+        for key, text in LAYOUTS.items():
+            add(text, "Layout", lambda k=key: self.set_layout(k), "", self.layout_name == key)
+        sc = {"trend": "Alt+T", "hline": "Alt+H", "hray": "Alt+J", "vline": "Alt+V", "crossline": "Alt+C",
+              "fib": "Alt+F", "rect": "Shift+Alt+R"}
+        for key, text in TOOL_LABELS.items():
+            add(text, "Drawing tool", lambda k=key: self._tool_clicked(k), sc.get(key, ""))
+        add("Remove all drawings", "Drawing tool", lambda: ch.layer.clear())
+        add("Hide / show drawings", "Drawing tool", lambda: ch.layer.set_hidden(not ch.layer.hidden), "Ctrl+Alt+H")
+        for dock, text in ((self.watch_dock, "Watchlist"), (self.alerts_dock, "Alerts panel"),
+                           (self.strategy_dock, "Strategy editor"), (self.data_dock, "Data window")):
+            add(text, "Panel", lambda d=dock: self.show_right_panel(d), "Alt+D" if dock is self.data_dock else "",
+                dock.isVisible())
+        add("Strategy Tester", "Panel", lambda: self.results_dock.setVisible(not self.results_dock.isVisible()), "",
+            self.results_dock.isVisible())
+        add("Run strategy / backtest", "Strategy", self.run_backtest, "Cmd+Enter")
+        add("Remove strategy from chart", "Strategy", self.remove_strategy)
+        add("Backtest settings", "Strategy", self.show_bt_settings)
+        add("Open strategy file", "Strategy", self.open_strategy)
+        add("Save strategy file", "Strategy", self.save_strategy, "Cmd+S")
+        add("Manage broker accounts", "Accounts", self.manage_accounts)
+        add("Run script on multiple accounts", "Accounts", self.run_on_accounts)
+        add("Open data file", "Data", self.open_data_file, "Cmd+O")
         for lbl, fn in getattr(self, "_extra_actions", {}).items():
-            items[lbl] = fn
-        d = QtWidgets.QDialog(self)
-        d.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
-        d.resize(520, 360)
-        d.setStyleSheet("QDialog{background:#1e222d;border:1px solid #434651;border-radius:8px;} QLineEdit{background:#131722;border:1px solid #434651;border-radius:6px;padding:8px;font-size:14px;} QListWidget{background:transparent;border:0;} QListWidget::item{padding:8px;} QListWidget::item:selected{background:#2a2e39;}")
-        lay = QtWidgets.QVBoxLayout(d)
-        e = QtWidgets.QLineEdit()
-        e.setPlaceholderText("Search tool or function")
-        lst = QtWidgets.QListWidget()
-        lay.addWidget(e)
-        lay.addWidget(lst)
+            add(lbl, "Other", fn)
+        return A
 
-        def fill(t=""):
-            lst.clear()
-            for k in items:
-                if t.lower() in k.lower():
-                    lst.addItem(k)
-            if lst.count():
-                lst.setCurrentRow(0)
-
-        def go(*_):
-            it = lst.currentItem()
-            if it:
-                d.accept()
-                items[it.text()]()
-        e.textChanged.connect(fill)
-        e.returnPressed.connect(go)
-        lst.itemActivated.connect(go)
-        fill()
-        d.exec()
+    def quick_search(self):
+        """Ctrl+K: 'Search tool or function' over every action in the app."""
+        from .tvui import QuickSearch
+        QuickSearch(self, self.quick_actions()).exec()
+        self.focus_chart()
 
     def toggle_fullscreen(self):
         self.setWindowState(self.windowState() ^ QtCore.Qt.WindowState.WindowFullScreen)
@@ -1016,6 +1100,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.replay_btn.setChecked(ch.replay["active"])
 
     def _escape(self):
+        pop = QtWidgets.QApplication.activePopupWidget()     # Esc first closes an open menu / autocomplete list
+        if pop is not None:
+            pop.close()
+            return
         if self.active.chart.replay["active"]:
             self.active.chart.replay_exit()
             self.replay_btn.setChecked(False)
@@ -1181,6 +1269,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for k, a in self.ind_actions.items():
                 a.setChecked(k in p.chart._enabled)
             self.style_actions[p.chart.style].setChecked(True)
+            self.style_btn.setIcon(icons.get("st_" + p.chart.style))
             self.magnet_action.setChecked(p.chart.magnet)
             tool = p.chart.layer.tool
             act = self.draw_actions.get(tool, self.draw_actions[None])
@@ -1342,11 +1431,55 @@ class MainWindow(QtWidgets.QMainWindow):
             if path:
                 self.load_into(self.active, "file", self.active.params.get("symbol", ""), val, "max", path)
 
+    # what the Indicators dialog shows: (title, category, extra search words)
+    IND_INFO = {"sma20": ("Moving Average Simple (20)", "Moving averages", "sma ma 20"),
+                "sma50": ("Moving Average Simple (50)", "Moving averages", "sma ma 50"),
+                "sma200": ("Moving Average Simple (200)", "Moving averages", "sma ma 200"),
+                "ema20": ("Moving Average Exponential (20)", "Moving averages", "ema ma 20"),
+                "ema50": ("Moving Average Exponential (50)", "Moving averages", "ema ma 50"),
+                "bb": ("Bollinger Bands (20, 2)", "Volatility", "bb bands bollinger"),
+                "supertrend": ("Supertrend (10, 3)", "Trend", "super trend atr"),
+                "vwap": ("VWAP \u2014 Volume Weighted Average Price", "Volume", "vwap volume"),
+                "rsi": ("Relative Strength Index (14)", "Oscillators", "rsi oscillator momentum")}
+
+    def open_indicators(self, text: str = ""):
+        """TradingView's Indicators dialog ( / ): click to add or remove, strategies load into the editor and run."""
+        from .tvui import IndicatorsDialog
+        items = []
+        for key, (title, cat, extra) in self.IND_INFO.items():
+            if key in self.ind_actions:
+                items.append({"key": key, "title": title, "category": cat, "kind": "indicator",
+                              "on": self.ind_actions[key].isChecked(), "search": f"{extra} {INDICATORS.get(key, '')}"})
+        sdir = datamod.ROOT / "strategies"
+        for f in sorted(sdir.glob("*.py")) if sdir.exists() else []:
+            words = [w.upper() if w in ("rsi", "sma", "ema", "macd", "vwap", "atr", "bb", "orb") else w
+                     for w in f.stem.lower().split("_")]
+            items.append({"key": "strategy:" + str(f), "title": " ".join(words)[:1].upper() + " ".join(words)[1:],
+                          "category": "Strategies (Python)", "kind": "strategy", "on": False,
+                          "search": "strategy backtest python"})
+
+        def toggle(key):
+            a = self.ind_actions[key]
+            a.setChecked(not a.isChecked())
+            return a.isChecked()
+
+        def run(key):
+            self.set_strategy_code(Path(key.split(":", 1)[1]).read_text())
+            self.show_right_panel(self.strategy_dock)
+            self.run_backtest()
+
+        IndicatorsDialog(self, items, toggle, run, text).exec()
+        self.focus_chart()
+
     def _indicator_toggled(self, key, on):
         if not self._syncing:
             self.active.chart.set_indicator(key, on)
 
     def _style_chosen(self, key):
+        if hasattr(self, "style_btn"):
+            self.style_btn.setIcon(icons.get("st_" + key))
+        if key in self.style_actions:
+            self.style_actions[key].setChecked(True)
         if not self._syncing:
             self.active.chart.set_style(key)
 
@@ -1568,7 +1701,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel is self.active:
             self._show_result(panel)
             self.results_dock.show()
-            self.tabs.setCurrentWidget(self.summary)
+            self.tabs.setCurrentIndex(0)
         m = res.metrics
         self.statusBar().showMessage(f"Script done: {m['trades']} trades, net {m['total_return'] * 100:+.2f}%")
 
@@ -1579,46 +1712,82 @@ class MainWindow(QtWidgets.QMainWindow):
         return cfg
 
     def show_bt_settings(self):
+        """TradingView-style strategy 'Properties': capital, order size, costs, risk exits."""
         cur = bt.Config(**getattr(self, "bt_extra", {}))
         d = QtWidgets.QDialog(self)
-        d.setWindowTitle("Backtest settings")
-        f = QtWidgets.QFormLayout(d)
-        direction = QtWidgets.QComboBox()
-        direction.addItems(["long", "short", "both"])
-        direction.setCurrentText(cur.direction)
-        fill = QtWidgets.QComboBox()
-        fill.addItems(["next_open", "close"])
-        fill.setCurrentText(cur.fill)
+        d.setWindowTitle("Strategy properties")
+        d.setMinimumWidth(500)
+        v = QtWidgets.QVBoxLayout(d)
+        v.setContentsMargins(22, 18, 22, 16)
+        v.setSpacing(10)
+        t = QtWidgets.QLabel("<span style='font-size:17px;font-weight:600;color:#fff'>Strategy properties</span>")
+        v.addWidget(t)
+        f = QtWidgets.QFormLayout()
+        f.setHorizontalSpacing(18)
+        f.setVerticalSpacing(9)
+        f.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
 
-        def spin(v, hi=1000.0, dec=2):
+        def combo(items, current):
+            c = QtWidgets.QComboBox()
+            for text, data in items:
+                c.addItem(text, data)
+            c.setCurrentIndex(max(0, c.findData(current)))
+            return c
+
+        def spin(val, hi=1000.0, dec=2, suffix=""):
             w = QtWidgets.QDoubleSpinBox()
             w.setRange(0, hi)
             w.setDecimals(dec)
-            w.setValue(v)
+            w.setValue(val)
+            w.setSuffix(suffix)
             return w
-        size, slip = spin(cur.size_pct, 1000), spin(cur.slippage_pct, 10, 3)
-        sl, tp, tr = spin(cur.sl_pct, 100), spin(cur.tp_pct, 1000), spin(cur.trail_pct, 100)
+
+        def head(text):
+            h = QtWidgets.QLabel(text.upper())
+            h.setStyleSheet(f"color:{theme.MUTED};font-size:11px;font-weight:600;padding-top:8px;")
+            f.addRow(h)
+        direction = combo([("Long only", "long"), ("Short only", "short"), ("Long and short", "both")], cur.direction)
+        fill = combo([("Next bar's open", "next_open"), ("This bar's close", "close")], cur.fill)
+        capital = spin(self.capital.value(), 1e10, 0)
+        fee = spin(self.fee.value(), 5, 3, " %")
+        size, slip = spin(cur.size_pct, 1000, 2, " %"), spin(cur.slippage_pct, 10, 3, " %")
+        sl, tp, tr = spin(cur.sl_pct, 100, 2, " %"), spin(cur.tp_pct, 1000, 2, " %"), spin(cur.trail_pct, 100, 2, " %")
         sq = QtWidgets.QLineEdit(cur.square_off)
-        sq.setPlaceholderText("HH:MM, e.g. 15:15 (empty = off)")
+        sq.setPlaceholderText("HH:MM, e.g. 15:15  (empty = off)")
+        head("Orders")
+        f.addRow("Initial capital", capital)
+        f.addRow("Order size (% of equity)", size)
         f.addRow("Direction", direction)
-        f.addRow("Fill price", fill)
-        f.addRow("Position size (% of equity)", size)
-        f.addRow("Slippage % per fill", slip)
-        f.addRow("Stop loss % (0 = off)", sl)
-        f.addRow("Take profit % (0 = off)", tp)
-        f.addRow("Trailing stop % (0 = off)", tr)
-        f.addRow("Square-off time", sq)
-        note = QtWidgets.QLabel("Signals fill at the next bar's open (or this bar's close). If a stop and a target are both "
-                                "inside one candle the stop is assumed first. Gaps fill at the open.")
+        f.addRow("Fill at", fill)
+        head("Costs")
+        f.addRow("Commission per side", fee)
+        f.addRow("Slippage per fill", slip)
+        head("Exits  (0 = off)")
+        f.addRow("Stop loss", sl)
+        f.addRow("Take profit", tp)
+        f.addRow("Trailing stop", tr)
+        f.addRow("Intraday square-off", sq)
+        v.addLayout(f)
+        note = QtWidgets.QLabel("If a stop and a target are both inside one candle, the stop is assumed first. "
+                                "Gaps fill at the open.")
         note.setWordWrap(True)
-        f.addRow(note)
-        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
-                                        QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(d.accept)
-        bb.rejected.connect(d.reject)
-        f.addRow(bb)
+        note.setStyleSheet(f"color:{theme.MUTED};font-size:12px;")
+        v.addWidget(note)
+        foot = QtWidgets.QHBoxLayout()
+        foot.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(d.reject)
+        ok = QtWidgets.QPushButton("Ok")
+        ok.setObjectName("primary")
+        ok.setDefault(True)
+        ok.clicked.connect(d.accept)
+        foot.addWidget(cancel)
+        foot.addWidget(ok)
+        v.addLayout(foot)
         if d.exec():
-            self.bt_extra = dict(direction=direction.currentText(), fill=fill.currentText(), size_pct=size.value(),
+            self.capital.setValue(capital.value())
+            self.fee.setValue(fee.value())
+            self.bt_extra = dict(direction=direction.currentData(), fill=fill.currentData(), size_pct=size.value(),
                                  slippage_pct=slip.value(), sl_pct=sl.value(), tp_pct=tp.value(),
                                  trail_pct=tr.value(), square_off=sq.text().strip())
             self.run_backtest()
@@ -1685,7 +1854,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel is self.active:
             self._show_result(panel)
             self.results_dock.show()
-            self.tabs.setCurrentWidget(self.summary)
+            self.tabs.setCurrentIndex(0)
         mt = res.metrics
         self._strat_say(f"\u2713 {mt['trades']} trades \u00b7 net {mt['total_return'] * 100:+.2f}% \u00b7 "
                         f"max DD {mt['max_drawdown'] * 100:.2f}% \u00b7 {dt * 1000:.0f} ms", True)
@@ -1731,7 +1900,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel is self.active:
             self._show_result(panel)
             self.results_dock.show()
-            self.tabs.setCurrentWidget(self.summary)
+            self.tabs.setCurrentIndex(0)
         m = res.metrics
         self.statusBar().showMessage(
             f"Backtest ({panel.params['symbol']}): {m['trades']} trades, net {m['total_return'] * 100:+.2f}% "
@@ -1744,6 +1913,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.summary.setRowCount(0)
             self.trades_tbl.setRowCount(0)
             self.equity_plot.clear()
+            self._clear_overview()
             return
         self._fill_summary(res)
         self._fill_trades(res.trades, panel)
@@ -1763,26 +1933,71 @@ class MainWindow(QtWidgets.QMainWindow):
             self.summary.setItem(r, c, ki)
             self.summary.setItem(r, c + 1, vi)
 
+    _SIGNAL = {"signal": "Signal", "sl": "Stop loss", "tp": "Take profit", "trail": "Trailing stop",
+               "square_off": "Square-off"}
+
     def _fill_trades(self, trades, panel):
         intraday = panel.chart.axes[0].intraday
         tf = "%d %b %y %H:%M" if intraday else "%d %b %Y"
+        AL = QtCore.Qt.AlignmentFlag
         self.trades_tbl.setRowCount(len(trades))
+        cum = 0.0
         for r, t in enumerate(trades.itertuples(index=False)):
-            vals = [str(r + 1), f"{t.entry_time:{tf}}", f"{t.exit_time:{tf}}" + (" (open)" if t.open else ""),
+            cum += float(t.pnl)
+            side = str(getattr(t, "side", "long") or "long")
+            reason = "Open" if t.open else self._SIGNAL.get(str(getattr(t, "reason", "") or ""), str(getattr(t, "reason", "")))
+            vals = [str(r + 1), side.capitalize(), reason, f"{t.entry_time:{tf}}", f"{t.exit_time:{tf}}",
                     f"{t.entry_price:,.2f}", f"{t.exit_price:,.2f}", f"{t.qty:,.2f}",
-                    f"{t.pnl:+,.2f}", f"{t.pnl_pct * 100:+.2f}%", str(t.bars)]
+                    f"{t.pnl:+,.2f}", f"{t.pnl_pct * 100:+.2f}%", f"{cum:+,.2f}", str(t.bars)]
             for c, text in enumerate(vals):
                 item = QtWidgets.QTableWidgetItem(text)
-                if c in (6, 7):
+                item.setTextAlignment((AL.AlignRight if c >= 5 else AL.AlignLeft) | AL.AlignVCenter)
+                if c in (8, 9):
                     item.setForeground(QtGui.QColor(theme.UP if t.pnl >= 0 else theme.DOWN))
+                elif c == 10:
+                    item.setForeground(QtGui.QColor(theme.UP if cum >= 0 else theme.DOWN))
+                elif c == 1:
+                    item.setForeground(QtGui.QColor(theme.UP if side == "long" else theme.DOWN))
+                elif c == 2 and t.open:
+                    item.setForeground(QtGui.QColor("#ff9800"))
                 self.trades_tbl.setItem(r, c, item)
+
+    def _clear_overview(self):
+        for lab in self.ov_cards.values():
+            lab.setText(f"<span style='color:{theme.MUTED};font-size:12px'>{lab._title}</span><br>"
+                        f"<span style='color:#5d606b;font-size:17px'>\u2014</span>")
+
+    def _fill_overview(self, res):
+        mt = res.metrics
+        fm = dict(bt.format_metrics(mt))
+
+        def card(key, value, sub="", color="#dbdbdb"):
+            lab = self.ov_cards[key]
+            lab.setText(f"<span style='color:{theme.MUTED};font-size:12px'>{lab._title}</span><br>"
+                        f"<span style='color:{color};font-size:17px;font-weight:600'>{value}</span>"
+                        + (f"&nbsp;<span style='color:{color};font-size:12px'>{sub}</span>" if sub else ""))
+        net = mt.get("net_profit", 0.0)
+        ncol = theme.UP if net >= 0 else theme.DOWN
+        card("net", f"{net:+,.2f}", f"{mt.get('total_return', 0) * 100:+.2f}%", ncol)
+        card("trades", f"{int(mt.get('trades', 0))}")
+        card("win", fm.get("Win rate", "\u2014"))
+        pf = mt.get("profit_factor", float("nan"))
+        card("pf", fm.get("Profit factor", "\u2014"), color=(theme.UP if pf == pf and pf >= 1 else theme.DOWN))
+        card("dd", fm.get("Max drawdown", "\u2014"), color=theme.DOWN)
+        avg = mt.get("avg_trade", 0.0)
+        card("avg", fm.get("Avg trade", "\u2014"), color=theme.UP if avg >= 0 else theme.DOWN)
+        card("bars", fm.get("Avg bars in trade", "\u2014"))
 
     def _fill_equity(self, res, panel):
         self.equity_axis.set_index(panel.df.index)
         self.equity_plot.clear()
         x = np.arange(len(res.equity))
-        self.equity_plot.plot(x, res.buy_hold.to_numpy(), pen=pg.mkPen(theme.MUTED, width=1.2), name="Buy & hold")
-        self.equity_plot.plot(x, res.equity.to_numpy(), pen=pg.mkPen(theme.ACCENT, width=2), name="Strategy")
+        eq = res.equity.to_numpy(float)
+        base = float(eq[0]) if len(eq) else 0.0
+        self.equity_plot.plot(x, res.buy_hold.to_numpy(), pen=pg.mkPen("#5d606b", width=1.2), name="Buy & hold")
+        self.equity_plot.plot(x, eq, pen=pg.mkPen("#089981", width=1.8), fillLevel=base,
+                              brush=pg.mkBrush(8, 153, 129, 40), name="Strategy equity")
+        self._fill_overview(res)
 
     def _trade_clicked(self, row, _col):
         res = self.active.result
@@ -1819,6 +2034,7 @@ def main():
     _ic = datamod.ROOT / "assets" / "logo.png"
     if _ic.exists():
         app.setWindowIcon(QtGui.QIcon(str(_ic)))
+    theme.check_icon_path()                       # tick / chevron images the style sheet points at
     app.setStyleSheet(theme.STYLESHEET)
     win = MainWindow()
     geo = app.primaryScreen().availableGeometry()
@@ -1843,4 +2059,33 @@ def main():
     QtCore.QTimer.singleShot(300, win.on_load)
     if win.source.currentData() == "yahoo":
         QtCore.QTimer.singleShot(2500, win.watchlist.refresh)
-    sys.exit(app.exec())
+    rc = app.exec()
+    quit_cleanly(win, rc)
+
+
+def quit_cleanly(win, rc: int = 0, exit_process: bool = True):
+    """Leave without a macOS 'ChartLab quit unexpectedly' report.
+
+    Qt aborts the whole process when a QThread object is destroyed while its thread still runs - which is
+    exactly what happens if you quit while a price / quote fetch is in flight. So: give running fetches a
+    moment to finish, flush settings + log to disk, then end the process without tearing those objects down."""
+    import os
+    import time
+    try:
+        threads = [t for t in win.findChildren(QtCore.QThread) if t.isRunning()]
+        end = time.monotonic() + 1.2
+        for t in threads:
+            t.requestInterruption()
+        for t in threads:
+            t.wait(max(0, int((end - time.monotonic()) * 1000)))
+        win.settings.sync()
+    except Exception:  # noqa: BLE001 - never block quitting
+        logging.exception("shutdown")
+    logging.shutdown()
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    if exit_process:
+        os._exit(rc)

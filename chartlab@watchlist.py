@@ -74,24 +74,46 @@ class QuoteWorker(QtCore.QThread):
     def run(self):
         try:
             import yfinance as yf
-            out, extra = {}, {}
-            for sym in self.symbols:
-                try:
-                    h = yf.Ticker(datamod.normalize_symbol(sym)).history(period="5d", interval="1d", auto_adjust=False)
-                except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
-                    continue
-                h = h.dropna(subset=["Close"])
-                if h.empty:
-                    continue
-                last = float(h["Close"].iloc[-1])
-                prev = float(h["Close"].iloc[-2]) if len(h) >= 2 else last
-                out[sym] = (last, last / prev - 1 if prev else 0.0)
-                extra[sym] = {"high": float(h["High"].iloc[-1]), "low": float(h["Low"].iloc[-1]),
-                              "open": float(h["Open"].iloc[-1]), "prev": prev,
-                              "volume": float(h["Volume"].iloc[-1]), "time": time.strftime("%H:%M")}
-            self.done.emit(out, extra)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(f"{type(e).__name__}: {e}")
+            return
+        out, extra = {}, {}
+        ysyms = {s: datamod.normalize_symbol(s) for s in self.symbols}
+
+        def take(sym, h):
+            h = h.dropna(subset=["Close"]) if h is not None and len(h) else None
+            if h is None or h.empty:
+                return
+            last = float(h["Close"].iloc[-1])
+            prev = float(h["Close"].iloc[-2]) if len(h) >= 2 else last
+            out[sym] = (last, last / prev - 1 if prev else 0.0)
+            extra[sym] = {"high": float(h["High"].iloc[-1]), "low": float(h["Low"].iloc[-1]),
+                          "open": float(h["Open"].iloc[-1]), "prev": prev,
+                          "volume": float(h["Volume"].iloc[-1]), "time": time.strftime("%H:%M")}
+        try:                                            # one request for the whole list (fast)
+            data = yf.download(list(dict.fromkeys(ysyms.values())), period="5d", interval="1d", group_by="ticker",
+                               auto_adjust=False, progress=False, threads=True)
+            for sym, ys in ysyms.items():
+                try:
+                    h = data[ys] if len(set(ysyms.values())) > 1 else data
+                    if hasattr(h.columns, "levels"):
+                        h = h.droplevel(0, axis=1) if h.columns.nlevels > 1 else h
+                    take(sym, h)
+                except Exception:  # noqa: BLE001 - symbol missing from the batch: try it alone below
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        for sym, ys in ysyms.items():                   # anything the batch missed, one by one
+            if sym in out:
+                continue
+            try:
+                take(sym, yf.Ticker(ys).history(period="5d", interval="1d", auto_adjust=False))
+            except Exception:  # noqa: BLE001
+                continue
+        if out or not self.symbols:
+            self.done.emit(out, extra)
+        else:
+            self.failed.emit("no prices returned (offline?)")
 
 
 class QuoteDelegate(QtWidgets.QStyledItemDelegate):
@@ -185,7 +207,7 @@ class RangeBar(QtWidgets.QWidget):
         p.drawText(QtCore.QRect(0, 26, w, 16), QtCore.Qt.AlignmentFlag.AlignRight, f"{self.hi:,.2f}")
         y = 19
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(QtGui.QColor("#2a2e39"))
+        p.setBrush(QtGui.QColor("#2a2a2a"))
         p.drawRoundedRect(QtCore.QRectF(0, y, w, 3), 1.5, 1.5)
         span = (self.hi - self.lo) or 1.0
         x = (min(max(self.cur, self.lo), self.hi) - self.lo) / span * w
@@ -459,7 +481,7 @@ class WatchlistWidget(QtWidgets.QWidget):
         if it and not it.data(ROLE_SECTION):
             sym = it.data(ROLE_SYM)
             m.addAction(f"Open {sym}", lambda: self.symbolChosen.emit(sym))
-            m.addAction(f"Remove {sym}\tDel", lambda: self.remove(sym))
+            m.addAction(f"Remove {sym}\t{theme.sc('Del')}", lambda: self.remove(sym))
             m.addSeparator()
         m.addAction("Add symbol…", self.addRequested.emit)
         m.addAction("Refresh prices", self.refresh)

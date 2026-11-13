@@ -28,7 +28,9 @@ ch.replay_step(3); assert ch._limit == k0 + 3
 assert ch.candles.limit == ch._limit and ch.volbars.limit == ch._limit
 # strategies see only revealed bars
 w.editor.setPlainText("def strategy(df):\n    print('LEN', len(df))\n    return {'buy': df['Close'] > 0, 'sell': df['Close'] < 0}")
-w.run_backtest(); app.processEvents()
+w.run_backtest()
+t_ = time.time()
+while not w.run2_btn.isEnabled() and time.time() - t_ < 10: app.processEvents(); time.sleep(0.01)
 assert f"LEN {ch._limit}" in w.log_view.toPlainText(), w.log_view.toPlainText()[-200:]
 # play advances on a timer, then pause
 ch.replay_set_speed(10.0); ch.replay_play(); t0 = time.time()

@@ -113,7 +113,10 @@ def instrument(symbol: str, exchange: str = "NSE") -> dict:
 def _options_table() -> pd.DataFrame:
     fresh = _OPT.exists() and date.fromtimestamp(_OPT.stat().st_mtime) == date.today()
     if fresh:
-        return pd.read_pickle(_OPT)
+        try:
+            return pd.read_pickle(_OPT)
+        except Exception:  # noqa: BLE001 - unreadable cache: rebuild it below
+            pass
     m = _master()
     c = {x.upper(): x for x in m.columns}
     need = ["INSTRUMENT", "UNDERLYING_SYMBOL", "SECURITY_ID", "LOT_SIZE", "SM_EXPIRY_DATE", "STRIKE_PRICE", "OPTION_TYPE"]
@@ -125,7 +128,9 @@ def _options_table() -> pd.DataFrame:
     t["expiry"] = pd.to_datetime(t["expiry"], errors="coerce").dt.date
     t["und"] = t["und"].astype(str).str.upper()
     _OPT.parent.mkdir(parents=True, exist_ok=True)
-    t.to_pickle(_OPT)
+    tmp = _OPT.with_suffix(".part")
+    t.to_pickle(tmp)
+    os.replace(tmp, _OPT)
     return t
 
 
