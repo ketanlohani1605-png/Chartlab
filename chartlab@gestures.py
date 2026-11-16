@@ -180,6 +180,10 @@ class TVViewBox(pg.ViewBox):
         if ev.isStart():
             self._stop_anim()
             self._vel, self._last_t = 0.0, time.monotonic()
+        if self.is_price and axis is None and self.chart.layer.tool == "brush":
+            pos = self.mapSceneToView(ev.buttonDownScenePos() if ev.isStart() else ev.scenePos())
+            self.chart.layer.brush_stroke(pos.x(), pos.y(), ev.isStart(), ev.isFinish())
+            return
         if self.is_price and axis is None:
             layer = self.chart.layer
             if ev.isStart():

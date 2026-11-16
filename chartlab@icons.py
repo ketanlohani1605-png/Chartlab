@@ -404,6 +404,28 @@ def t_arrow(p, r, c):
     p.drawPolyline([QtCore.QPointF(11, 6), QtCore.QPointF(18, 6), QtCore.QPointF(18, 13)])
 
 
+def t_channel(p, r, c):
+    p.drawLine(QtCore.QPointF(4, 14), QtCore.QPointF(20, 6))
+    p.drawLine(QtCore.QPointF(4, 19), QtCore.QPointF(20, 11))
+    for x, y in ((4, 14), (20, 6), (4, 19)):
+        p.drawEllipse(QtCore.QPointF(x, y), 1.6, 1.6)
+
+
+def t_brush(p, r, c):
+    path = QtGui.QPainterPath(QtCore.QPointF(4, 17))
+    path.cubicTo(QtCore.QPointF(8, 6), QtCore.QPointF(12, 22), QtCore.QPointF(15, 11))
+    path.cubicTo(QtCore.QPointF(16, 8), QtCore.QPointF(18, 7), QtCore.QPointF(20, 6))
+    p.drawPath(path)
+
+
+def t_stay(p, r, c):
+    p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(5, 19), QtCore.QPointF(6, 15), QtCore.QPointF(15, 6),
+                                   QtCore.QPointF(18, 9), QtCore.QPointF(9, 18)]))
+    p.drawLine(QtCore.QPointF(13, 8), QtCore.QPointF(16, 11))
+    p.drawRoundedRect(QtCore.QRectF(14, 15, 6, 4.5), 1, 1)
+    p.drawArc(QtCore.QRectF(15.2, 12.2, 3.6, 5), 0, 180 * 16)
+
+
 def t_ellipse(p, r, c):
     p.drawEllipse(QtCore.QRectF(4, 7, 16, 11))
 
@@ -445,7 +467,7 @@ _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
     "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin", "chain", "st_bars", "st_candles", "st_hollow", "st_heikin", "st_line",
     "st_linemark", "st_step", "st_area", "st_baseline", "t_ext", "t_arrow", "t_ellipse", "t_long", "t_short",
-    "t_pricerange", "t_daterange")}
+    "t_pricerange", "t_daterange", "t_channel", "t_brush", "t_stay")}
 
 
 def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:

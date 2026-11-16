@@ -14,16 +14,23 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import theme
 
 TOOLS = {"trend": 2, "ray": 2, "hline": 1, "vline": 1, "rect": 2, "fib": 2, "measure": 2, "text": 1, "hray": 1, "crossline": 1,
-         "ext": 2, "arrow": 2, "ellipse": 2, "pricerange": 2, "daterange": 2, "long": 2, "short": 2}
+         "ext": 2, "arrow": 2, "ellipse": 2, "pricerange": 2, "daterange": 2, "long": 2, "short": 2,
+         "channel": 3, "brush": 2}
 TOOL_LABELS = {"trend": "Trend line", "ray": "Ray", "hline": "Horizontal line",
                "vline": "Vertical line", "rect": "Rectangle", "fib": "Fib retracement",
                "measure": "Measure (price / % / bars)", "text": "Text note",
                "hray": "Horizontal ray", "crossline": "Cross line", "ext": "Extended line",
                "arrow": "Arrow", "ellipse": "Ellipse", "pricerange": "Price range", "daterange": "Date range",
-               "long": "Long position", "short": "Short position"}
+               "long": "Long position", "short": "Short position",
+               "channel": "Parallel channel", "brush": "Brush"}
 FIB_LEVELS = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
 FIB_COLORS = ["#787b86", "#f23645", "#ff9800", "#4caf50", "#089981", "#00bcd4", "#787b86"]
 DEFAULT_COLOR = "#2962ff"
+DEFAULT_WIDTH = 1.6
+STYLES = {"solid": QtCore.Qt.PenStyle.SolidLine, "dash": QtCore.Qt.PenStyle.DashLine, "dot": QtCore.Qt.PenStyle.DotLine}
+ANGLE_TOOLS = ("trend", "ray", "ext", "arrow")           # Shift while drawing: horizontal / vertical / 45 degrees
+EXTRA_KEYS = ("text", "w", "ls", "lock")                 # optional per-drawing properties that are saved
+_CLIP: dict = {}                                         # last copied drawing (Cmd+C), shared by all panes
 HIT_PIXELS = 9
 
 
@@ -96,6 +103,7 @@ class DrawingLayer(QtCore.QObject):
             for it in items:
                 it.setVisible(not on)
         self.place_tags()
+        self.chart.selection_changed()
 
     def begin_drag(self, x: float, y: float) -> bool:
         if self.tool or self.locked or not self.chart.has_data():
@@ -104,7 +112,7 @@ class DrawingLayer(QtCore.QObject):
         click = vb.mapViewToScene(QtCore.QPointF(x, y))
         if self.selected is not None:                      # grab a handle of the selected drawing
             d = next((d for d in self.drawings if d["id"] == self.selected), None)
-            if d and d["type"] not in ("hline", "vline", "text"):
+            if d and d["type"] not in ("hline", "vline", "text", "brush") and not d.get("lock"):
                 for i, (hx, hy) in enumerate(self._xy(d)):
                     ps = vb.mapViewToScene(QtCore.QPointF(hx, hy))
                     if math.hypot(ps.x() - click.x(), ps.y() - click.y()) <= HIT_PIXELS + 2:
@@ -116,7 +124,28 @@ class DrawingLayer(QtCore.QObject):
             self.selected = hit
             self.rebuild()
         d = next(d for d in self.drawings if d["id"] == hit)
+        if d.get("lock"):
+            return False                                   # a locked drawing stays put: the drag pans the chart
+        mods = QtWidgets.QApplication.keyboardModifiers()
+        M = QtCore.Qt.KeyboardModifier
+        if mods & (M.AltModifier | M.ControlModifier | M.MetaModifier):
+            # TradingView: hold Option / Cmd and drag a drawing to pull a copy off it
+            state = self._snapshot()
+            c = self._copy_of(d)
+            self.drawings.append(c)
+            self.selected = c["id"]
+            self.rebuild()
+            self._start_drag(c, ("move", 0), x, y)
+            self._drag["state"], self._drag["moved"] = state, True
+            return True
         return self._start_drag(d, ("move", 0), x, y)
+
+    def _copy_of(self, d) -> dict:
+        c = copy.deepcopy(d)
+        c["id"] = self._next_id
+        c.pop("lock", None)
+        self._next_id += 1
+        return c
 
     def _start_drag(self, d, mode, x, y) -> bool:
         self._drag = {"id": d["id"], "mode": mode, "x0": x, "y0": y, "orig": copy.deepcopy(d["pts"]),
@@ -134,6 +163,9 @@ class DrawingLayer(QtCore.QObject):
         kind, idx = g["mode"]
         if kind == "pt":
             sx, sy = self.chart.snap(x, y) if self.chart.magnet else (x, y)
+            if d["type"] in ANGLE_TOOLS and len(d["pts"]) == 2 and self._shift():
+                ax, ay = self._xy(d)[1 - idx]
+                sx, sy = self._constrain(ax, ay, x, y)
             d["pts"][idx] = [self.chart.x_to_time(sx), float(self.chart.iy(sy))]
         else:
             dx, dy = x - g["x0"], y - g["y0"]
@@ -162,36 +194,103 @@ class DrawingLayer(QtCore.QObject):
         d = next((d for d in self.drawings if d["id"] == self.selected), None)
         if d:
             self._push_undo()
-            nid = self.add(d["type"], [[t + 86400 * 0, p] for t, p in d["pts"]], d.get("color", DEFAULT_COLOR))
-            for e in self.drawings:
-                if e["id"] == nid:
-                    for q in e["pts"]:
-                        q[1] += (self.chart.y_range()[1] - self.chart.y_range()[0]) * 0.03
-                    if "text" in d:
-                        e["text"] = d["text"]
+            c = self._copy_of(d)
+            off = (self.chart.y_range()[1] - self.chart.y_range()[0]) * 0.03
+            for q in c["pts"]:
+                q[1] = float(self.chart.iy(self.chart.ty(q[1]) + off))
+            self.drawings.append(c)
+            nid = c["id"]
             self.selected = nid
             self.rebuild()
             self.changed.emit()
 
     def set_color(self, did: int, color: str):
-        for d in self.drawings:
-            if d["id"] == did:
-                self._push_undo()
-                d["color"] = color
-                self.rebuild()
-                self.changed.emit()
+        self.set_props(did, color=color)
+
+    def get(self, did):
+        return next((d for d in self.drawings if d["id"] == did), None)
+
+    def set_props(self, did: int, **props):
+        """Change colour / width ('w') / line style ('ls') / lock / text / points of one drawing (one undo step)."""
+        d = self.get(did)
+        if d is None:
+            return
+        self._push_undo()
+        for k, v in props.items():
+            if v is None:
+                d.pop(k, None)
+            else:
+                d[k] = v
+        self.rebuild()
+        self.changed.emit()
+
+    def set_width(self, did: int, w: float):
+        self.set_props(did, w=float(w))
+
+    def set_style(self, did: int, ls: str):
+        self.set_props(did, ls=ls if ls in STYLES else "solid")
+
+    def set_locked(self, did: int, on: bool):
+        self.set_props(did, lock=True if on else None)
+
+    # ------------------------------------------------------------------ copy / paste
+    def copy_selected(self) -> bool:
+        d = self.get(self.selected)
+        if d is None:
+            return False
+        _CLIP.clear()
+        _CLIP.update(copy.deepcopy(d))
+        return True
+
+    def paste(self) -> bool:
+        """Paste the copied drawing a little below the original (or onto this pane, when copied from another)."""
+        if not _CLIP or not self.chart.has_data():
+            return False
+        self._push_undo()
+        c = self._copy_of(_CLIP)
+        lo, hi = self.chart.y_range()
+        (x0, x1) = self.chart.price.vb.viewRange()[0]
+        xs = [self.chart.time_to_x(t) for t, _ in c["pts"]]
+        dx = 0.0 if (x0 <= min(xs) and max(xs) <= x1) else (x0 + x1) / 2 - (min(xs) + max(xs)) / 2
+        for q in c["pts"]:
+            q[0] = self.chart.x_to_time(self.chart.time_to_x(q[0]) + dx)
+            q[1] = float(self.chart.iy(self.chart.ty(q[1]) - (hi - lo) * 0.04))
+        self.drawings.append(c)
+        self.selected = c["id"]
+        self.rebuild()
+        self.changed.emit()
+        return True
+
+    # ------------------------------------------------------------------ Shift = straight lines
+    @staticmethod
+    def _shift() -> bool:
+        return bool(QtWidgets.QApplication.keyboardModifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier)
+
+    def _constrain(self, ax: float, ay: float, x: float, y: float):
+        """Second point of a line with Shift held: snap the direction (as seen on screen) to the nearest of
+        horizontal, vertical and the two diagonals. All in view coordinates."""
+        vb = self.chart.price.vb
+        a, b = vb.mapViewToScene(QtCore.QPointF(ax, ay)), vb.mapViewToScene(QtCore.QPointF(x, y))
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        if dx == 0 and dy == 0:
+            return x, y
+        ang = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+        L = dx * math.cos(ang) + dy * math.sin(ang)
+        q = vb.mapSceneToView(QtCore.QPointF(a.x() + L * math.cos(ang), a.y() + L * math.sin(ang)))
+        return q.x(), (ay if abs(math.sin(ang)) < 1e-9 else q.y())
 
     # ------------------------------------------------------------------ public API
     def set_tool(self, tool: str | None):
         self.tool = tool if tool in TOOLS else None
         self.cancel(keep_tool=True)
         self.chart.set_cursor_for_tool(self.tool is not None)
+        self.chart.selection_changed()                       # the floating toolbar hides while a tool is in hand
 
     def add(self, dtype: str, pts: list, color: str = DEFAULT_COLOR) -> int:
         if dtype not in TOOLS or len(pts) < TOOLS[dtype]:
             raise ValueError(f"'{dtype}' needs {TOOLS.get(dtype, '?')} point(s)")
         self._push_undo()
-        n = 3 if dtype in ("long", "short") and len(pts) >= 3 else TOOLS[dtype]
+        n = 3 if dtype in ("long", "short") and len(pts) >= 3 else (len(pts) if dtype == "brush" else TOOLS[dtype])
         d = {"id": self._next_id, "type": dtype, "pts": [[float(t), float(p)] for t, p in pts[:n]],
              "color": color}
         if dtype in ("long", "short") and len(d["pts"]) == 2:      # stop starts mirrored; drag its handle to change R/R
@@ -249,9 +348,12 @@ class DrawingLayer(QtCore.QObject):
         self.clear_silent()
         for d in data or []:
             try:
+                if d["type"] not in TOOLS:
+                    continue
                 self.drawings.append({"id": self._next_id, "type": d["type"],
                                       "pts": [[float(a), float(b)] for a, b in d["pts"]],
-                                      "color": d.get("color", DEFAULT_COLOR), **({"text": d["text"]} if "text" in d else {})})
+                                      "color": d.get("color", DEFAULT_COLOR),
+                                      **{k: d[k] for k in EXTRA_KEYS if k in d}})
                 self._next_id += 1
             except Exception:  # noqa: BLE001 - ignore a corrupt stored drawing
                 continue
@@ -266,7 +368,12 @@ class DrawingLayer(QtCore.QObject):
 
     # ------------------------------------------------------------------ mouse input (view coordinates)
     def handle_click(self, x: float, y: float):
+        if self.tool == "brush":
+            return                                           # the brush is drawn by dragging (see brush_stroke)
         if self.tool:
+            if self.tool in ANGLE_TOOLS and len(self.pending) == 1 and self._shift():
+                ax, ay = self.chart.time_to_x(self.pending[0][0]), float(self.chart.ty(self.pending[0][1]))
+                x, y = self._constrain(ax, ay, x, y)
             t = self.chart.x_to_time(x)
             self.pending.append([t, float(self.chart.iy(y))])
             if len(self.pending) >= TOOLS[self.tool]:
@@ -286,6 +393,10 @@ class DrawingLayer(QtCore.QObject):
                 self.pending = []
                 self._clear_preview()
                 self.selected = did
+                if self.chart.stay_in_drawing and self.tool != "measure":
+                    self.selected = None                     # keep drawing: the tool stays in the hand
+                    self.rebuild()
+                    return
                 self.rebuild()
                 self.tool = None
                 self.chart.set_cursor_for_tool(False)
@@ -297,14 +408,46 @@ class DrawingLayer(QtCore.QObject):
             self.rebuild()
 
     def handle_move(self, x: float, y: float):
-        if not (self.tool and self.pending):
+        if not (self.tool and self.pending) or self.tool == "brush":
             return
+        if self.tool in ANGLE_TOOLS and len(self.pending) == 1 and self._shift():
+            ax, ay = self.chart.time_to_x(self.pending[0][0]), float(self.chart.ty(self.pending[0][1]))
+            x, y = self._constrain(ax, ay, x, y)
         d = {"id": -1, "type": self.tool, "pts": self.pending + [[self.chart.x_to_time(x), float(self.chart.iy(y))]],
              "color": DEFAULT_COLOR}
         self._clear_preview()
         self._preview_items = self._make_items(d, preview=True)
         for it in self._preview_items:
             self.chart.price.addItem(it, ignoreBounds=True)
+
+    def brush_stroke(self, x: float, y: float, start: bool, finish: bool):
+        """Freehand: called while the mouse is dragged with the Brush tool."""
+        pt = [self.chart.x_to_time(x), float(self.chart.iy(y))]
+        if start:
+            self.pending = [pt]
+        elif self.pending:
+            a = self.chart.price.vb.mapViewToScene(QtCore.QPointF(self.chart.time_to_x(self.pending[-1][0]),
+                                                                  float(self.chart.ty(self.pending[-1][1]))))
+            b = self.chart.price.vb.mapViewToScene(QtCore.QPointF(x, y))
+            if math.hypot(a.x() - b.x(), a.y() - b.y()) >= 2.0 or finish:      # skip points on top of each other
+                self.pending.append(pt)
+        if not finish:
+            self._clear_preview()
+            if len(self.pending) >= 2:
+                self._preview_items = self._make_items({"id": -1, "type": "brush", "pts": self.pending,
+                                                        "color": DEFAULT_COLOR})
+                for it in self._preview_items:
+                    self.chart.price.addItem(it, ignoreBounds=True)
+            return
+        pts, self.pending = self.pending, []
+        self._clear_preview()
+        if len(pts) >= 2:
+            self.selected = self.add("brush", pts, DEFAULT_COLOR)
+            self.rebuild()
+        if not self.chart.stay_in_drawing:
+            self.tool = None
+            self.chart.set_cursor_for_tool(False)
+            self.chart.toolChanged.emit(None)
 
     # ------------------------------------------------------------------ building visuals
     def rebuild(self):
@@ -313,6 +456,7 @@ class DrawingLayer(QtCore.QObject):
         for d in self.drawings:
             self._build(d)
         self._sync_tags()
+        self.chart.selection_changed()
 
     def _build(self, d):
         items = self._make_items(d)
@@ -378,8 +522,9 @@ class DrawingLayer(QtCore.QObject):
             return []
         sel = d["id"] == self.selected and not preview
         color = d.get("color", DEFAULT_COLOR)
-        pen = pg.mkPen(color, width=2.5 if sel else 1.6,
-                       style=QtCore.Qt.PenStyle.DashLine if preview else QtCore.Qt.PenStyle.SolidLine)
+        w = float(d.get("w", DEFAULT_WIDTH))
+        pen = pg.mkPen(color, width=w + 0.9 if sel else w,
+                       style=QtCore.Qt.PenStyle.DashLine if preview else STYLES.get(d.get("ls"), QtCore.Qt.PenStyle.SolidLine))
         pts = self._xy(d)
         items: list = []
         t = d["type"]
@@ -414,6 +559,24 @@ class DrawingLayer(QtCore.QObject):
             c.setAlpha(45)
             r.setBrush(QtGui.QBrush(c))
             items.append(r)
+        elif t == "brush" and len(pts) >= 2:
+            items.append(pg.PlotDataItem([q[0] for q in pts], [q[1] for q in pts], pen=pen))
+        elif t == "channel" and len(pts) >= 2:
+            (x1, y1), (x2, y2) = pts[0], pts[1]
+            items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pen))
+            if len(pts) >= 3:
+                off = self._channel_offset(pts)
+                items.append(pg.PlotDataItem([x1, x2], [y1 + off, y2 + off], pen=pen))
+                items.append(pg.PlotDataItem([x1, x2], [y1 + off / 2, y2 + off / 2],
+                                             pen=pg.mkPen(color, width=1, style=QtCore.Qt.PenStyle.DashLine)))
+                poly = QtWidgets.QGraphicsPolygonItem(QtGui.QPolygonF([QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2),
+                                                                       QtCore.QPointF(x2, y2 + off), QtCore.QPointF(x1, y1 + off)]))
+                poly.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
+                c = QtGui.QColor(color)
+                c.setAlpha(30)
+                poly.setBrush(QtGui.QBrush(c))
+                poly.setZValue(-2)
+                items.append(poly)
         elif t == "ext" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             if x2 == x1:
@@ -542,17 +705,34 @@ class DrawingLayer(QtCore.QObject):
             tx.setPos(*pts[0])
             items.append(tx)
         if sel:
-            hs = [p for p in pts] if t not in ("hline", "vline", "text") else []
+            hs = [p for p in pts] if t not in ("hline", "vline", "text", "brush") else []
+            if d.get("lock"):
+                hs = []
             if hs:
                 items.append(pg.ScatterPlotItem(x=[p[0] for p in hs], y=[p[1] for p in hs], size=9,
                                                 brush=pg.mkBrush(theme.BG), pen=pg.mkPen(color, width=2)))
         return items
+
+    @staticmethod
+    def _channel_offset(pts) -> float:
+        """How far (in price-axis units) the second line of a channel sits from the first: it runs through point 3."""
+        (x1, y1), (x2, y2), (x3, y3) = pts[0], pts[1], pts[2]
+        base = y1 if x2 == x1 else y1 + (y2 - y1) * (x3 - x1) / (x2 - x1)
+        return y3 - base
 
     # ------------------------------------------------------------------ hit testing
     def _segments(self, d):
         pts = self._xy(d)
         t = d["type"]
         far = self.chart.x_limit()
+        if t == "brush" and len(pts) >= 2:
+            step = max(1, len(pts) // 60)
+            q = pts[::step] + ([pts[-1]] if (len(pts) - 1) % step else [])
+            return list(zip(q[:-1], q[1:]))
+        if t == "channel" and len(pts) >= 3:
+            (x1, y1), (x2, y2) = pts[0], pts[1]
+            off = self._channel_offset(pts)
+            return [(pts[0], pts[1]), ((x1, y1 + off), (x2, y2 + off))]
         if t == "trend" and len(pts) == 2:
             return [(pts[0], pts[1])]
         if t == "ray" and len(pts) == 2:

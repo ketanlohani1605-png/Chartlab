@@ -422,6 +422,212 @@ def _watermark_pixmap(size: int = 64, opacity: float = 0.22) -> QtGui.QPixmap:
     return out
 
 
+IND_DEFAULTS = {"sma20": {"len": 20, "color": "#2962ff"}, "sma50": {"len": 50, "color": "#ff9800"},
+                "sma200": {"len": 200, "color": "#e040fb"}, "ema20": {"len": 20, "color": "#00bcd4"},
+                "ema50": {"len": 50, "color": "#ffeb3b"}, "bb": {"len": 20, "mult": 2.0, "color": "#2962ff"},
+                "supertrend": {"len": 10, "mult": 3.0}, "vwap": {"color": "#2962ff"},
+                "rsi": {"len": 14, "color": "#7e57c2"}}
+IND_TITLES = {"sma20": "Moving Average (SMA)", "sma50": "Moving Average (SMA)", "sma200": "Moving Average (SMA)",
+              "ema20": "Moving Average Exponential (EMA)", "ema50": "Moving Average Exponential (EMA)",
+              "bb": "Bollinger Bands", "supertrend": "Supertrend", "vwap": "VWAP", "rsi": "Relative Strength Index"}
+
+
+class _IndButtons(QtWidgets.QFrame):
+    """Hide / settings / remove, shown at the end of a legend row while the mouse is on it (TradingView)."""
+
+    def __init__(self, chart):
+        super().__init__(chart.glw)
+        self.chart, self.key = chart, None
+        self.setStyleSheet("QFrame{background:#1e222d;border:1px solid #363a45;border-radius:5px;}"
+                           "QToolButton{background:transparent;border:0;border-radius:3px;padding:1px;}"
+                           "QToolButton:hover{background:#2a2e39;}")
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(3, 2, 3, 2)
+        h.setSpacing(1)
+        self.btns = {}
+        for name, icon, tip, fn in (("eye", "eye", "Hide / show", self._eye), ("gear", "gear", "Settings\u2026", self._gear),
+                                    ("x", "close", "Remove", self._remove)):
+            b = QtWidgets.QToolButton()
+            b.setIcon(icons.get(icon))
+            b.setIconSize(QtCore.QSize(15, 15))
+            b.setToolTip(tip)
+            b.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            b.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(fn)
+            h.addWidget(b)
+            self.btns[name] = b
+        self.adjustSize()
+        self.hide()
+        self._off = QtCore.QTimer(self)
+        self._off.setSingleShot(True)
+        self._off.setInterval(350)
+        self._off.timeout.connect(lambda: None if self.underMouse() else self.hide())
+
+    def show_for(self, key, x, y):
+        self._off.stop()
+        self.key = key
+        self.btns["gear"].setVisible(bool({"len", "mult", "color"} & set(IND_DEFAULTS.get(key, {}))))
+        self.adjustSize()
+        self.move(int(x), int(y))
+        self.show()
+        self.raise_()
+
+    def leave(self):
+        if not self.isHidden() and not self._off.isActive():
+            self._off.start()
+
+    def leaveEvent(self, ev):
+        self._off.start()
+
+    def _eye(self):
+        ch = self.chart
+        ch.set_indicator_hidden(self.key, self.key not in ch._ind_hidden)
+
+    def _gear(self):
+        self.hide()
+        self.chart.edit_indicator(self.key)
+
+    def _remove(self):
+        self.hide()
+        self.chart.set_indicator(self.key, False)
+        self.chart.indicatorToggled.emit(self.key, False)
+
+
+class _IndicatorSettings(QtWidgets.QDialog):
+    """Inputs of one indicator: length, multiplier, colour."""
+
+    def __init__(self, chart, key: str):
+        super().__init__(chart)
+        from .drawbar import COLORS, swatch
+        self.chart, self.key = chart, key
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle(IND_TITLES.get(key, key))
+        self.setMinimumWidth(340)
+        P, D = chart.ind_params[key], IND_DEFAULTS[key]
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 14)
+        v.setSpacing(10)
+        form = QtWidgets.QFormLayout()
+        form.setSpacing(8)
+        self.len = self.mult = None
+        if "len" in D:
+            self.len = QtWidgets.QSpinBox()
+            self.len.setRange(1, 2000)
+            self.len.setValue(int(P.get("len", D["len"])))
+            form.addRow("Length", self.len)
+        if "mult" in D:
+            self.mult = QtWidgets.QDoubleSpinBox()
+            self.mult.setRange(0.1, 50.0)
+            self.mult.setSingleStep(0.1)
+            self.mult.setDecimals(2)
+            self.mult.setValue(float(P.get("mult", D["mult"])))
+            form.addRow("StdDev" if key == "bb" else "Factor", self.mult)
+        self.color = P.get("color") or D.get("color")
+        self.color_btn = None
+        if "color" in D:
+            self.color_btn = QtWidgets.QPushButton()
+            m = QtWidgets.QMenu(self.color_btn)
+            for name, c in COLORS:
+                m.addAction(swatch(c), name, lambda c=c: self._pick(c))
+            m.addSeparator()
+            m.addAction("Other colour\u2026", self._custom)
+            self.color_btn.setMenu(m)
+            self._swatch = swatch
+            self._pick(self.color)
+            form.addRow("Colour", self.color_btn)
+        v.addLayout(form)
+        row = QtWidgets.QHBoxLayout()
+        dflt = QtWidgets.QPushButton("Defaults")
+        dflt.setAutoDefault(False)
+        dflt.clicked.connect(self._defaults)
+        row.addWidget(dflt)
+        row.addStretch(1)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                        QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+
+    def _pick(self, c):
+        self.color = c
+        self.color_btn.setIcon(self._swatch(c))
+        self.color_btn.setText("  " + c)
+
+    def _custom(self):
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.color), self, "Colour")
+        if c.isValid():
+            self._pick(c.name())
+
+    def _defaults(self):
+        D = IND_DEFAULTS[self.key]
+        if self.len is not None:
+            self.len.setValue(D["len"])
+        if self.mult is not None:
+            self.mult.setValue(D["mult"])
+        if self.color_btn is not None:
+            self._pick(D["color"])
+
+    def _ok(self):
+        kw = {}
+        if self.len is not None:
+            kw["len"] = int(self.len.value())
+        if self.mult is not None:
+            kw["mult"] = float(self.mult.value())
+        if self.color_btn is not None:
+            kw["color"] = self.color
+        self.chart.set_indicator_params(self.key, **kw)
+        self.accept()
+
+
+class _PaneGrip(QtWidgets.QWidget):
+    """The thin strip between the price pane and the RSI pane: drag it to give either pane more room."""
+
+    def __init__(self, chart):
+        super().__init__(chart.glw)
+        self.chart = chart
+        self.setFixedHeight(7)
+        self.setCursor(QtCore.Qt.CursorShape.SplitVCursor)
+        self.setToolTip("Drag to resize the panes")
+        self._y = None
+        self.hide()
+
+    def place(self):
+        ch = self.chart
+        if ch.rsi.isVisible():
+            r = ch.rsi.sceneBoundingRect()
+            tl = ch.glw.mapFromScene(r.topLeft())
+            self.setGeometry(int(tl.x()), int(tl.y()) - 3, int(ch.price.vb.sceneBoundingRect().width()), 7)
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+
+    def paintEvent(self, _ev):
+        if self.underMouse() or self._y is not None:
+            p = QtGui.QPainter(self)
+            p.fillRect(0, 2, self.width(), 3, QtGui.QColor("#2962ff"))
+
+    def enterEvent(self, ev):
+        self.update()
+
+    def leaveEvent(self, ev):
+        self.update()
+
+    def mousePressEvent(self, ev):
+        self._y = ev.globalPosition().y()
+        self._h = self.chart.rsi.height()
+        self.update()
+
+    def mouseMoveEvent(self, ev):
+        if self._y is not None:
+            self.chart.set_rsi_height(self._h - (ev.globalPosition().y() - self._y))
+
+    def mouseReleaseEvent(self, ev):
+        self._y = None
+        self.update()
+
+
 class ChartWidget(QtWidgets.QWidget):
     replayChanged = QtCore.Signal()
     alertRequested = QtCore.Signal(float)
@@ -430,6 +636,9 @@ class ChartWidget(QtWidgets.QWidget):
     drawingsChanged = QtCore.Signal()
     tradeRequested = QtCore.Signal(str, float)
     settingsRequested = QtCore.Signal()
+    gotoDateRequested = QtCore.Signal()
+    indicatorsChanged = QtCore.Signal()                      # inputs changed (saved by the window)
+    indicatorToggled = QtCore.Signal(str, bool)              # removed / added from the legend
     typed = QtCore.Signal(str)
     barHovered = QtCore.Signal(int)
 
@@ -528,6 +737,10 @@ class ChartWidget(QtWidgets.QWidget):
             pl.getAxis("right").setStyle(showValues=False)
 
         self._legend_rows: list = []                    # [(name, [(item, colour), ...])] shown under "Vol"
+        self._legend_keys: list = []                    # indicator key of each legend row (None = strategy line)
+        self._ind_hidden: set = set()                   # switched off with the eye, still listed
+        self.ind_params = {k: dict(v) for k, v in IND_DEFAULTS.items()}
+        self.ind_buttons = _IndButtons(self)
 
         # tags: last price, crosshair price (per pane) and crosshair date
         self.last_tag = AxisTag(self, self.price, "y", theme.UP)
@@ -547,10 +760,26 @@ class ChartWidget(QtWidgets.QWidget):
         for p in (self.price, self.vol, self.rsi):
             p.dtag = AxisTag(self, p, "x", "#363a45")
 
+        self.stay_in_drawing = False                        # keep the tool after a drawing is placed
         self.layer = DrawingLayer(self)
         self.layer.changed.connect(self.drawingsChanged)
+        from .drawbar import DrawBar
+        self.draw_bar = DrawBar(self)
+        # TradingView's "scroll to the most recent bar": appears when the newest bar is off screen
+        self.latest_btn = QtWidgets.QToolButton(self.glw)
+        self.latest_btn.setIcon(icons.get("latest"))
+        self.latest_btn.setIconSize(QtCore.QSize(18, 18))
+        self.latest_btn.setFixedSize(30, 30)
+        self.latest_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.latest_btn.setToolTip(f"Scroll to the most recent bar  ({theme.sc('Alt+Shift+Right')})")
+        self.latest_btn.setStyleSheet("QToolButton{background:#1e222d;border:1px solid #363a45;border-radius:15px;}"
+                                      "QToolButton:hover{background:#2a2e39;}")
+        self.latest_btn.clicked.connect(self.scroll_to_latest)
+        self.latest_btn.hide()
+        self.pane_grip = _PaneGrip(self)
 
         self.price.vb.sigXRangeChanged.connect(self._autoscale)
+        self.price.vb.sigXRangeChanged.connect(lambda *_: self._sync_latest_btn())
         self.price.vb.sigRangeChanged.connect(lambda *_: (self._place_last_tag(), self._place_alert_tags(),
                                                           self.layer.place_tags(), self._refresh_crosshair()))
         # labels on the scales are QWidgets: re-place them once pyqtgraph has finished laying the plots out
@@ -830,6 +1059,11 @@ class ChartWidget(QtWidgets.QWidget):
     def _place_overlays(self):
         self.corners.setGeometry(self.glw.rect())
         self.corners.raise_()
+        self._sync_latest_btn()
+        self.pane_grip.place()
+        if not self.draw_bar.isHidden():
+            self.draw_bar.place()
+            self.draw_bar.raise_()
         self._place_last_tag()
         self._place_alert_tags()
         self.layer.place_tags()
@@ -948,7 +1182,10 @@ class ChartWidget(QtWidgets.QWidget):
     def _set_rsi_visible(self, on: bool):
         grid = self.glw.ci.layout
         self.rsi.setVisible(on)
-        if on:
+        if on and getattr(self, "_rsi_px", None):           # the height the pane was dragged to
+            for setter in (grid.setRowMinimumHeight, grid.setRowPreferredHeight, grid.setRowMaximumHeight):
+                setter(2, self._rsi_px)
+        elif on:
             grid.setRowMinimumHeight(2, 0)
             grid.setRowMaximumHeight(2, _QWIDGETSIZE_MAX)
         else:
@@ -1311,6 +1548,57 @@ class ChartWidget(QtWidgets.QWidget):
         hi = getattr(self, "_hover_i", None)
         self._update_header(len(self.df) - 1 if hi is None else min(hi, len(self.df) - 1))
 
+    # ------------------------------------------------------------------ drawings: selection, settings
+    def selection_changed(self):
+        bar = getattr(self, "draw_bar", None)
+        if bar is not None:
+            bar.sync()
+
+    def edit_drawing(self, did):
+        d = self.layer.get(did) if did is not None else None
+        if d is None:
+            return
+        from .drawbar import DrawingSettings
+        DrawingSettings(self, d).exec()
+
+    # ------------------------------------------------------------------ newest bar
+    def _latest_visible(self) -> bool:
+        return self.df is None or self.price.vb.viewRange()[0][1] >= self._n() - 0.5
+
+    def _sync_latest_btn(self):
+        b = getattr(self, "latest_btn", None)
+        if b is None:
+            return
+        show = self.df is not None and not self._latest_visible()
+        if show != (not b.isHidden()):
+            b.setVisible(show)
+        if show:
+            r = self.price.vb.sceneBoundingRect()
+            br = self.glw.mapFromScene(r.bottomRight())
+            b.move(int(br.x()) - b.width() - 12, int(br.y()) - b.height() - 12)
+            b.raise_()
+
+    def scroll_to_latest(self):
+        """Back to the newest bar without changing the zoom (TradingView's round arrow button)."""
+        n = self._n()
+        if not n:
+            return
+        vb = self.price.vb
+        x0, x1 = vb.viewRange()[0]
+        right = n + int(settings.get()['scale_right_bars'])
+        vb._goal = (right - (x1 - x0), right)
+        vb._animate_x(right - (x1 - x0), right, ms=260)
+
+    def set_rsi_height(self, h: float):
+        """Drag the line between the price pane and the RSI pane."""
+        grid = self.glw.ci.layout
+        total = self.price.height() + self.rsi.height()
+        h = max(60.0, min(float(h), total - 140.0))
+        self._rsi_px = h
+        for setter in (grid.setRowMinimumHeight, grid.setRowPreferredHeight, grid.setRowMaximumHeight):
+            setter(2, h)
+        self._schedule_relayout()
+
     def go_latest(self):
         n = self._n()
         self.auto_y = True
@@ -1380,37 +1668,83 @@ class ChartWidget(QtWidgets.QWidget):
             self._set_rsi_visible(on)
         self._rebuild_legend()
 
+    def set_indicator_params(self, key: str, **params):
+        """Change an indicator's inputs (len, mult, color). The line is rebuilt at once."""
+        if key not in self.ind_params:
+            return
+        for k, v in params.items():
+            if v is None:
+                self.ind_params[key].pop(k, None)
+            else:
+                self.ind_params[key][k] = v
+        if key in self._ind_items:
+            self._remove_indicator(key)
+            self._build_indicator(key)
+            self._rebuild_legend()
+            if self.df is not None and self._n():
+                self._update_header(min(getattr(self, "_hdr_i", self._n() - 1), self._n() - 1))
+        self.indicatorsChanged.emit()
+
+    def set_indicator_hidden(self, key: str, hidden: bool):
+        (self._ind_hidden.add if hidden else self._ind_hidden.discard)(key)
+        self._rebuild_legend()
+
+    def edit_indicator(self, key: str):
+        if key in self.ind_params:
+            _IndicatorSettings(self, key).exec()
+
+    def _legend_hover(self, vp_pos):
+        """Mouse over a legend row: show its hide / settings / remove buttons at the end of the row."""
+        b = self.ind_buttons
+        if vp_pos is None or self.df is None:
+            b.leave()
+            return
+        for label, keys in ((self.ind_label, [k for k in self._legend_keys]),
+                            (self.rsi_label, ["rsi"] if "rsi" in self._ind_items else [])):
+            if label.isHidden() or not keys:
+                continue
+            g = label.geometry()
+            zone = QtCore.QRect(g.x() - 6, g.y(), g.width() + 110, g.height())
+            if zone.contains(vp_pos):
+                row = min(len(keys) - 1, max(0, int((vp_pos.y() - g.y()) * len(keys) / max(g.height(), 1))))
+                key = keys[row]
+                if key is None:
+                    break
+                h = g.height() / len(keys)
+                b.show_for(key, g.x() + g.width() + 8, int(g.y() + row * h + (h - b.height()) / 2))
+                return
+        b.leave()
+
     def _build_indicator(self, key: str):
         if self.df is None or key in self._ind_items:
             return
         c = self.df["Close"]
         lines = []
-        if key == "sma20":
-            lines = [(self.price, ta.sma(c, 20), "#2962ff", "SMA 20")]
-        elif key == "sma50":
-            lines = [(self.price, ta.sma(c, 50), "#ff9800", "SMA 50")]
-        elif key == "sma200":
-            lines = [(self.price, ta.sma(c, 200), "#e040fb", "SMA 200")]
-        elif key == "ema20":
-            lines = [(self.price, ta.ema(c, 20), "#00bcd4", "EMA 20")]
-        elif key == "ema50":
-            lines = [(self.price, ta.ema(c, 50), "#ffeb3b", "EMA 50")]
+        P = self.ind_params.get(key, {})
+        L = max(1, int(P.get("len", 1)))
+        col = P.get("color") or IND_DEFAULTS.get(key, {}).get("color", "#2962ff")
+        if key in ("sma20", "sma50", "sma200"):
+            lines = [(self.price, ta.sma(c, L), col, f"SMA {L}")]
+        elif key in ("ema20", "ema50"):
+            lines = [(self.price, ta.ema(c, L), col, f"EMA {L}")]
         elif key == "bb":
-            bb = ta.bollinger(c, 20, 2)
-            lines = [(self.price, bb["mid"], "#ff6d00", "BB 20 2"),
-                     (self.price, bb["upper"], "#2962ff", None),
-                     (self.price, bb["lower"], "#2962ff", None)]
+            m = float(P.get("mult", 2.0))
+            bb = ta.bollinger(c, L, m)
+            lines = [(self.price, bb["mid"], "#ff6d00", f"BB {L} {m:g}"),
+                     (self.price, bb["upper"], col, None),
+                     (self.price, bb["lower"], col, None)]
         elif key == "vwap":
-            lines = [(self.price, ta.vwap(self.df), "#2962ff", "VWAP")]
+            lines = [(self.price, ta.vwap(self.df), col, "VWAP")]
         elif key == "supertrend":
-            st = ta.supertrend(self.df, 10, 3.0)
+            m = float(P.get("mult", 3.0))
+            st = ta.supertrend(self.df, L, m)
             upl = st["st"].where(st["dir"] > 0)
             dnl = st["st"].where(st["dir"] < 0)
-            lines = [(self.price, upl, theme.UP, "Supertrend 10 3"), (self.price, dnl, theme.DOWN, None)]
+            lines = [(self.price, upl, theme.UP, f"Supertrend {L} {m:g}"), (self.price, dnl, theme.DOWN, None)]
         elif key == "rsi":
-            r14 = ta.rsi(c, 14)
+            r14 = ta.rsi(c, L)
             self._rsi_arr = r14.to_numpy(float)
-            lines = [(self.rsi, r14, "#7e57c2", None)]
+            lines = [(self.rsi, r14, col, None)]
 
         items = []
         x = np.arange(len(c))
@@ -1429,7 +1763,9 @@ class ChartWidget(QtWidgets.QWidget):
                 item.setData(x[:self._limit], item._full[1][:self._limit])
             items.append((plot, item, name))
         if key == "bb" and len(items) == 3:              # TradingView fills between the bands
-            fill = BandFill(items[1][1]._full[1], items[2][1]._full[1], pg.mkBrush(33, 150, 243, 22))
+            fc = QtGui.QColor(col)
+            fc.setAlpha(22)
+            fill = BandFill(items[1][1]._full[1], items[2][1]._full[1], pg.mkBrush(fc))
             fill.limit = self._limit
             fill.setZValue(-8)
             self.price.addItem(fill, ignoreBounds=True)
@@ -1453,17 +1789,22 @@ class ChartWidget(QtWidgets.QWidget):
 
     def _rebuild_legend(self):
         """Indicator / strategy lines listed under 'Vol', TradingView style: name then value(s) at the bar."""
-        rows = []
+        rows, keys = [], []
         for key, items in self._ind_items.items():
+            hidden = key in self._ind_hidden
+            for _pl, it, _n in items:
+                it.setVisible(not hidden)
             name = next((n for _, _, n in items if n), None)
             vals = [(it, getattr(it, "_legend_color", "#d1d4dc")) for pl, it, _ in items
                     if pl is self.price and isinstance(it, pg.PlotDataItem)]
             if name and vals:
                 rows.append((name, vals))
+                keys.append(key)
         for item, name in self._strategy_items:
             col = item.opts["pen"].color().name() if hasattr(item.opts.get("pen"), "color") else "#d1d4dc"
             rows.append((name, [(item, col)]))
-        self._legend_rows = rows
+            keys.append(None)
+        self._legend_rows, self._legend_keys = rows, keys
         self._update_ind_legend(getattr(self, "_hdr_i", None))
         self._hdr_shape = None
         self._place_overlays()
@@ -1476,10 +1817,13 @@ class ChartWidget(QtWidgets.QWidget):
         if i is None:
             i = self._n() - 1
         out = []
-        for name, vals in self._legend_rows:
+        for r_, (name, vals) in enumerate(self._legend_rows):
             col0 = vals[0][1]
-            parts = [f"<span style='color:#d1d4dc'>{name}</span>"]
-            if S.get("sl_ind_values", True):
+            off = self._legend_keys[r_] in self._ind_hidden if r_ < len(self._legend_keys) else False
+            parts = [f"<span style='color:{'#5d606b' if off else '#d1d4dc'}'>{name}</span>"]
+            if off:
+                col0 = "#5d606b"
+            if S.get("sl_ind_values", True) and not off:
                 for it, col in vals:
                     f = getattr(it, "_full", None)
                     y = f[1][i] if f is not None and 0 <= i < len(f[1]) else np.nan
@@ -1661,6 +2005,8 @@ class ChartWidget(QtWidgets.QWidget):
         if self.df is None:
             return
         self._cross_vp = self.glw.mapFromScene(pos)
+        if not refresh:
+            self._legend_hover(self._cross_vp)
         plots = (self.price, self.vol, self.rsi)
         hovered = next((p for p in plots if p.isVisible() and p.sceneBoundingRect().contains(pos)), None)
         if hovered is None:
@@ -1760,19 +2106,43 @@ class ChartWidget(QtWidgets.QWidget):
     def _panning(self) -> bool:
         return bool(QtWidgets.QApplication.mouseButtons() & QtCore.Qt.MouseButton.LeftButton)
 
+    def _time_menu(self):
+        """Right-click on the time scale."""
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Go to date\u2026\t" + theme.sc("Alt+G"), self.gotoDateRequested.emit)
+        menu.addAction("Scroll to the most recent bar\t" + theme.sc("Alt+Shift+Right"), self.scroll_to_latest)
+        menu.addAction("Reset time scale", self.go_latest)
+        menu.addSeparator()
+        menu.addAction("Settings\u2026", self.settingsRequested.emit)
+        menu.exec(QtGui.QCursor.pos())
+
     def _context_menu(self, ev):
         mp = self.price.vb.mapSceneToView(ev.scenePos())
         menu = QtWidgets.QMenu(self)
         hit = self.layer._hit_test(mp.x(), mp.y())
         if hit is not None:
+            from .drawbar import COLORS, NO_LINE, STYLE_NAMES, WIDTHS, line_icon, swatch
             self.layer.selected = hit
             self.layer.rebuild()
-            menu.addAction("Duplicate", self.layer.duplicate_selected)
-            col = menu.addMenu("Color")
-            for name, c in (("Blue", "#2962ff"), ("Red", "#f23645"), ("Green", "#089981"), ("Orange", "#ff9800"),
-                            ("Purple", "#9c27b0"), ("White", "#ffffff")):
-                col.addAction(name, lambda c=c, h=hit: self.layer.set_color(h, c))
-            menu.addAction("Delete", self.layer.delete_selected)
+            d = self.layer.get(hit)
+            menu.addAction("Settings\u2026", lambda h=hit: self.edit_drawing(h))
+            menu.addAction("Clone", self.layer.duplicate_selected)
+            menu.addAction("Copy\t" + theme.sc("Ctrl+C"), self.layer.copy_selected)
+            col = menu.addMenu("Colour")
+            for name, c in COLORS:
+                col.addAction(swatch(c), name, lambda c=c, h=hit: self.layer.set_color(h, c))
+            if d["type"] not in NO_LINE:
+                wm = menu.addMenu("Line width")
+                for w in WIDTHS:
+                    wm.addAction(line_icon(w), f"{w:g} px", lambda w=w, h=hit: self.layer.set_width(h, w))
+                sm = menu.addMenu("Line style")
+                for key, lab in STYLE_NAMES:
+                    sm.addAction(line_icon(2, key), lab, lambda k=key, h=hit: self.layer.set_style(h, k))
+            lk = menu.addAction("Lock")
+            lk.setCheckable(True)
+            lk.setChecked(bool(d.get("lock")))
+            lk.toggled.connect(lambda on, h=hit: self.layer.set_locked(h, on))
+            menu.addAction("Remove\tDel", self.layer.delete_selected)
             menu.addSeparator()
         price = float(self.iy(mp.y()))
         menu.addAction(f"Copy price {self.fp(price)}", lambda: QtWidgets.QApplication.clipboard().setText(f"{price:.2f}"))
@@ -1785,6 +2155,9 @@ class ChartWidget(QtWidgets.QWidget):
         a.setChecked(self.auto_y)
         a.toggled.connect(self.set_auto_y)
         menu.addAction("Reset chart view\t" + theme.sc("Alt+R"), lambda: (self.set_auto_y(True), self.go_latest()))
+        from .drawings import _CLIP
+        if _CLIP:
+            menu.addAction("Paste drawing\t" + theme.sc("Ctrl+V"), self.layer.paste)
         menu.addAction("Undo\t" + theme.sc("Ctrl+Z"), self.layer.undo)
         menu.addAction("Redo\t" + theme.sc("Ctrl+Shift+Z"), self.layer.redo)
         menu.addAction("Remove all drawings", self.layer.clear)
@@ -1857,6 +2230,10 @@ class ChartWidget(QtWidgets.QWidget):
             self._axis_menu()
             return
         if self.df is not None and ev.button() == QtCore.Qt.MouseButton.RightButton and \
+                any(axis_rect(a).contains(ev.scenePos()) for a in self.axes if a.isVisible()):
+            self._time_menu()
+            return
+        if self.df is not None and ev.button() == QtCore.Qt.MouseButton.RightButton and \
                 self.price.sceneBoundingRect().contains(ev.scenePos()):
             self._context_menu(ev)
             return
@@ -1877,6 +2254,17 @@ class ChartWidget(QtWidgets.QWidget):
         if self.replay["picking"]:
             self.replay_start(int(round(mp.x())))
             return
+        if ev.double() and not self.layer.tool:              # double-click a drawing: its settings
+            hit = self.layer._hit_test(mp.x(), mp.y())
+            if hit is not None:
+                self.layer.selected = hit
+                self.layer.rebuild()
+                QtCore.QTimer.singleShot(0, lambda h=hit: self.edit_drawing(h))
+                return
+        if (ev.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier) and not self.layer.tool \
+                and self.layer._hit_test(mp.x(), mp.y()) is None:
+            self.layer.set_tool("measure")                   # TradingView: Shift + click measures from here
+            self.toolChanged.emit("measure")
         x, y = self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y())
         self.layer.handle_click(x, y)
 
@@ -2002,7 +2390,7 @@ class ChartWidget(QtWidgets.QWidget):
             ind.append((name, "&nbsp;&nbsp;".join(parts) or "<span style='color:#5d606b'>\u2014</span>", None))
         rs = getattr(self, "_rsi_arr", None)
         if "rsi" in self._enabled and rs is not None and i < len(rs):
-            ind.append(("RSI 14", f"{rs[i]:.2f}" if np.isfinite(rs[i]) else "\u2014", "#b388ff"))
+            ind.append((f"RSI {int(self.ind_params['rsi'].get('len', 14))}", f"{rs[i]:.2f}" if np.isfinite(rs[i]) else "\u2014", "#b388ff"))
         if ind:
             sections.append(("Indicators", ind))
         out = ["<table width='100%' cellspacing=0 cellpadding=3>"]
@@ -2054,7 +2442,8 @@ class ChartWidget(QtWidgets.QWidget):
         self.vol_label.setVisible(bool(S["sl_volume"]) and not self.collapse_btn.isChecked())
         rs = getattr(self, "_rsi_arr", None)
         if rs is not None and i < len(rs) and np.isfinite(rs[i]):
-            self.rsi_label.setText(f"<span style='color:#ffffff'>RSI 14</span> <span style='color:#b388ff'>{rs[i]:.2f}</span>")
+            self.rsi_label.setText(f"<span style='color:#ffffff'>RSI {int(self.ind_params['rsi'].get('len', 14))}</span> "
+                                   f"<span style='color:#b388ff'>{rs[i]:.2f}</span>")
         self._update_ind_legend(i)
         hs = (self.header.height(), self.header.isHidden(), self.vol_label.isHidden(), self.ind_label.height(),
               self.ind_label.isHidden())

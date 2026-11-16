@@ -164,6 +164,16 @@ class MainWindow(QtWidgets.QMainWindow):
             p.chart.alertRequested.connect(lambda price, pp=p: self.create_alert(price, pp))
             p.chart.tradeRequested.connect(self._on_trade)
             p.chart.settingsRequested.connect(self.open_settings)
+            p.chart.gotoDateRequested.connect(self._goto_date)
+            p.chart.indicatorsChanged.connect(lambda pp=p: self._ind_params_changed(pp))
+            p.chart.indicatorToggled.connect(lambda key, on, pp=p: self._ind_toggled_on_chart(pp, key, on))
+            try:
+                saved = json.loads(self.settings.value("ind_params", "") or "{}")
+                for k, v in saved.items():
+                    if k in p.chart.ind_params and isinstance(v, dict):
+                        p.chart.ind_params[k].update(v)
+            except Exception:  # noqa: BLE001 - a broken saved value only means: defaults
+                pass
             p.chart.typed.connect(self._chart_typed)
             p.chart.barHovered.connect(lambda i, p=p: self._update_data_window(p, i))
             self.panels.append(p)
@@ -676,11 +686,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.draw_actions[None] = cur
         tb.addSeparator()
         ICON = {"hray": "ray", "crossline": "cross", "ext": "t_ext", "arrow": "t_arrow", "ellipse": "t_ellipse",
-                "pricerange": "t_pricerange", "daterange": "t_daterange", "long": "t_long", "short": "t_short"}
+                "pricerange": "t_pricerange", "daterange": "t_daterange", "long": "t_long", "short": "t_short",
+                "channel": "t_channel", "brush": "t_brush"}
         SC = {"trend": "Alt+T", "hline": "Alt+H", "hray": "Alt+J", "vline": "Alt+V", "crossline": "Alt+C",
               "fib": "Alt+F", "rect": "Shift+Alt+R"}
-        GROUPS = [("Trend lines", ["trend", "ray", "ext", "hray", "hline", "vline", "crossline"]),
+        GROUPS = [("Trend lines", ["trend", "ray", "ext", "hray", "hline", "vline", "crossline", "channel"]),
                   ("Gann and Fibonacci", ["fib"]),
+                  ("Brush  (drag to draw freehand)", ["brush"]),
                   ("Forecasting and measurement", ["long", "short", "pricerange", "daterange"]),
                   ("Geometric shapes", ["rect", "ellipse", "arrow"]),
                   ("Text and notes", ["text"]),
@@ -715,6 +727,10 @@ class MainWindow(QtWidgets.QMainWindow):
         zi = tb.addAction(icons.get("zoom"), "")
         zi.setToolTip("Zoom in")
         zi.triggered.connect(lambda: self._zoom_x(0.7))
+        st = tb.addAction(icons.get("t_stay"), "")
+        st.setCheckable(True)
+        st.setToolTip("Stay in drawing mode: the tool stays selected after each drawing")
+        st.toggled.connect(lambda on: [setattr(p.chart, "stay_in_drawing", on) for p in self.panels])
         lk = tb.addAction(icons.get("lock"), "")
         lk.setCheckable(True)
         lk.setToolTip("Lock all drawings")
@@ -1121,6 +1137,9 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Alt+I"), self, activated=lambda: self.active.chart.price.vb.invertY(not self.active.chart.price.vb.state["yInverted"]))
         QtGui.QShortcut(QtGui.QKeySequence("Alt+L"), self, activated=lambda: self._toggle_scale("log"))
         QtGui.QShortcut(QtGui.QKeySequence("Alt+P"), self, activated=lambda: self._toggle_scale("percent"))
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+S"), self, activated=self.copy_chart_image)
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+S"), self, activated=self.copy_chart_image)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+S"), self, activated=self.save_chart_image)
         QtGui.QShortcut(QtGui.QKeySequence("Alt+D"), self, activated=lambda: self.toggle_right_panel(self.data_dock))
         QtGui.QShortcut(QtGui.QKeySequence("Shift+F"), self, activated=self.toggle_fullscreen)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+,"), self, activated=self.open_settings)
@@ -1182,6 +1201,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if ev.key() in (QtCore.Qt.Key.Key_Delete, QtCore.Qt.Key.Key_Backspace) and plain:
             self.active.chart.layer.delete_selected()
             return True
+        cmd = bool(mods & (M.ControlModifier | M.MetaModifier)) and not (mods & (M.AltModifier | M.ShiftModifier))
+        lay = self.active.chart.layer
+        if cmd and ev.key() == QtCore.Qt.Key.Key_C and lay.selected is not None:
+            if lay.copy_selected():
+                self.statusBar().showMessage("Drawing copied  \u2014  " + theme.sc("Ctrl+V") + " pastes it (on any chart)", 4000)
+            return True
+        if cmd and ev.key() == QtCore.Qt.Key.Key_V:
+            from .drawings import _CLIP
+            if _CLIP and lay.paste():
+                return True
+        if cmd and ev.key() == QtCore.Qt.Key.Key_D and lay.selected is not None:
+            lay.duplicate_selected()
+            return True
         return bool(self.active.chart.handle_key(ev))
 
     def focus_chart(self):
@@ -1231,6 +1263,11 @@ class MainWindow(QtWidgets.QMainWindow):
               "fib": "Alt+F", "rect": "Shift+Alt+R"}
         for key, text in TOOL_LABELS.items():
             add(text, "Drawing tool", lambda k=key: self._tool_clicked(k), sc.get(key, ""))
+        add("Stay in drawing mode", "Drawing tool",
+            lambda: [setattr(p.chart, "stay_in_drawing", not ch.stay_in_drawing) for p in self.panels], "",
+            ch.stay_in_drawing)
+        add("Copy chart image", "Chart", self.copy_chart_image, "Alt+S")
+        add("Save chart image", "Chart", self.save_chart_image, "Ctrl+Alt+S")
         add("Remove all drawings", "Drawing tool", lambda: ch.layer.clear())
         add("Hide / show drawings", "Drawing tool", lambda: ch.layer.set_hidden(not ch.layer.hidden), "Ctrl+Alt+H")
         for dock, text in ((self.watch_dock, "Watchlist"), (self.alerts_dock, "Alerts panel"),
@@ -1261,13 +1298,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def toggle_fullscreen(self):
         self.setWindowState(self.windowState() ^ QtCore.Qt.WindowState.WindowFullScreen)
 
-    def save_chart_image(self):
-        ch = self.active.chart
-        default = str(Path.home() / "Pictures" / f"{(ch.label or 'chart').replace(' ', '_')}.png")
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save chart image", default, "PNG (*.png)")
-        if path:
-            ch.glw.grab().save(path)
-            self.statusBar().showMessage(f"Saved {path}")
+    def copy_chart_image(self):
+        """The chart as a picture on the clipboard, ready to paste into a chat or a note."""
+        QtWidgets.QApplication.clipboard().setImage(self.active.chart.glw.grab().toImage())
+        self.statusBar().showMessage("Chart image copied to the clipboard", 4000)
 
     def toggle_replay(self):
         ch = self.active.chart
@@ -1867,6 +1901,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         IndicatorsDialog(self, items, toggle, run, text).exec()
         self.focus_chart()
+
+    def _ind_params_changed(self, panel):
+        """Inputs changed on one pane (legend -> gear): every pane uses them, and they are remembered."""
+        self.settings.setValue("ind_params", json.dumps(panel.chart.ind_params))
+        for p in self.panels:
+            if p is not panel:
+                for k, v in panel.chart.ind_params.items():
+                    if p.chart.ind_params.get(k) != v:
+                        p.chart.blockSignals(True)
+                        p.chart.set_indicator_params(k, **v)
+                        p.chart.blockSignals(False)
+
+    def _ind_toggled_on_chart(self, panel, key, on):
+        if panel is self.active and key in self.ind_actions:
+            self._syncing = True
+            try:
+                self.ind_actions[key].setChecked(on)
+            finally:
+                self._syncing = False
 
     def _indicator_toggled(self, key, on):
         if not self._syncing:
