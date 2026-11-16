@@ -79,6 +79,8 @@ class BacktestWorker(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    updProgress = QtCore.Signal(int, int)
+
     def __init__(self, settings: QtCore.QSettings | None = None):
         super().__init__()
         from . import __version__
@@ -495,6 +497,13 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self._gap(6))
         self.load_btn = QtWidgets.QPushButton("Load", self)   # kept for state; loading happens on Enter / search
         self.load_btn.hide()
+        self.upd_btn = QtWidgets.QPushButton("Update")       # appears only when a newer build is published
+        self.upd_btn.setObjectName("updpill")
+        self.upd_btn.setToolTip("Download the new ChartLab and restart into it")
+        self.upd_btn.clicked.connect(self.start_update)
+        self._upd_action = tb.addWidget(self.upd_btn)
+        self._upd_action.setVisible(False)
+        tb.addWidget(self._gap(4))
         self.run_btn = QtWidgets.QPushButton("\u25b6  Run")
         self.run_btn.setObjectName("pill")
         self.run_btn.setToolTip("Run the strategy / script  (Cmd+R)")
@@ -521,9 +530,11 @@ class MainWindow(QtWidgets.QMainWindow):
             TB = QtCore.Qt.ToolButtonStyle
             on = self.auto.active if hasattr(self, "auto") else False
             steps = [(self.replay_btn, " Replay"), (self.alert_btn, " Alert"), (self.src_btn, None),
-                     (self.ind_btn, " Indicators"), (self.run_btn, "\u25b6  Run")]
+                     (self.ind_btn, " Indicators"), (self.run_btn, "\u25b6  Run"), (self.acct_btn, None)]
             for b, full in steps:                                   # everything at full size first
-                if b is self.src_btn:
+                if b is self.acct_btn:
+                    b.setToolButtonStyle(TB.ToolButtonTextBesideIcon)
+                elif b is self.src_btn:
                     b.setText(getattr(self, "_src_full", b.text()))
                 elif b is self.run_btn:
                     b.setText(full)
@@ -973,6 +984,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         f = mb.addMenu("File")
+        f.addAction("Check for updates\u2026", lambda: self.check_updates(True))
         f.addAction("Open data file…", self.open_data_file, QtGui.QKeySequence("Ctrl+O"))
         f.addAction("Open data folder…", self.open_data_folder)
         f.addAction("Open strategy…", self.open_strategy)
@@ -995,6 +1007,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s.addAction("Run script on multiple accounts…", self.run_on_accounts)
         s.addAction("Auto-trade strategy on accounts…", self.toggle_auto_trade)
         v = mb.addMenu("View")
+        v.addAction("Performance test", self.perf_test)
         v.addAction("Reset layout", self.reset_layout)
         v.addAction("Watchlist", lambda: self.show_right_panel(self.watch_dock))
         v.addAction("Alerts", lambda: self.show_right_panel(self.alerts_dock))
@@ -1178,6 +1191,117 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             ch.replay_begin()
         self.replay_btn.setChecked(ch.replay["active"])
+
+    # ------------------------------------------------------------------ self-update
+    def check_updates(self, manual: bool = False):
+        from .autotrade import _OrderWorker
+        from . import updater
+        if getattr(self, "_upd_busy", False):
+            return
+        self._upd_busy, self._upd_manual = True, bool(manual)
+        if manual:
+            self.statusBar().showMessage("Checking for a newer ChartLab\u2026")
+        w = self._upd_worker = _OrderWorker(lambda: updater.check(self.version), self)
+        w.done.connect(self._update_checked)
+        w.start()
+
+    def _update_checked(self, info, err):
+        self._upd_busy = False
+        manual = getattr(self, "_upd_manual", False)
+        if err:
+            if manual:
+                self.statusBar().showMessage(f"Could not check for updates: {err}", 8000)
+            return
+        if not info:
+            if manual:
+                self.statusBar().showMessage(f"ChartLab {self.version} is the newest version", 6000)
+            return
+        self._upd_info = info
+        self.upd_btn.setText(f"Update to {info['version']}")
+        self._upd_action.setVisible(True)
+        self._fit_topbar()
+        self.statusBar().showMessage(
+            f"ChartLab {info['version']} is ready: press 'Update to {info['version']}' at the top right", 15000)
+
+    def start_update(self):
+        from .autotrade import _OrderWorker
+        from . import updater
+        info = getattr(self, "_upd_info", None)
+        if not info or getattr(self, "_upd_busy", False):
+            return
+        reason = updater.why_not()
+        if reason:
+            QtWidgets.QMessageBox.information(self, "Update", reason)
+            return
+        if hasattr(self, "auto") and self.auto.active:
+            QtWidgets.QMessageBox.information(self, "Update", "Auto-trade is running. Stop it first, then update.")
+            return
+        self._upd_busy = True
+        self.upd_btn.setEnabled(False)
+        self.upd_btn.setText("Downloading 0%")
+        self.updProgress.connect(self._update_progress, QtCore.Qt.ConnectionType.UniqueConnection)
+
+        def job():
+            z = updater.download(info, progress=lambda got, total: self.updProgress.emit(int(got), int(total)))
+            self.updProgress.emit(-1, 0)
+            return updater.unpack(z, info["version"])
+        w = self._upd_worker = _OrderWorker(job, self)
+        w.done.connect(self._update_downloaded)
+        w.start()
+
+    def _update_progress(self, got: int, total: int):
+        if got < 0:
+            self.upd_btn.setText("Checking\u2026")
+        elif total > 0:
+            pct = int(got * 100 / total)
+            if pct != getattr(self, "_upd_pct", -1):
+                self._upd_pct = pct
+                self.upd_btn.setText(f"Downloading {pct}%")
+
+    def _update_downloaded(self, new_app, err):
+        from . import updater
+        self._upd_busy = False
+        if err or new_app is None:
+            self.upd_btn.setEnabled(True)
+            self.upd_btn.setText(f"Update to {self._upd_info['version']}")
+            self.statusBar().showMessage(f"Update failed, nothing was changed: {err}", 15000)
+            logging.error("update failed: %s", err)
+            return
+        try:
+            updater.swap_and_restart(new_app)
+        except Exception as e:  # noqa: BLE001
+            self.upd_btn.setEnabled(True)
+            self.statusBar().showMessage(f"Update failed, nothing was changed: {e}", 15000)
+            return
+        self.upd_btn.setText("Restarting\u2026")
+        self.statusBar().showMessage("Restarting into the new ChartLab\u2026")
+        QtCore.QTimer.singleShot(300, lambda: (self.close(), QtWidgets.QApplication.quit()))
+
+    def perf_test(self):
+        """View > Performance test: how long this Mac needs to draw one chart frame while panning / zooming."""
+        import time
+        ch = self.active.chart
+        if ch.df is None:
+            self.statusBar().showMessage("Load a chart first")
+            return
+        vp, vb = ch.glw.viewport(), ch.price.vb
+        (x0, x1) = vb.viewRange()[0]
+
+        def run(fn, n=40):
+            vp.repaint()
+            t0 = time.perf_counter()
+            for k in range(n):
+                fn(k)
+                vp.repaint()
+            return (time.perf_counter() - t0) / n * 1000
+        pan = run(lambda k: vb.pan_x(1.5 if k % 2 else -1.5))
+        zoom = run(lambda k: vb.zoom_x(0.97 if k % 2 else 1 / 0.97))
+        ch.price.setXRange(x0, x1, padding=0)
+        msg = (f"Performance on this Mac: pan {pan:.1f} ms per frame, zoom {zoom:.1f} ms per frame "
+               f"({int(x1 - x0)} bars on screen, {vp.width()}x{vp.height()} at {vp.devicePixelRatioF():g}x). "
+               f"Under 8 ms is perfectly smooth at 120 Hz, under 16 ms at 60 Hz.")
+        self.statusBar().showMessage(msg)
+        self.add_log("[performance] " + msg)
 
     def show_about(self):
         QtWidgets.QMessageBox.about(
@@ -1690,8 +1814,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(df):   # catch moves since last session; crossing alerts only arm on this first look
             last = float(df["Close"].iloc[-1])
             self.alerts.check(self._alert_key(panel), last, last, last)
-        self.statusBar().showMessage(
-            f"{panel.label}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} → {df.index[-1]:%d %b %Y}")
+        self._load_status(panel)
         if panel is self.active:
             self._sync_toolbar()
             self._show_result(panel)
@@ -1799,9 +1922,29 @@ class MainWindow(QtWidgets.QMainWindow):
         w.failed.connect(lambda *_: setattr(self, "_daily_busy", False))
         w.start()
 
+    def _load_status(self, panel):
+        df = panel.df
+        if df is None or not len(df):
+            return
+        ms = getattr(panel, "load_ms", None)
+        took = ""
+        if ms is not None:
+            took = f"  |  shown in {ms:,.0f} ms" if ms < 1000 else f"  |  shown in {ms / 1000:.1f} s"
+            if getattr(panel, "from_cache", False):
+                took += " from the saved copy, fetching fresh bars\u2026"
+            elif getattr(panel, "fresh_ms", None):
+                took += f", fresh bars after {panel.fresh_ms / 1000:.1f} s"
+        self.statusBar().showMessage(
+            f"{panel.chart.ticker()}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} \u2192 {df.index[-1]:%d %b %Y}{took}")
+
     def _on_refreshed(self, panel):
         """New bars arrived from a quiet auto refresh: keep alerts, strategy and labels in step."""
         df = panel.df
+        if panel is self.active and getattr(panel, "fresh_ms", None):
+            self._load_status(panel)
+            panel.fresh_ms = None
+        if not getattr(panel, "changed", True):
+            return                                           # same bars as before: nothing else to do
         if hasattr(self, "auto"):
             self.auto.on_bars(panel)
         self._refresh_alert_lines()
@@ -2300,6 +2443,12 @@ def selftest() -> int:
     for k in ("sma20", "bb", "rsi"):
         win.ind_actions[k].setChecked(True)
     win.start_auto_update()
+    from . import updater
+    if updater.app_bundle() is not None:               # the Mac app looks for a newer build by itself
+        QtCore.QTimer.singleShot(5000, win.check_updates)
+        win._upd_timer = QtCore.QTimer(win)
+        win._upd_timer.timeout.connect(win.check_updates)
+        win._upd_timer.start(2 * 60 * 60 * 1000)
     win.set_auto_refresh(0)
     win.set_strategy_code(FALLBACK_STRATEGY)
     win.run_backtest()

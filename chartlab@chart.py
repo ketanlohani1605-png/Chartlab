@@ -2,6 +2,8 @@
 crosshair with price+date tags, last-price tag, drawing tools and trade markers."""
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
@@ -86,27 +88,101 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
     def set_index(self, index: pd.DatetimeIndex):
         self._index = index
         self.intraday = bool(len(index)) and bool(((index.hour != 0) | (index.minute != 0)).any())
+        # how "important" each bar is as a place for a time label (TradingView puts labels ON calendar boundaries:
+        # a new year beats a new month beats a new day beats a round hour ...)
+        n = len(index)
+        w = np.zeros(n, dtype=np.int8)
+        if n:
+            y, mo, d = index.year.to_numpy(), index.month.to_numpy(), index.day.to_numpy()
+            ch = lambda a: np.r_[True, a[1:] != a[:-1]]  # noqa: E731
+            if self.intraday:
+                h, mi = index.hour.to_numpy(), index.minute.to_numpy()
+                w[mi % 5 == 0] = 1
+                w[mi % 15 == 0] = 2
+                w[mi % 30 == 0] = 3
+                w[ch(h) | (mi == 0)] = 4
+            newday = ch(d) | ch(mo) | ch(y)
+            if self.intraday:
+                w[newday] = 5
+            w[ch(mo) | ch(y)] = 6
+            w[ch(y)] = 7
+            w[0] = max(int(w[0]), 0) if n > 1 else 0
+            if n > 1:                                    # the very first bar is not a real boundary
+                w[0] = 0
+        self._weight = w
+        self._levels = {int(k): np.flatnonzero(w >= k) for k in range(1, 8)}
+
+    def tickValues(self, minVal, maxVal, size):
+        idx = self._index
+        if idx is None or not len(idx) or maxVal <= minVal or size <= 0:
+            return super().tickValues(minVal, maxVal, size)
+        n = len(idx)
+        gap = max(1.0, 82.0 * (maxVal - minVal) / size)          # bars between two labels (~82 px apart)
+        lo, hi = max(int(np.ceil(minVal)), 0), min(int(np.floor(maxVal)), n - 1)
+        if hi < lo:
+            return []
+        chosen: list[int] = []
+        for k in range(7, 0, -1):                                 # most important boundaries first
+            cand = self._levels[k]
+            a, b = np.searchsorted(cand, lo), np.searchsorted(cand, hi, side="right")
+            if b - a == 0:
+                continue
+            self._place(chosen, cand[a:b], gap)
+        if not self.intraday or not chosen:                       # fill what is left with ordinary bars
+            self._place(chosen, None, gap, lo, hi)
+        return [(gap, [float(v) for v in chosen])]
+
+    @staticmethod
+    def _place(chosen: list, cand, gap: float, lo: int = 0, hi: int = 0):
+        """Add candidates that keep at least `gap` bars from every label already chosen (chosen stays sorted)."""
+        import bisect
+        pos = None
+        j, m = 0, (len(cand) if cand is not None else 0)
+        cur = lo
+        while True:
+            if cand is not None:
+                if pos is not None:
+                    j = int(np.searchsorted(cand, pos + gap))
+                if j >= m:
+                    return
+                x = int(cand[j])
+            else:
+                x = cur if pos is None else int(np.ceil(pos + gap))
+                if x > hi:
+                    return
+            i = bisect.bisect_left(chosen, x)
+            left_ok = i == 0 or x - chosen[i - 1] >= gap
+            right_ok = i == len(chosen) or chosen[i] - x >= gap
+            if left_ok and right_ok:
+                chosen.insert(i, x)
+                pos = x
+            else:                                               # blocked: jump past the label in the way
+                nxt = (chosen[i - 1] if not left_ok else chosen[i]) + gap
+                pos = max(nxt - gap, x + 1 - gap) if nxt > x else x + 1 - gap
+                if cand is not None:
+                    j = int(np.searchsorted(cand, max(nxt, x + 1)))
+                    pos = None
+                    if j >= m:
+                        return
 
     def tickStrings(self, values, scale, spacing):
         idx, out = self._index, []
+        w = getattr(self, "_weight", None)
         for v in values:
             i = int(round(v))
             if idx is None or i < 0 or i >= len(idx):
                 out.append("")
                 continue
             t = idx[i]
-            if self.intraday:
-                prev = idx[max(i - max(int(round(spacing)), 1), 0)]
-                if i == 0 or prev.date() != t.date():
-                    out.append(t.strftime("%b") if prev.month != t.month or i == 0 else str(t.day))
-                else:
-                    out.append(t.strftime("%H:%M" if self.h24 else "%I:%M %p"))
-            else:                                   # TradingView: month names on month starts, day numbers between
-                prev = idx[max(i - max(int(round(spacing)), 1), 0)]
-                if i == 0 or prev.month != t.month or prev.year != t.year:
-                    out.append(str(t.year) if t.month == 1 else t.strftime("%b"))
-                else:
-                    out.append(str(t.day))
+            k = int(w[i]) if w is not None and i < len(w) else 0
+            if k >= 7:
+                out.append(str(t.year))
+            elif k == 6:
+                out.append(t.strftime("%b"))
+            elif self.intraday:
+                out.append(str(t.day) if k == 5 else t.strftime("%H:%M" if self.h24 else "%I:%M %p"))
+            else:
+                out.append(str(t.day))
         return out
 
 
@@ -1428,7 +1504,7 @@ class ChartWidget(QtWidgets.QWidget):
         self.last_tag.setVisible(bool(settings.get()['last_label']))
         self.last_line.setVisible(bool(settings.get()['last_line']))
         nt = self.name_tag                                 # TradingView: the symbol name sits left of the price
-        name = str(self.label).split(" \u00b7 ")[0].split(".")[0].lstrip("^") or ""
+        name = self.ticker()
         nt.setText(name)
         nt.setStyleSheet(f"QLabel {{ background: {color}; color: #ffffff; font-size: 12px; font-weight: 500;"
                          f" padding: 2px 5px; border-radius: 2px; }}")
@@ -1726,9 +1802,47 @@ class ChartWidget(QtWidgets.QWidget):
             return "1W"
         return "1M"
 
+    def _raw_symbol(self) -> str:
+        raw = (self.label or "").split(" \u00b7 ")[0].strip()
+        return raw.split()[0] if raw else ""
+
+    def ticker(self) -> str:
+        """What you typed, not the data vendor's code: NIFTY for '^NSEI', RELIANCE for 'RELIANCE.NS'."""
+        t = self._raw_symbol()
+        from . import data as _d
+        u = t.upper()
+        for name, code in _d._INDEX.items():
+            if code == u:
+                return name
+        for suf in (".NS", ".BO"):
+            if u.endswith(suf):
+                return t[: -len(suf)]
+        return t.lstrip("^")
+
+    def display_name(self) -> str:
+        """TradingView's legend shows the description: 'Nifty 50 Index', 'Reliance Industries Ltd'."""
+        t = self.ticker()
+        try:
+            from .tvui import NAMES
+            return NAMES.get(t.upper(), t)
+        except Exception:  # noqa: BLE001
+            return t
+
     def exchange_tag(self) -> str:
-        lab = (self.label or "").upper()
-        return "NSE" if lab and not lab.endswith("=X") and "." not in lab else (lab.split(".")[-1] if "." in lab else "FX")
+        u = self._raw_symbol().upper()
+        if not u:
+            return ""
+        if u.endswith(".BO") or u == "^BSESN":
+            return "BSE"
+        if u.endswith("=X"):
+            return "FX"
+        if u.endswith("=F"):
+            return "FUTURES"
+        if re.fullmatch(r"[A-Z0-9]{2,10}-(USD|USDT|INR|EUR|BTC)", u):
+            return "CRYPTO"
+        if "." in u and not u.endswith(".NS"):
+            return u.split(".")[-1]
+        return "NSE"
 
     def data_window_html(self, i: int) -> str:
         """TradingView's Data Window: the bar under the crosshair and every indicator / strategy value at it,
@@ -1742,14 +1856,14 @@ class ChartWidget(QtWidgets.QWidget):
         ccol = theme.UP if c >= o else theme.DOWN            # same rule as the legend at the top of the chart
         dcol = theme.UP if d >= 0 else theme.DOWN
         vol = float(self._vols[i])
-        vs = f"{vol / 1e7:.2f}Cr" if vol >= 1e7 else (f"{vol / 1e5:.2f}L" if vol >= 1e5 else f"{vol:,.0f}")
+        vs = theme.fmt_vol(vol)
         fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
         rows = [("Date", df.index[i].strftime(fmt), "#d1d4dc"),
                 ("Open", self.fp(o), ccol), ("High", self.fp(h), ccol), ("Low", self.fp(lo), ccol),
                 ("Close", self.fp(c), ccol),
                 ("Change", f"{d:+,.2f} ({(c / prev - 1) * 100 if prev else 0:+.2f}%)", dcol),
                 ("Volume", vs, "#d1d4dc")]
-        title = f"{self.label} \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}"
+        title = f"{self.ticker()} \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}"
         sections = [(title, rows)]
         ind = []
         for name, vals in getattr(self, "_legend_rows", []):
@@ -1793,7 +1907,7 @@ class ChartWidget(QtWidgets.QWidget):
         fp = self.fp
         m = theme.MUTED
         v = lambda k, x: (f"<span style='color:#ffffff'>{k}</span><span style='color:{col}'>{fp(x)}</span>")  # noqa: E731
-        title = (f"<span style='font-size:16px;color:#ffffff;font-weight:500'>{self.label}</span>"
+        title = (f"<span style='font-size:16px;color:#ffffff;font-weight:500'>{self.display_name()}</span>"
                  f"<span style='font-size:16px;color:#ffffff'> \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}</span>"
                  f"&nbsp;&nbsp;&nbsp;") if S["sl_title"] else ""
         vals = (f"{v('O', r['Open'])}&nbsp;&nbsp;{v('H', r['High'])}&nbsp;&nbsp;{v('L', r['Low'])}&nbsp;&nbsp;{v('C', r['Close'])}"
@@ -1809,7 +1923,7 @@ class ChartWidget(QtWidgets.QWidget):
                 self.header.setText(title)
         self.header.setVisible(bool(title or vals or chgt))
         vol = float(r["Volume"])
-        vs = f"{vol / 1e7:.2f}Cr" if vol >= 1e7 else (f"{vol / 1e5:.2f}L" if vol >= 1e5 else f"{vol:,.0f}")
+        vs = theme.fmt_vol(vol)
         self.vol_label.setText(f"<span style='color:#ffffff'>Vol</span> <span style='color:{col}'>{vs}</span>")
         self.vol_label.setVisible(bool(S["sl_volume"]) and not self.collapse_btn.isChecked())
         rs = getattr(self, "_rsi_arr", None)

@@ -286,7 +286,7 @@ class SymbolCard(QtWidgets.QFrame):
         if "low" in ex:
             self.range.set_range(ex["low"], ex["high"], q[0])
             v = ex.get("volume", 0.0)
-            vs = f"{v / 1e7:.2f} Cr" if v >= 1e7 else (f"{v / 1e5:.2f} L" if v >= 1e5 else f"{v:,.0f}")
+            vs = theme.fmt_vol(v)
             self.vol.setText(f"<span style='color:{theme.MUTED};font-size:12px'>Volume</span><br>"
                              f"<span style='color:#dbdbdb;font-size:13px'>{vs}</span>")
         else:

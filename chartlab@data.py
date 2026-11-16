@@ -280,6 +280,16 @@ def load_yahoo(symbol: str, interval: str = "1d", period: str = "2y") -> tuple[p
     return df, f"{sym} · {interval}"
 
 
+def peek_cache(symbol: str, interval: str = "1d", period: str = "2y"):
+    """The last good download of this chart, if there is one - shown at once while the fresh bars are fetched."""
+    sym = normalize_symbol(symbol)
+    f = _cache_file(sym, interval, clamp_period(interval, period))
+    if not f.exists():
+        return None
+    df = pd.read_parquet(f)
+    return (df, f"{sym} \u00b7 {interval}") if len(df) else None
+
+
 def _cache_file(sym: str, interval: str, period: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{sym}_{interval}_{period}")
     return USER_DIR / "cache" / f"{safe}.parquet"

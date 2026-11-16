@@ -13,12 +13,21 @@ from .chart import ChartWidget
 class LoadWorker(QtCore.QThread):
     done = QtCore.Signal(object, str)
     failed = QtCore.Signal(str)
+    early = QtCore.Signal(object, str)          # a saved copy, shown at once while the fresh bars are on their way
 
-    def __init__(self, fn, parent=None):
+    def __init__(self, fn, parent=None, early_fn=None):
         super().__init__(parent)
         self.fn = fn
+        self.early_fn = early_fn
 
     def run(self):
+        if self.early_fn is not None:
+            try:
+                r = self.early_fn()
+                if r is not None:
+                    self.early.emit(r[0], r[1])
+            except Exception:  # noqa: BLE001 - a bad saved copy only means: wait for the fresh one
+                pass
         try:
             df, label = self.fn()
             self.done.emit(df, label)
@@ -122,10 +131,36 @@ class ChartPanel(QtWidgets.QFrame):
         if not quiet:
             self.chart.header.setText(f"Loading {symbol} …")
             self.loadStarted.emit(self)
-        self._worker = LoadWorker(fn, self)
+        early = None
+        if not quiet and source == "yahoo":
+            early = lambda: datamod.peek_cache(symbol, interval, rng)  # noqa: E731
+        elif not quiet and source == "auto":
+            early = lambda: (None if datamod.find_local(symbol) is not None  # noqa: E731
+                             else datamod.peek_cache(symbol, interval, rng))
+        import time
+        self._t0 = time.perf_counter()
+        self.load_ms, self.from_cache = None, False
+        self._worker = LoadWorker(fn, self, early)
         self._worker.done.connect(self._on_done)
         self._worker.failed.connect(self._fail)
+        self._worker.early.connect(self._on_early)
         self._worker.start()
+
+    def _stale(self) -> bool:
+        """True when this result belongs to an older request (the symbol was changed again meanwhile)."""
+        s = self.sender()
+        return isinstance(s, LoadWorker) and s is not getattr(self, "_worker", None)
+
+    def _on_early(self, df, label):
+        import time
+        if self._stale() or getattr(self, "_quiet", False) or df is None or not len(df):
+            return
+        self.df, self.label, self.result, self.signals = df, label, None, None
+        self.chart.set_data(df, label)
+        self.last_error = ""
+        self.load_ms, self.from_cache = (time.perf_counter() - self._t0) * 1000, True
+        self._quiet = True                      # the fresh bars then slide in without disturbing the view
+        self.loadFinished.emit(self)
 
     _raw_cache: dict = {}
 
@@ -147,12 +182,20 @@ class ChartPanel(QtWidgets.QFrame):
         self._on_done(df, label)
 
     def _on_done(self, df, label):
+        import time
+        if self._stale():
+            return
         self.loading = False
         if getattr(self, "_quiet", False) and self.df is not None:
             self._quiet = False
             self.load_event.set()
+            if self.from_cache:
+                self.from_cache = False
+                self.fresh_ms = (time.perf_counter() - self._t0) * 1000
             self._apply_refresh(df, label)
             return
+        if getattr(self, "_t0", None) is not None:
+            self.load_ms = (time.perf_counter() - self._t0) * 1000
         self.df, self.label, self.result, self.signals = df, label, None, None
         self.chart.set_data(df, label)
         self.last_error = ""
@@ -167,7 +210,10 @@ class ChartPanel(QtWidgets.QFrame):
         except Exception:  # noqa: BLE001
             same = False
         if same or df is None or not len(df) or ch.replay["active"] or ch.layer._drag or ch.layer.pending:
+            self.changed = False
+            self.refreshed.emit(self)
             return
+        self.changed = True
         (x0, x1), auto_y = ch.price.vb.viewRange()[0], ch.auto_y
         yr = ch.price.vb.viewRange()[1]
         grew = len(df) - len(old)
@@ -187,6 +233,8 @@ class ChartPanel(QtWidgets.QFrame):
         self.refreshed.emit(self)
 
     def _fail(self, msg: str):
+        if self._stale():
+            return
         self.loading = False
         if getattr(self, "_quiet", False):                 # a background refresh that failed: keep the chart as is
             self._quiet = False

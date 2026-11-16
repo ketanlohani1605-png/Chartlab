@@ -20,6 +20,19 @@ CHEVRON_PNG = os.path.join(tempfile.gettempdir(), "chartlab_chevron_v1.png").rep
 LINE_COLORS = ["#f5a623", "#2196f3", "#e91e63", "#9c27b0", "#00bcd4", "#8bc34a", "#ffeb3b"]
 
 
+def fmt_vol(v: float) -> str:
+    """Volume the way TradingView writes it: 342.5K, 3.42M, 30.03B."""
+    v = float(v)
+    a = abs(v)
+    if a >= 1e9:
+        return f"{v / 1e9:.2f}B"
+    if a >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if a >= 1e3:
+        return f"{v / 1e3:.2f}K"
+    return f"{v:,.0f}"
+
+
 def sc(keys: str) -> str:
     """A shortcut the way the platform writes it: on macOS 'Alt+A' -> '⌥A', 'Ctrl+Shift+Z' -> '⇧⌘Z',
     'Del' -> '⌫' (TradingView for Mac shows these symbols); unchanged elsewhere."""
@@ -127,6 +140,9 @@ QPushButton#primary {{ background: {ACCENT}; color: white; font-weight: 600; }}
 QPushButton#primary:hover {{ background: #4a7bff; }}
 QPushButton#pill {{ background: white; color: black; font-weight: 700; border-radius: 16px; padding: 6px 18px; }}
 QPushButton#pill:hover {{ background: #e0e3eb; }}
+QPushButton#updpill {{ background: #2962ff; color: white; font-weight: 600; border-radius: 16px; padding: 6px 14px; }}
+QPushButton#updpill:hover {{ background: #1e53e5; }}
+QPushButton#updpill:disabled {{ background: #1c2f6b; color: #c9d4ff; }}
 QPushButton:disabled {{ color: {MUTED}; }}
 QPlainTextEdit {{ background: #0a0a0a; border: 1px solid {GRID}; selection-background-color: {ACCENT}; }}
 QTableWidget {{ background: {BG}; gridline-color: {GRID}; border: 0; alternate-background-color: #0d0d0d; selection-background-color: #1e2a55; }}
