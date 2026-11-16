@@ -282,7 +282,7 @@ class SymbolCard(QtWidgets.QFrame):
                            f"<span style='font-size:11px;color:{theme.MUTED}'>&nbsp;{cur}&nbsp;&nbsp;</span>"
                            f"<span style='font-size:16px;color:{col}'>{chg:+,.2f}&nbsp;&nbsp;{q[1] * 100:+.2f}%</span>")
         ex = ex or {}
-        self.when.setText(f"Last update at {ex.get('time', '--:--')}  (delayed)")
+        self.when.setText(f"Last update at {ex.get('time', '--:--')}  ({'live' if ex.get('live') else 'delayed'})")
         if "low" in ex:
             self.range.set_range(ex["low"], ex["high"], q[0])
             v = ex.get("volume", 0.0)
@@ -509,6 +509,30 @@ class WatchlistWidget(QtWidgets.QWidget):
         self._update_card()
         self.refresh_btn.setEnabled(True)
         self.status.setText(f"Updated {QtCore.QTime.currentTime().toString('HH:mm:ss')}  ·  delayed quotes")
+
+    def live_price(self, sym: str, ltp: float, prev: float | None = None):
+        """A real-time trade from the broker feed: this row moves now, between the slower full refreshes."""
+        ex = self.extra.setdefault(sym, {})
+        if prev:
+            ex["prev"] = float(prev)
+        pv = ex.get("prev")
+        if not pv:
+            q = self.quotes.get(sym)
+            if q and q[0] and (1 + q[1]):
+                pv = ex["prev"] = q[0] / (1 + q[1])
+        self.quotes[sym] = (float(ltp), (ltp / pv - 1) if pv else 0.0)
+        ex["high"], ex["low"] = max(ex.get("high", ltp), ltp), min(ex.get("low", ltp), ltp)
+        ex["time"], ex["live"] = time.strftime("%H:%M:%S"), True
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if not it.data(ROLE_SECTION) and it.data(ROLE_SYM) == sym:
+                it.setData(ROLE_QUOTE, self.quotes[sym])
+        if not getattr(self, "_live_note", False):
+            self._live_note = True
+            self.status.setText("Live prices from Dhan")
+        cur = self.list.currentItem()
+        if cur is not None and cur.data(ROLE_SYM) == sym:
+            self._update_card()
 
     def _quotes_failed(self, msg):
         self.refresh_btn.setEnabled(True)

@@ -1,7 +1,7 @@
 """Qt-free Dhan helpers shared by the app and by user scripts (copied next to the script as chartlab_dhan.py)."""
 from __future__ import annotations
 
-import http.client, json, os, threading, time, urllib.error, urllib.request
+import http.client, json, os, re, threading, time, urllib.error, urllib.request
 import concurrent.futures as cf
 from datetime import date
 from pathlib import Path
@@ -80,7 +80,7 @@ def resolve_symbol(symbol: str) -> tuple[str, str, str, str]:
 
 # ------------------------------------------------------------------ instruments (fast, cached)
 _IDS = USER_DIR / "cache" / "dhan_ids.json"
-_OPT = USER_DIR / "cache" / "dhan_options.pkl"
+_OPT = USER_DIR / "cache" / "dhan_options2.pkl"
 
 
 def _ids_cache() -> dict:
@@ -110,11 +110,21 @@ def instrument(symbol: str, exchange: str = "NSE") -> dict:
     return {"security_id": sid, "segment": seg, "instrument": inst, "lot": 1}
 
 
+_OPT_MEM: dict = {}
+
+
 def _options_table() -> pd.DataFrame:
+    """Every listed option contract: inst, und, sid, lot, expiry, strike, type, seg. Built once a day."""
     fresh = _OPT.exists() and date.fromtimestamp(_OPT.stat().st_mtime) == date.today()
     if fresh:
+        key = _OPT.stat().st_mtime
+        if _OPT_MEM.get("key") == key:
+            return _OPT_MEM["df"]
         try:
-            return pd.read_pickle(_OPT)
+            t = pd.read_pickle(_OPT)
+            if "seg" in t.columns:
+                _OPT_MEM.update(key=key, df=t)
+                return t
         except Exception:  # noqa: BLE001 - unreadable cache: rebuild it below
             pass
     m = _master()
@@ -123,14 +133,23 @@ def _options_table() -> pd.DataFrame:
     miss = [n for n in need if n not in c]
     if miss:
         raise RuntimeError("Dhan instrument list changed (missing " + ", ".join(miss) + "). Update ChartLab.")
-    t = m[m[c["INSTRUMENT"]].isin(["OPTIDX", "OPTSTK"])][[c[n] for n in need]].copy()
+    rows = m[m[c["INSTRUMENT"]].isin(["OPTIDX", "OPTSTK"])]
+    t = rows[[c[n] for n in need]].copy()
     t.columns = ["inst", "und", "sid", "lot", "expiry", "strike", "type"]
     t["expiry"] = pd.to_datetime(t["expiry"], errors="coerce").dt.date
     t["und"] = t["und"].astype(str).str.upper()
+    t["type"] = t["type"].astype(str).str.upper()
+    t["strike"] = pd.to_numeric(t["strike"], errors="coerce")
+    ex = rows[c["EXCH_ID"]].astype(str).str.upper() if "EXCH_ID" in c else "NSE"
+    t["seg"] = "NSE_FNO"
+    if "EXCH_ID" in c:
+        t.loc[(ex == "BSE").to_numpy(), "seg"] = "BSE_FNO"
+    t = t.dropna(subset=["expiry", "strike"]).reset_index(drop=True)
     _OPT.parent.mkdir(parents=True, exist_ok=True)
     tmp = _OPT.with_suffix(".part")
     t.to_pickle(tmp)
     os.replace(tmp, _OPT)
+    _OPT_MEM.update(key=_OPT.stat().st_mtime, df=t)
     return t
 
 
@@ -148,8 +167,336 @@ def option(underlying: str, strike: float, kind: str, expiry: str | None = None)
     if t.empty:
         raise RuntimeError(f"No {underlying} {strike} {kind} contract found" + (f" for {expiry}" if expiry else ""))
     r = t.iloc[0]
-    return {"security_id": str(int(r["sid"])), "segment": "NSE_FNO", "instrument": str(r["inst"]),
-            "lot": int(r["lot"]), "name": f"{underlying.upper()} {r['expiry']} {strike:g} {kind}"}
+    return _contract(r)
+
+
+def _contract(r) -> dict:
+    und, exp, strike, kind = str(r["und"]), r["expiry"], float(r["strike"]), str(r["type"])
+    return {"security_id": str(int(r["sid"])), "segment": str(r.get("seg", "NSE_FNO")), "instrument": str(r["inst"]),
+            "lot": int(r["lot"]), "name": f"{und} {exp} {strike:g} {kind}",
+            "und": und, "expiry": exp, "strike": strike, "kind": kind,
+            "symbol": option_symbol(und, exp, strike, kind)}
+
+
+# ------------------------------------------------------------------ option symbols
+_MON = {m: i + 1 for i, m in enumerate("JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split())}
+_MONS = "|".join(_MON)
+_TV_OPT = re.compile(r"^([A-Z][A-Z0-9&\-]*?)(\d{2})(\d{2})(\d{2})([CP])(\d+(?:\.\d+)?)$")
+_KIND = {"CE": "CE", "C": "CE", "CALL": "CE", "PE": "PE", "P": "PE", "PUT": "PE"}
+
+
+def option_symbol(und: str, expiry, strike: float, kind: str) -> str:
+    """One-word contract name, the way TradingView writes it: NIFTY261124C25000."""
+    return f"{und.upper()}{pd.Timestamp(expiry):%y%m%d}{'C' if kind.upper().startswith('C') else 'P'}{float(strike):g}"
+
+
+def option_name(und: str, expiry, strike: float, kind: str) -> str:
+    return f"{und.upper()} {pd.Timestamp(expiry):%d %b %Y} {float(strike):g} {kind.upper()}".replace(" 0", " ", 1)
+
+
+def _expiry_spec(mid: str):
+    """'' -> None (nearest) | '24NOV', '24 NOV 26', '2026-11-24', '24-11-2026' -> ('d', y|None, m, d) | 'NOV', 'NOV26' -> ('m', y|None, m).
+    Returns False when the text is not a date at all."""
+    mid = mid.strip().strip(",")
+    if not mid:
+        return None
+    yr = lambda y: None if not y else (int(y) if len(y) == 4 else 2000 + int(y))  # noqa: E731
+    m = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", mid)
+    if m:
+        return ("d", int(m[1]), int(m[2]), int(m[3]))
+    m = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})(?:[-/](\d{4}|\d{2}))?", mid)
+    if m:
+        return ("d", yr(m[3]), int(m[2]), int(m[1]))
+    m = re.fullmatch(rf"(\d{{1,2}})\s*[-]?\s*({_MONS})[A-Z]*\s*[-']?\s*(\d{{4}}|\d{{2}})?", mid)
+    if m:
+        return ("d", yr(m[3]), _MON[m[2]], int(m[1]))
+    m = re.fullmatch(rf"({_MONS})[A-Z]*\s*[-']?\s*(\d{{4}}|\d{{2}})?", mid)
+    if m:
+        return ("m", yr(m[2]), _MON[m[1]])
+    return False
+
+
+_TAIL_OPT = re.compile(r"^(.*?)\s*(\d+(?:\.\d+)?)\s*(CE|PE|CALL|PUT|C|P)$")
+
+
+def _option_candidates(text: str):
+    """Every sensible reading of the text, best first; the contract list then decides which one exists."""
+    s = re.sub(r"\s+", " ", str(text).strip().upper())
+    if ":" in s:
+        s = s.split(":", 1)[1].strip()
+    m = _TV_OPT.match(s.replace(" ", ""))
+    if m:
+        try:
+            d = date(2000 + int(m[2]), int(m[3]), int(m[4]))
+            yield m[1], ("d", d.year, d.month, d.day), float(m[6]), _KIND[m[5]]
+        except ValueError:
+            pass
+    m = _TAIL_OPT.match(s)
+    if not m or not m[1] or not float(m[2]):
+        return
+    head, strike, kind = m[1].strip(), m[2], _KIND[m[3]]
+    if not re.match(r"[A-Z0-9]", head) or not re.search(r"[A-Z]", head):
+        return
+    splits = []
+    if " " in head:
+        und, mid = head.split(" ", 1)
+        splits.append((und, mid))
+    else:
+        for pat in (rf"^(.+?)(\d{{1,2}}(?:{_MONS})\d{{0,4}})$", rf"^(.+?)((?:{_MONS})\d{{0,4}})$"):
+            m2 = re.match(pat, head)
+            if m2 and re.search(r"[A-Z]", m2[1]):
+                splits.append((m2[1], m2[2]))
+        splits.append((head, ""))
+    for und, mid in splits:
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9&\-]*", und):
+            continue
+        spec = _expiry_spec(mid)
+        if spec is not False:
+            yield und, spec, float(strike), kind
+        # "NIFTY24NOV2625000CE": the year ran into the strike
+        if mid and " " not in s and len(strike) > 3:
+            spec2 = _expiry_spec(mid + strike[:2])
+            if spec2 and float(strike[2:] or 0):
+                yield und, spec2, float(strike[2:]), kind
+
+
+def parse_option(text: str):
+    """'NIFTY 25000 CE', 'NIFTY 24NOV 25000 PE', 'BANKNIFTY NOV 52000 CE', 'NIFTY261124C25000'
+    -> (underlying, expiry spec or None, strike, 'CE'|'PE'); None when the text is not an option."""
+    return next(iter(_option_candidates(text)), None)
+
+
+def is_option(text: str) -> bool:
+    return parse_option(text) is not None
+
+
+def _pick_expiry(t: pd.DataFrame, spec):
+    today = date.today()
+    exps = sorted(set(t["expiry"]))
+    live = [e for e in exps if e >= today]
+    if spec is None:
+        return live[0] if live else None
+    if spec[0] == "d":
+        _, y, mo, d = spec
+        hit = [e for e in (live if y is None else exps) if e.month == mo and e.day == d and (y is None or e.year == y)]
+        return hit[0] if hit else None
+    _, y, mo = spec
+    hit = [e for e in (live if y is None else exps) if e.month == mo and (y is None or e.year == y)]
+    if not hit:
+        return None
+    first = hit[0]
+    return max(e for e in hit if (e.year, e.month) == (first.year, first.month))     # the monthly contract
+
+
+def resolve_option(text: str) -> dict:
+    """Any way of writing an option -> the contract (security id, segment, lot, expiry, canonical 'symbol')."""
+    cands = list(_option_candidates(text))
+    if not cands:
+        raise RuntimeError(f"'{text}' is not an option. Write it like NIFTY 25000 CE or NIFTY 24NOV 25000 PE.")
+    tab = _options_table()
+    why = ""
+    for und, spec, strike, kind in cands:
+        t = tab[tab["und"] == und]
+        if t.empty:
+            why = why or f"{und} has no options on Dhan"
+            continue
+        exp = _pick_expiry(t, spec)
+        if exp is None:
+            nxt = ", ".join(f"{e:%d %b}" for e in sorted(set(t[t['expiry'] >= date.today()]['expiry']))[:4])
+            why = f"no {und} expiry matches that date. Upcoming: {nxt}"
+            continue
+        r = t[(t["expiry"] == exp) & (t["type"] == kind) & ((t["strike"] - strike).abs() < 1e-6)]
+        if r.empty:
+            ks = sorted(set(t[t["expiry"] == exp]["strike"]))
+            near = sorted(ks, key=lambda k: abs(k - strike))[:4]
+            why = f"no {und} {strike:g} {kind} for {exp:%d %b %Y}. Nearest strikes: " + ", ".join(f"{k:g}" for k in sorted(near))
+            continue
+        return _contract(r.iloc[0])
+    raise RuntimeError(why[0].upper() + why[1:] + ".")
+
+
+def expiries(underlying: str) -> list:
+    t = _options_table()
+    t = t[(t["und"] == underlying.upper()) & (t["expiry"] >= date.today())]
+    return sorted(set(t["expiry"]))
+
+
+def strikes(underlying: str, expiry) -> list:
+    t = _options_table()
+    t = t[(t["und"] == underlying.upper()) & (t["expiry"] == pd.Timestamp(expiry).date())]
+    return sorted(set(float(x) for x in t["strike"]))
+
+
+def contracts(underlying: str, expiry) -> dict:
+    """(strike, 'CE'|'PE') -> contract dict for one expiry."""
+    t = _options_table()
+    t = t[(t["und"] == underlying.upper()) & (t["expiry"] == pd.Timestamp(expiry).date())]
+    return {(float(r["strike"]), str(r["type"])): _contract(r) for _, r in t.iterrows()}
+
+
+def underlyings() -> list:
+    """Names that have options, indices first."""
+    t = _options_table()
+    idx = [u for u in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX")
+           if (t["und"] == u).any()]
+    rest = sorted(set(t[t["inst"] == "OPTSTK"]["und"]))
+    return idx + rest
+
+
+def options_ready() -> bool:
+    """True when the contract list can be read without downloading anything (safe to use from the UI thread)."""
+    if _OPT_MEM.get("df") is not None:
+        return True
+    try:
+        return _OPT.exists() and date.fromtimestamp(_OPT.stat().st_mtime) == date.today()
+    except OSError:
+        return False
+
+
+def search_options(text: str, limit: int = 40) -> list:
+    """Contracts for what was typed so far: 'NIFTY' -> strikes around the middle of the nearest expiry,
+    'NIFTY 25000' -> that strike's CE and PE for the next expiries, 'NIFTY 24NOV 25000 CE' -> that contract."""
+    s = re.sub(r"\s+", " ", str(text).strip().upper())
+    if ":" in s:
+        s = s.split(":", 1)[1].strip()
+    if not s:
+        return []
+    tab = _options_table()
+    today = date.today()
+    out, seen = [], set()
+
+    def add(rows):
+        for _, r in rows.iterrows():
+            c = _contract(r)
+            if c["symbol"] not in seen:
+                seen.add(c["symbol"])
+                out.append(c)
+
+    for und, spec, strike, kind in _option_candidates(s):
+        t = tab[(tab["und"] == und) & (tab["type"] == kind) & ((tab["strike"] - strike).abs() < 1e-6)]
+        if t.empty:
+            continue
+        if spec is None:
+            t = t[t["expiry"] >= today].sort_values("expiry").head(6)
+        else:
+            exp = _pick_expiry(tab[tab["und"] == und], spec)
+            t = t[t["expiry"] == exp] if exp else t.iloc[0:0]
+        add(t)
+    if out:
+        return out[:limit]
+    tok = s.split(" ")
+    und, rest = tok[0], tok[1:]
+    strike = None
+    if rest and re.fullmatch(r"\d+(?:\.\d+)?", rest[-1]):
+        strike, rest = float(rest[-1]), rest[:-1]
+    spec = _expiry_spec(" ".join(rest))
+    if spec is False:
+        return []
+    if (tab["und"] == und).any():
+        names = [und]
+    elif strike is None and not rest:
+        names = [u for u in underlyings() if u.startswith(und)][:3]
+    else:
+        names = []
+    for u in names:
+        t = tab[tab["und"] == u]
+        if strike is not None:
+            t = t[(t["strike"] - strike).abs() < 1e-6]
+            if spec is None:
+                exps = sorted(set(t[t["expiry"] >= today]["expiry"]))[:4]
+            else:
+                e = _pick_expiry(tab[tab["und"] == u], spec)
+                exps = [e] if e else []
+            add(t[t["expiry"].isin(exps)].sort_values(["expiry", "type"]))
+            continue
+        exp = _pick_expiry(t, spec)
+        if exp is None:
+            continue
+        t = t[t["expiry"] == exp]
+        ks = sorted(set(t["strike"]))
+        mid = len(ks) // 2
+        near = ks[max(0, mid - 4): mid + 5] if len(names) == 1 else ks[mid:mid + 1]
+        add(t[t["strike"].isin(near)].sort_values(["strike", "type"]))
+    return out[:limit]
+
+
+def underlying_ref(underlying: str) -> tuple[int, str]:
+    """(security id, segment) of the thing the options are written on, as the option-chain API wants it."""
+    u = underlying.upper()
+    if u in INDEX_IDS:
+        return int(INDEX_IDS[u]), "IDX_I"
+    ins = instrument(u)
+    return int(ins["security_id"]), ins["segment"]
+
+
+def resolve_any(symbol: str) -> dict:
+    """Index, stock or option -> {'security_id','segment','instrument','lot', ...}. Raises when Dhan has no such thing."""
+    if is_option(symbol):
+        return resolve_option(symbol)
+    s = symbol.strip().upper()
+    ex, base = (s.split(":", 1) if ":" in s else ("NSE", s))
+    if base in INDEX_IDS:
+        return {"security_id": INDEX_IDS[base], "segment": "IDX_I", "instrument": "INDEX", "lot": 1}
+    if ex not in ("NSE", "BSE") or not re.fullmatch(r"[A-Z0-9&\-_]+", base):
+        raise RuntimeError(f"'{symbol}' is not an NSE/BSE symbol")
+    return instrument(base, ex)
+
+
+# ------------------------------------------------------------------ live prices / option chain (Data API)
+def _hdr(acct: dict) -> dict:
+    return {"access-token": acct["access_token"], "client-id": str(acct["client_id"]), "Accept": "application/json"}
+
+
+def ltp(acct: dict, instruments) -> dict:
+    """[(segment, security_id), ...] -> {(segment, security_id): last price}. One call, up to 1000 instruments,
+    Dhan allows one such call a second."""
+    body: dict = {}
+    for seg, sid in instruments:
+        body.setdefault(seg, []).append(int(sid))
+    if not body:
+        return {}
+    js = json.loads(_http(f"{DHAN}/marketfeed/ltp", body, _hdr(acct), timeout=8))
+    out = {}
+    for seg, rows in (js.get("data") or {}).items():
+        for sid, v in (rows or {}).items():
+            px = (v or {}).get("last_price")
+            if px:
+                out[(seg, str(sid))] = float(px)
+    return out
+
+
+def expiry_list(acct: dict, underlying: str) -> list:
+    scrip, seg = underlying_ref(underlying)
+    js = json.loads(_http(f"{DHAN}/optionchain/expirylist", {"UnderlyingScrip": scrip, "UnderlyingSeg": seg},
+                          _hdr(acct), timeout=10))
+    return [pd.Timestamp(d).date() for d in (js.get("data") or [])]
+
+
+def option_chain(acct: dict, underlying: str, expiry) -> dict:
+    """-> {'spot': float, 'rows': [{'strike', 'ce': {...}, 'pe': {...}}]} sorted by strike. Each side has
+    ltp, oi, volume, iv, prev (previous close), bid, ask and delta when Dhan sends them. One call per 3 seconds."""
+    scrip, seg = underlying_ref(underlying)
+    js = json.loads(_http(f"{DHAN}/optionchain", {"UnderlyingScrip": scrip, "UnderlyingSeg": seg,
+                                                  "Expiry": str(pd.Timestamp(expiry).date())}, _hdr(acct), timeout=10))
+    d = js.get("data") or {}
+
+    def side(x):
+        if not x:
+            return None
+        g = x.get("greeks") or {}
+        return {"ltp": float(x.get("last_price") or 0), "oi": float(x.get("oi") or 0),
+                "volume": float(x.get("volume") or 0), "iv": float(x.get("implied_volatility") or 0),
+                "prev": float(x.get("previous_close_price") or 0), "prev_oi": float(x.get("previous_oi") or 0),
+                "bid": float(x.get("top_bid_price") or 0), "ask": float(x.get("top_ask_price") or 0),
+                "delta": float(g.get("delta") or 0), "sid": str(x.get("security_id") or "")}
+    rows = []
+    for k, v in (d.get("oc") or {}).items():
+        try:
+            rows.append({"strike": float(k), "ce": side((v or {}).get("ce")), "pe": side((v or {}).get("pe"))})
+        except (TypeError, ValueError):
+            continue
+    rows.sort(key=lambda r: r["strike"])
+    return {"spot": float(d.get("last_price") or 0), "rows": rows}
 
 
 # ------------------------------------------------------------------ fast order routing

@@ -46,23 +46,28 @@ def supertrend(df: pd.DataFrame, n: int = 10, mult: float = 3.0) -> pd.DataFrame
     a = atr(df, n).to_numpy(float)
     hl2 = (h + l) / 2
     up, dn = hl2 - mult * a, hl2 + mult * a
-    st = np.full(len(c), np.nan)
-    d = np.ones(len(c))
-    for k in range(1, len(c)):
-        if np.isnan(a[k]):
+    # plain Python floats: this loop is ~10x faster than indexing numpy arrays one element at a time
+    n_ = len(c)
+    nan = float("nan")
+    A, C, U, D = a.tolist(), c.tolist(), up.tolist(), dn.tolist()
+    st, d = [nan] * n_, [1.0] * n_
+    for k in range(1, n_):
+        ak = A[k]
+        if ak != ak:                                         # NaN: ATR not ready yet
             continue
-        if not np.isnan(up[k - 1]) and c[k - 1] > up[k - 1]:
-            up[k] = max(up[k], up[k - 1])
-        if not np.isnan(dn[k - 1]) and c[k - 1] < dn[k - 1]:
-            dn[k] = min(dn[k], dn[k - 1])
+        u1, d1, c1 = U[k - 1], D[k - 1], C[k - 1]
+        if u1 == u1 and c1 > u1 and u1 > U[k]:
+            U[k] = u1
+        if d1 == d1 and c1 < d1 and d1 < D[k]:
+            D[k] = d1
         prev = d[k - 1]
-        if prev < 0 and c[k] > dn[k - 1]:
-            d[k] = 1
-        elif prev > 0 and c[k] < up[k - 1]:
-            d[k] = -1
+        if prev < 0 and C[k] > d1:
+            d[k] = 1.0
+        elif prev > 0 and C[k] < u1:
+            d[k] = -1.0
         else:
             d[k] = prev
-        st[k] = up[k] if d[k] > 0 else dn[k]
+        st[k] = U[k] if d[k] > 0 else D[k]
     return pd.DataFrame({"st": st, "dir": d}, index=df.index)
 
 

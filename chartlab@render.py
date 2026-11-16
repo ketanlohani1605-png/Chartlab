@@ -56,6 +56,23 @@ class CandleItem(pg.GraphicsObject):
         self.informViewBoundsChanged()
         self.update()
 
+    def set_last(self, o, h, l, c) -> bool:
+        """Live tick: change only the newest bar. False when the whole series must be rebuilt (Heikin Ashi)."""
+        if self.style == "heikin" or not len(self.o):
+            return False
+        v = np.array([o, h, l, c], float)
+        if self.tf is not None:
+            v = np.asarray(self.tf(v), float)
+        if not self.o.flags.writeable:
+            self.o, self.h, self.l, self.c = (np.array(a, float) for a in (self.o, self.h, self.l, self.c))
+        grow = v[1] > self.h[-1] or v[2] < self.l[-1]
+        self.o[-1], self.h[-1], self.l[-1], self.c[-1] = v
+        if grow:
+            self.prepareGeometryChange()
+            self.informViewBoundsChanged()
+        self.update()
+        return True
+
     def boundingRect(self):
         n = len(self.o)
         if n == 0:
@@ -154,6 +171,16 @@ class VolumeItem(pg.GraphicsObject):
         self.informViewBoundsChanged()
         self.update()
 
+    def set_last(self, vol, up):
+        if not len(self.v):
+            return
+        if not self.v.flags.writeable:
+            self.v = np.array(self.v, float)
+        if not self.up.flags.writeable:
+            self.up = np.array(self.up, bool)
+        self.v[-1], self.up[-1] = vol, up
+        self.update()
+
     def boundingRect(self):
         n = len(self.v)
         if n == 0:
@@ -187,6 +214,45 @@ class VolumeItem(pg.GraphicsObject):
             m = up == is_up
             if m.any():
                 p.drawRects([QR(a - w, base, 2 * w, b * k) for a, b in zip(xs[m].tolist(), v[m].tolist())])
+
+
+class BandFill(pg.GraphicsObject):
+    """The shaded area between two lines (Bollinger bands). Only the part on screen is drawn, so a band over
+    100,000 bars costs the same as one over 100."""
+
+    def __init__(self, upper, lower, brush):
+        super().__init__()
+        self.u, self.l = np.asarray(upper, float), np.asarray(lower, float)
+        self.brush = brush
+        self.limit = None
+        ok = np.isfinite(self.u) & np.isfinite(self.l)
+        self._first = int(np.argmax(ok)) if ok.any() else len(self.u)
+        if ok.any():
+            lo, hi = float(np.nanmin(self.l)), float(np.nanmax(self.u))
+            self._rect = QtCore.QRectF(-1, lo, len(self.u) + 2, max(hi - lo, 1e-9))
+        else:
+            self._rect = QtCore.QRectF()
+
+    def boundingRect(self):
+        return self._rect
+
+    def paint(self, p, *args):
+        i0, i1, g = _visible(self, len(self.u))
+        i0 = max(i0, self._first)
+        if i1 - i0 < 2:
+            return
+        xs = np.arange(i0, i1, g, dtype=float)
+        u, lo = self.u[i0:i1:g], self.l[i0:i1:g]
+        ok = np.isfinite(u) & np.isfinite(lo)
+        if ok.sum() < 2:
+            return
+        xs, u, lo = xs[ok], u[ok], lo[ok]
+        P = QtCore.QPointF
+        pts = [P(a, b) for a, b in zip(xs.tolist(), u.tolist())]
+        pts += [P(a, b) for a, b in zip(xs[::-1].tolist(), lo[::-1].tolist())]
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(self.brush)
+        p.drawPolygon(QtGui.QPolygonF(pts))
 
 
 class TradeMarkers(pg.GraphicsObject):

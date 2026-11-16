@@ -24,7 +24,7 @@ DARK = ("QDialog{background:#1e1e1e;border:1px solid #2e2e2e;border-radius:10px;
         "QCalendarWidget QAbstractItemView{selection-background-color:#2962ff;selection-color:#fff;} "
         "QDateEdit,QTimeEdit{background:#121212;border:1px solid #3a3a3a;border-radius:6px;padding:6px;color:#fff;}")
 
-CHIPS = ["All", "Stocks", "Indices", "Crypto", "US"]
+CHIPS = ["All", "Stocks", "Indices", "Options", "Crypto", "US"]
 
 NAMES = {"NIFTY": "Nifty 50 Index", "BANKNIFTY": "Nifty Bank Index", "SENSEX": "S&P BSE Sensex", "FINNIFTY":
          "Nifty Financial Services", "RELIANCE": "Reliance Industries Ltd", "TCS": "Tata Consultancy Services Ltd",
@@ -43,8 +43,23 @@ NAMES = {"NIFTY": "Nifty 50 Index", "BANKNIFTY": "Nifty Bank Index", "SENSEX": "
          "TSLA": "Tesla Inc", "BTC-USD": "Bitcoin / US Dollar", "ETH-USD": "Ethereum / US Dollar"}
 
 
+def _opt(sym: str):
+    """(underlying, expiry, strike, 'CE'|'PE') for a contract symbol like NIFTY261124C25000, else None."""
+    from .dhan_core import _TV_OPT
+    import datetime as _dt
+    m = _TV_OPT.match(sym.upper().split(":")[-1])
+    if not m:
+        return None
+    try:
+        return m[1], _dt.date(2000 + int(m[2]), int(m[3]), int(m[4])), float(m[6]), "CE" if m[5] == "C" else "PE"
+    except ValueError:
+        return None
+
+
 def _kind(sym: str) -> str:
     s = sym.upper()
+    if _opt(s):
+        return "Options"
     if "-USD" in s:
         return "Crypto"
     if s.split(":")[-1] in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY"):
@@ -55,10 +70,18 @@ def _kind(sym: str) -> str:
 
 
 def _exch(sym: str) -> str:
+    o = _opt(sym)
+    if o:
+        return "BSE" if o[0] in ("SENSEX", "BANKEX") else "NSE"
     return "BSE" if sym.startswith("BSE:") else ("NASDAQ" if sym.startswith("US:") else ("CRYPTO" if "-USD" in sym else "NSE"))
 
 
 ROLE = QtCore.Qt.ItemDataRole.UserRole
+
+
+def _is_option_text(t: str) -> bool:
+    from .dhan_core import is_option
+    return is_option(t)
 
 
 class _SearchDelegate(QtWidgets.QStyledItemDelegate):
@@ -85,7 +108,8 @@ class _SearchDelegate(QtWidgets.QStyledItemDelegate):
         sym = index.data(ROLE)
         typed = index.data(ROLE + 1)
         tick = sym.split(":")[-1]
-        draw_logo(p, QtCore.QRectF(r.x() + 20, r.center().y() - 15, 30, 30), sym, option.font)
+        opt = None if typed else _opt(sym)
+        draw_logo(p, QtCore.QRectF(r.x() + 20, r.center().y() - 15, 30, 30), opt[0] if opt else sym, option.font)
         f = QtGui.QFont(option.font)
         f.setPixelSize(16)
         f.setWeight(QtGui.QFont.Weight.Medium)
@@ -104,12 +128,18 @@ class _SearchDelegate(QtWidgets.QStyledItemDelegate):
         f.setWeight(QtGui.QFont.Weight.Normal)
         p.setFont(f)
         p.setPen(QtGui.QColor("#9598a1"))
-        desc = "Use the typed symbol" if typed else NAMES.get(tick, NAMES.get(sym, tick))
+        if typed:
+            desc = "Nearest expiry of this option" if " " in sym or _is_option_text(sym) else "Use the typed symbol"
+        elif opt:
+            from .dhan_core import option_name
+            desc = option_name(*opt)
+        else:
+            desc = NAMES.get(tick, NAMES.get(sym, tick))
         fm = p.fontMetrics()
         dy = r.y() + 32 + fm.ascent()
         p.drawText(r.x() + 66, dy, desc)
         badge = ("SYMBOL" if typed else _kind(sym).upper().replace("STOCKS", "STOCK").replace("INDICES", "INDEX")
-                 .replace("US", "STOCK"))
+                 .replace("OPTIONS", "OPTION").replace("US", "STOCK"))
         bx = r.x() + 66 + fm.horizontalAdvance(desc) + 8
         f.setPixelSize(9)
         f.setWeight(QtGui.QFont.Weight.Bold)
@@ -183,10 +213,10 @@ class SymbolSearch(QtWidgets.QDialog):
         self.lst.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.lst.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         lay.addWidget(self.lst, 1)
-        hint = QtWidgets.QLabel("\u2191 \u2193 to move  \u00b7  Enter to open  \u00b7  Esc to close  \u00b7  "
-                                "any NSE/BSE/US/crypto symbol works, even if it is not listed")
+        hint = QtWidgets.QLabel("")
         hint.setStyleSheet("color:#6a6d78;font-size:11px;padding:2px 6px;")
         lay.addWidget(hint)
+        self.hint = hint
         self.edit.textChanged.connect(self._fill)
         self.edit.returnPressed.connect(self._accept)
         self.lst.itemClicked.connect(lambda *_: self._accept())
@@ -226,8 +256,12 @@ class SymbolSearch(QtWidgets.QDialog):
                 continue
             scored.append((score, ":" in s, len(tick), s))       # NSE before BSE:/US: on ties
         scored.sort()
-        exact = any(sc[0] == 0 for sc in scored)
-        if t and not exact and re.fullmatch(r"[A-Z0-9&\-_.:^]+", t):
+        opts = self._options(t)
+        if self.kind == "Options":
+            scored = []
+        exact = any(sc[0] == 0 for sc in scored) or any(o.upper() == t.replace(" ", "") for o in opts)
+        if t and not exact and (re.fullmatch(r"[A-Z0-9&\-_.:^]+", t) or _is_option_text(t)) \
+                and (self.kind != "Options" or _is_option_text(t)):
             it = QtWidgets.QListWidgetItem()
             it.setData(ROLE, t)
             it.setData(ROLE + 1, True)
@@ -241,10 +275,73 @@ class SymbolSearch(QtWidgets.QDialog):
             scored_items.append(it)
         if scored_items and scored_items[0].data(ROLE + 1) and len(scored_items) > 1 and scored[0][0] <= 1:
             scored_items.append(scored_items.pop(0))        # a real prefix match goes first, typed text last
+        at = 0 if (self.kind == "Options" or (opts and (" " in t or any(ch.isdigit() for ch in t)))) else len(scored_items)
+        for o in opts:                                       # contracts: on top once a strike is being typed
+            it = QtWidgets.QListWidgetItem()
+            it.setData(ROLE, o)
+            it.setData(ROLE + 1, False)
+            scored_items.insert(at, it)
+            at += 1
+        self._set_hint()
         for it in scored_items:
             self.lst.addItem(it)
         if self.lst.count():
             self.lst.setCurrentRow(0)
+
+    # ------------------------------------------------------------------ option contracts
+    def _options(self, t: str) -> list:
+        """Contract symbols for the typed text. The contract list is read in the background the first time."""
+        from . import dhan_core
+        want = self.kind == "Options" or (self.kind == "All" and bool(t) and (" " in t or any(c.isdigit() for c in t)))
+        if not want:
+            return []
+        if not dhan_core.options_ready():
+            self._warm_options()
+            return []
+        try:
+            return [c["symbol"] for c in dhan_core.search_options(t or "NIFTY", 30 if self.kind == "Options" else 8)]
+        except Exception:  # noqa: BLE001 - a bad instrument list must not break symbol search
+            return []
+
+    def _warm_options(self):
+        if getattr(self, "_warm", None) is not None:
+            return
+        import threading
+        from . import dhan_core
+        self._warm_err = ""
+
+        def work():
+            try:
+                dhan_core._options_table()
+            except Exception as e:  # noqa: BLE001
+                self._warm_err = str(e)
+        self._warm = threading.Thread(target=work, daemon=True)
+        self._warm.start()
+        self._warm_timer = QtCore.QTimer(self)
+        self._warm_timer.setInterval(300)
+
+        def poll():
+            if not self._warm.is_alive():
+                self._warm_timer.stop()
+                if not self._warm_err:
+                    self._fill()
+                self._set_hint()
+        self._warm_timer.timeout.connect(poll)
+        self._warm_timer.start()
+
+    def _set_hint(self):
+        base = ("\u2191 \u2193 to move  \u00b7  Enter to open  \u00b7  Esc to close  \u00b7  "
+                "any NSE/BSE/US/crypto symbol works, even if it is not listed")
+        if self.kind == "Options":
+            w = getattr(self, "_warm", None)
+            if w is not None and w.is_alive():
+                base = "Reading the list of option contracts from Dhan (first time today)\u2026"
+            elif getattr(self, "_warm_err", ""):
+                base = "Could not read the contract list: " + self._warm_err[:90]
+            else:
+                base = ("Type like  NIFTY 25000 CE  \u00b7  BANKNIFTY NOV 52000 PE  \u00b7  RELIANCE 27NOV 1300 CE"
+                        "  \u00b7  no date = nearest expiry  \u00b7  prices need a Dhan account")
+        self.hint.setText(base)
 
     def keyPressEvent(self, ev):
         K = QtCore.Qt.Key

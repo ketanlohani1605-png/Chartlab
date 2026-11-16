@@ -1,8 +1,12 @@
 """One chart pane: owns its data, symbol/timeframe, indicators, drawings and last backtest result."""
 from __future__ import annotations
 
+import re
 import threading
+import time
 
+import numpy as np
+import pandas as pd
 from PySide6 import QtCore, QtWidgets
 
 from . import data as datamod
@@ -73,8 +77,8 @@ class ChartPanel(QtWidgets.QFrame):
         if not self.multi:
             self.setStyleSheet("ChartPanel { border: 0; }")
         else:
-            self.setStyleSheet(
-                f"ChartPanel {{ border: 1px solid {"#d1d4dc" if on else theme.BORDER}; }}")
+            col = "#d1d4dc" if on else theme.BORDER
+            self.setStyleSheet(f"ChartPanel {{ border: 1px solid {col}; }}")
 
     @property
     def symbol_key(self) -> str:
@@ -89,9 +93,25 @@ class ChartPanel(QtWidgets.QFrame):
     @staticmethod
     def _load_auto(symbol, interval, rng):
         from . import accounts
+        from .dhan_core import is_option
         loaders = [(f"API {a['name']}", lambda s, i, r, n=a["name"]: accounts.load_api(n, s, i, r))
                    for a in accounts.load_accounts() if a.get("broker") == "dhan" and a.get("access_token")]
+        if is_option(symbol):                              # option prices only come from the broker
+            return ChartPanel._load_option(symbol, interval, rng, loaders)
         return datamod.load_auto(symbol, interval, rng, loaders)
+
+    @staticmethod
+    def _load_option(symbol, interval, rng, loaders):
+        if not loaders:
+            raise RuntimeError("Option charts need a Dhan account: Accounts \u2192 Manage accounts, paste the client id "
+                               "and access token. (Yahoo has no NSE option prices.)")
+        errors = []
+        for name, fn in loaders:
+            try:
+                return fn(symbol, interval, rng)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}: {e}")
+        raise RuntimeError("  |  ".join(str(x)[:160] for x in errors))
 
     def refresh(self) -> bool:
         """Quietly fetch the same symbol again (live / daily auto update). The view, drawings and zoom stay put;
@@ -112,6 +132,8 @@ class ChartPanel(QtWidgets.QFrame):
             fn = lambda: self._load_local(path, interval)  # noqa: E731
         elif source == "auto":
             fn = lambda: self._load_auto(symbol, interval, rng)  # noqa: E731
+        elif source == "yahoo" and self._is_option(symbol):
+            fn = lambda: self._load_auto(symbol, interval, rng)  # noqa: E731 - Yahoo has no NSE options
         elif source == "yahoo":
             fn = lambda: datamod.load_yahoo(symbol, interval, rng)  # noqa: E731
         elif source.startswith("provider:"):
@@ -132,12 +154,13 @@ class ChartPanel(QtWidgets.QFrame):
             self.chart.header.setText(f"Loading {symbol} …")
             self.loadStarted.emit(self)
         early = None
-        if not quiet and source == "yahoo":
+        if self._is_option(symbol):
+            pass
+        elif not quiet and source == "yahoo":
             early = lambda: datamod.peek_cache(symbol, interval, rng)  # noqa: E731
         elif not quiet and source == "auto":
             early = lambda: (None if datamod.find_local(symbol) is not None  # noqa: E731
                              else datamod.peek_cache(symbol, interval, rng))
-        import time
         self._t0 = time.perf_counter()
         self.load_ms, self.from_cache = None, False
         self._worker = LoadWorker(fn, self, early)
@@ -146,13 +169,25 @@ class ChartPanel(QtWidgets.QFrame):
         self._worker.early.connect(self._on_early)
         self._worker.start()
 
+    @staticmethod
+    def _is_option(symbol) -> bool:
+        from .dhan_core import is_option
+        return is_option(symbol)
+
+    def _canon(self, label):
+        """'NIFTY 25000 CE' was typed, the contract that loaded is NIFTY261124C25000: remember that exact one, so
+        drawings, alerts and the live feed belong to this contract and not to next week's."""
+        first = str(label).split(" \u00b7 ")[0].strip()
+        if self.params.get("source") != "file" and first and self._is_option(self.params.get("symbol", "")) \
+                and " " not in first and self._is_option(first):
+            self.params["symbol"] = first
+
     def _stale(self) -> bool:
         """True when this result belongs to an older request (the symbol was changed again meanwhile)."""
         s = self.sender()
         return isinstance(s, LoadWorker) and s is not getattr(self, "_worker", None)
 
     def _on_early(self, df, label):
-        import time
         if self._stale() or getattr(self, "_quiet", False) or df is None or not len(df):
             return
         self.df, self.label, self.result, self.signals = df, label, None, None
@@ -182,7 +217,6 @@ class ChartPanel(QtWidgets.QFrame):
         self._on_done(df, label)
 
     def _on_done(self, df, label):
-        import time
         if self._stale():
             return
         self.loading = False
@@ -197,6 +231,8 @@ class ChartPanel(QtWidgets.QFrame):
         if getattr(self, "_t0", None) is not None:
             self.load_ms = (time.perf_counter() - self._t0) * 1000
         self.df, self.label, self.result, self.signals = df, label, None, None
+        self._canon(label)
+        self._tick, self._day_vol, self._live_bars = None, None, set()
         self.chart.set_data(df, label)
         self.last_error = ""
         self.load_event.set()
@@ -213,7 +249,24 @@ class ChartPanel(QtWidgets.QFrame):
             self.changed = False
             self.refreshed.emit(self)
             return
+        live = getattr(self, "_live_bars", None)
+        if live and len(old) and old.index[-1] > df.index[-1]:
+            # bars the live feed opened that the broker's candle list does not have yet: they stay
+            keep = old[(old.index > df.index[-1]) & old.index.isin(list(live))]
+            if len(keep):
+                df = pd.concat([df, keep])
+        if live:
+            self._live_bars = {t for t in live if t > df.index[0] and t >= df.index[-1]}
         self.changed = True
+        if self._same_bars(old, df) and ch.replace_values(df):
+            # the same bars with newer numbers: put them in place - no rebuild, the view and drawings are not touched
+            self.df, self.label = df, label
+            ch.label = label
+            tk = getattr(self, "_tick", None)
+            if tk and time.time() - tk[0] < 5:             # the live feed is ahead of the candle list: keep its price
+                ch.update_last(tk[1])
+            self.refreshed.emit(self)
+            return
         (x0, x1), auto_y = ch.price.vb.viewRange()[0], ch.auto_y
         yr = ch.price.vb.viewRange()[1]
         grew = len(df) - len(old)
@@ -231,6 +284,76 @@ class ChartPanel(QtWidgets.QFrame):
         else:
             ch.price.setYRange(yr[0], yr[1], padding=0)
         self.refreshed.emit(self)
+
+    @staticmethod
+    def _same_bars(old, df) -> bool:
+        try:
+            return len(df) == len(old) and list(df.columns) == list(old.columns) and df.index.equals(old.index)
+        except Exception:  # noqa: BLE001
+            return False
+
+    # ------------------------------------------------------------------ live ticks
+    def bar_step(self) -> float:
+        """Seconds in one bar: 0 = daily or longer."""
+        iv = str(self.params.get("interval", ""))
+        m = re.fullmatch(r"(\d+)(m|h)", iv)
+        if m:
+            return int(m[1]) * (60.0 if m[2] == "m" else 3600.0)
+        if iv in ("1d", "1wk", "1mo"):
+            return 0.0
+        s = self.chart.bar_seconds()
+        return s if 0 < s < 80000 else 0.0
+
+    def on_tick(self, ltp: float, t: float | None, day_volume: float | None = None) -> str:
+        """One live price. t = trade time as seconds on the chart's own (exchange wall-clock) time axis, or None.
+        -> 'same' (newest bar changed), 'new' (a bar was added), '' (ignored)."""
+        ch = self.chart
+        df = self.df
+        if (df is None or not len(df) or self.loading or ch.replay["active"] or ch.candles is None
+                or not ltp or ltp <= 0 or ch._limit is not None):
+            return ""
+        last_t = float(ch._times[-1])
+        step = self.bar_step()
+        iv = str(self.params.get("interval", ""))
+        prev_dv, self._day_vol = getattr(self, "_day_vol", None), day_volume
+        add = 0.0
+        if day_volume and prev_dv and day_volume > prev_dv:
+            add = float(day_volume - prev_dv)
+        new_t = None
+        if t is not None:
+            if step > 0:
+                k = int((t - last_t) // step)
+                if k >= 1:
+                    new_t = last_t + k * step
+                elif t < last_t - step:
+                    return ""                                # an old trade: not this bar
+            else:
+                a, b = pd.Timestamp(t, unit="s"), df.index[-1]
+                if iv == "1wk":
+                    newer = a.normalize() > b.normalize() and a.isocalendar()[:2] != b.isocalendar()[:2]
+                elif iv == "1mo":
+                    newer = (a.year, a.month) > (b.year, b.month)
+                else:
+                    newer = a.normalize() > b.normalize()
+                if newer:
+                    new_t = float(a.normalize().value // 10 ** 9)
+        self._tick = (time.time(), float(ltp))
+        if new_t is None:
+            vol = float(ch._vols[-1]) + add if add else None
+            return "same" if ch.update_last(float(ltp), volume=vol) else ""
+        if ch.layer._drag or ch.layer.pending or ch._panning() \
+                or QtWidgets.QApplication.mouseButtons() != QtCore.Qt.MouseButton.NoButton:
+            return ""                                        # mid-gesture: the bar is added on the next tick
+        row = {c: float(ltp) for c in ("Open", "High", "Low", "Close")}
+        row["Volume"] = add
+        extra = pd.DataFrame([{c: row.get(c, np.nan) for c in df.columns}],
+                             index=pd.DatetimeIndex([pd.Timestamp(new_t, unit="s")], name=df.index.name))
+        df2 = pd.concat([df, extra.astype(df.dtypes.to_dict(), errors="ignore")])
+        if not hasattr(self, "_live_bars"):
+            self._live_bars = set()
+        self._live_bars.add(df2.index[-1])
+        self._apply_refresh(df2, self.label)
+        return "new"
 
     def _fail(self, msg: str):
         if self._stale():

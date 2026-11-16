@@ -63,7 +63,8 @@ from .dhan_core import DHAN, INDEX_IDS, MASTER_URL, _http, _master, place_order,
 
 
 _DAYS = {"5d": 5, "1mo": 31, "3mo": 93, "6mo": 186, "1y": 366, "2y": 731, "5y": 1827, "10y": 3653, "max": 3653}
-_MIN = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+_MIN = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}             # the candle sizes Dhan serves directly
+_VIA = {"3m": ("1m", 3), "30m": ("15m", 30)}               # built here from a smaller one
 
 
 def _frame(js: dict) -> pd.DataFrame:
@@ -91,15 +92,28 @@ def fetch_dhan(acct: dict, symbol: str, interval: str, period: str) -> pd.DataFr
     per-symbol disk cache so re-opening a chart only downloads the bars that are new since last time."""
     import concurrent.futures as cf
     import time as _time
-    from .dhan_core import instrument
+    from .dhan_core import instrument, is_option, resolve_option
     hdr = {"access-token": acct["access_token"], "client-id": acct["client_id"], "Accept": "application/json"}
     s = symbol.strip().upper()
     ex, base = (s.split(":", 1) if ":" in s else ("NSE", s))
-    if base in INDEX_IDS:
+    tag = ""
+    if is_option(s):                                        # NIFTY 25000 CE, NIFTY261124C25000, ...
+        ins = resolve_option(s)
+        sid, seg, inst = ins["security_id"], ins["segment"], ins["instrument"]
+        tag = f"_{ins['expiry']:%y%m%d}"                    # ids are re-used after expiry: keep caches apart
+    elif base in INDEX_IDS:
         sid, seg, inst = INDEX_IDS[base], "IDX_I", "INDEX"
     else:
         ins = instrument(base, ex)
         sid, seg, inst = ins["security_id"], ins["segment"], ins["instrument"]
+    if interval in _VIA:                                    # Dhan has no 3m / 30m candles: build them from 1m / 15m
+        base_iv, mins = _VIA[interval]
+        df = fetch_dhan(acct, symbol, base_iv, period)
+        if not len(df):
+            return df
+        return (df.resample(f"{mins}min", on="Date", offset=f"{(9 * 60 + 15) % mins}min")
+                .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+                .dropna(subset=["Open"]).reset_index())
     mkey = (sid, seg, interval, period)
     hit = _MEM.get(mkey)
     if hit and _time.time() - hit[0] < 20:                  # same chart re-opened within seconds
@@ -109,7 +123,7 @@ def fetch_dhan(acct: dict, symbol: str, interval: str, period: str) -> pd.DataFr
     intraday = interval in _MIN
     if intraday:
         start = max(start, end - dt.timedelta(days=370))
-    cfile = _CANDLE_DIR / f"{seg}_{sid}_{'m' + str(_MIN[interval]) if intraday else 'd'}.pkl"
+    cfile = _CANDLE_DIR / f"{seg}_{sid}{tag}_{'m' + str(_MIN[interval]) if intraday else 'd'}.pkl"
     cached = None
     try:
         cached = pd.read_pickle(cfile)
@@ -277,8 +291,12 @@ def load_api(account: str, symbol: str, interval: str, period: str):
     a = get_account(account)
     if a["broker"] != "dhan":
         raise RuntimeError(f"Broker '{a['broker']}' has no data adapter")
+    from .dhan_core import is_option, resolve_option
     raw = fetch_dhan(a, symbol, interval, period)
-    return datamod.standardise(raw), f"{symbol.upper()} · {interval} · {a['name']}"
+    name = symbol.strip().upper()
+    if is_option(name):
+        name = resolve_option(name)["symbol"]               # one word, TradingView style: NIFTY261124C25000
+    return datamod.standardise(raw), f"{name} · {interval} · {a['name']}"
 
 
 # ---------------------------------------------------------------------- UI

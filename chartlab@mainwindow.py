@@ -108,6 +108,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_strategy_dock()
         self._build_alerts_dock()
         self._build_data_dock()
+        self._build_chain_dock()
         self._build_results_dock()
         self._build_right_rail()
         self._build_menu()
@@ -117,6 +118,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 hm.addMenu(act.menu())
         self.menu_btn.setMenu(hm)
         self.setStatusBar(QtWidgets.QStatusBar())
+        self.live_label = QtWidgets.QLabel("")
+        self.live_label.hide()
+        self.statusBar().addPermanentWidget(self.live_label)
         self.api_label = QtWidgets.QLabel("")
         self.statusBar().addPermanentWidget(self.api_label)
         ver = QtWidgets.QLabel(f"v{self.version}  ")
@@ -582,6 +586,10 @@ class MainWindow(QtWidgets.QMainWindow):
             a.setChecked(sec == cur)
             g3.addAction(a)
             a.triggered.connect(lambda _=False, s=sec: self.set_auto_refresh(s))
+        a = m.addAction("Real-time prices from Dhan (ticks)")
+        a.setCheckable(True)
+        a.setChecked(self.settings.value("live_prices", "true") == "true")
+        a.triggered.connect(self.set_live_prices)
         a = m.addAction("Download watchlist every day")
         a.setCheckable(True)
         a.setChecked(self.settings.value("daily_download", "true") == "true")
@@ -721,12 +729,13 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setMovable(False)
         tb.setIconSize(QtCore.QSize(24, 24))
         self.addToolBar(QtCore.Qt.ToolBarArea.RightToolBarArea, tb)
-        self.right_docks = [self.watch_dock, self.alerts_dock, self.strategy_dock, self.data_dock]
+        self.right_docks = [self.watch_dock, self.alerts_dock, self.strategy_dock, self.data_dock, self.chain_dock]
         self.rail_actions = {}
         for dock, ico, tip in ((self.watch_dock, "watchlist", "Watchlist"),
                                (self.alerts_dock, "bell", "Alerts"),
                                (self.strategy_dock, "code", "Python strategy editor"),
-                               (self.data_dock, "datawin", f"Data window  ({theme.sc('Alt+D')})")):
+                               (self.data_dock, "datawin", f"Data window  ({theme.sc('Alt+D')})"),
+                               (self.chain_dock, "chain", "Option chain")):
             act = tb.addAction(icons.get(ico), "")
             act.setCheckable(True)
             act.setToolTip(tip)
@@ -747,6 +756,9 @@ class MainWindow(QtWidgets.QMainWindow):
             d.setVisible(d is dock)
         for d, a in self.rail_actions.items():
             a.setChecked(d is dock)
+        if dock is getattr(self, "chain_dock", None) and getattr(self, "active", None) is not None:
+            QtCore.QTimer.singleShot(0, lambda: self.chain.follow(str(self.active.params.get("symbol", ""))))
+        self.live_sync()
         if dock is getattr(self, "data_dock", None):          # open on the bar the legend shows, not "Hover a bar"
             ch = self.active.chart
             if ch.df is not None and ch._n():
@@ -763,6 +775,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.data_dock.setWidget(self.data_lbl)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.data_dock)
         self.data_dock.hide()
+
+    def _build_chain_dock(self):
+        from .live import LiveController
+        from .optionchain import OptionChain
+        self.live = LiveController(self)
+        self.live.enabled = self.settings.value("live_prices", "true") == "true"
+        self.chain = OptionChain(account_fn=self.live.account)
+        self.chain_dock = QtWidgets.QDockWidget("Option chain", self)
+        self.chain_dock.setObjectName("chain_dock")
+        self.chain_dock.setWidget(self.chain)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.chain_dock)
+        self.chain_dock.hide()
+        self.live.extra = self.chain.instruments
+        self._live_timer = QtCore.QTimer(self)
+        self._live_timer.setSingleShot(True)
+        self._live_timer.setInterval(150)
+        self._live_timer.timeout.connect(self.live.sync)
+        self.chain.changed.connect(self.live_sync)
+        self.chain.picked.connect(self.open_symbol)
+        self.chain.needAccount.connect(lambda: self.manage_accounts())
+        self.live.status.connect(self._live_status)
+
+    def live_sync(self):
+        """Tell the live feed what is on screen now (debounced: layout changes come in bursts)."""
+        if hasattr(self, "_live_timer"):
+            self._live_timer.start()
+
+    def open_symbol(self, sym: str):
+        self.symbol.setText(sym)
+        self.on_load()
+
+    def set_live_prices(self, on: bool):
+        self.settings.setValue("live_prices", "true" if on else "false")
+        self.live.enabled = bool(on)
+        self.live.sync()
+        if not on:
+            self.live_label.hide()
+
+    def _live_status(self, mode: str, detail: str):
+        lab = self.live_label
+        text, col = {"live": ("\u25cf Live", theme.UP), "polling": ("\u25cf Live (1.5 s)", "#f7a600"),
+                     "connecting": ("\u25cb Connecting\u2026", theme.MUTED),
+                     "error": ("\u25cf Live prices off", theme.DOWN)}.get(mode, ("", theme.MUTED))
+        lab.setVisible(bool(text))
+        lab.setText(text + "  ")
+        lab.setStyleSheet(f"color:{col};")
+        tip = {"live": "Real-time prices from Dhan's live market feed: every trade moves the chart.",
+               "polling": "Prices are fetched from Dhan every 1.5 seconds (the live socket is not connected).",
+               "connecting": "Connecting to Dhan's live market feed\u2026",
+               "error": "Live prices are not running: " + (detail or "")}.get(mode, "")
+        lab.setToolTip(tip)
+        if mode == "error" and detail and getattr(self, "_live_err", "") != detail:
+            self.statusBar().showMessage("Live prices: " + detail, 9000)
+        self._live_err = detail if mode == "error" else ""
+
+    def on_live_price(self, panel, ltp: float, new_bar: bool):
+        """A live trade reached a chart: alerts fire at once; a freshly opened bar is checked against the broker's
+        own candle a moment later."""
+        self.alerts.check(self._alert_key(panel), ltp, ltp, ltp)
+        if new_bar:
+            QtCore.QTimer.singleShot(2500, panel.refresh)
 
     def _update_data_window(self, panel, i):
         if panel is self.active and self.data_dock.isVisible():
@@ -818,6 +891,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.watchlist = WatchlistWidget()
         self.watchlist.symbolChosen.connect(self._watchlist_chosen)
         self.watchlist.changed.connect(self._save_watchlist)
+        self.watchlist.changed.connect(lambda: self.live_sync())
         self.watchlist.addRequested.connect(self._watchlist_add_search)
         self.watch_dock = QtWidgets.QDockWidget("Watchlist", self)
         self.watch_dock.setWidget(self.watchlist)
@@ -961,13 +1035,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # TradingView: one side panel at a time, chosen from the right icon rail; no tabs
         self.watch_dock.setTitleBarWidget(QtWidgets.QWidget())          # the watchlist draws its own header
         for d, title in ((self.strategy_dock, "Strategy (Python)"), (self.alerts_dock, "Alerts"),
-                         (self.data_dock, "Data window")):
+                         (self.data_dock, "Data window"), (self.chain_dock, "Option chain")):
             lab = QtWidgets.QLabel(title)
             lab.setObjectName("panelTitle")
             d.setTitleBarWidget(lab)
-        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock, self.data_dock):
+        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock, self.data_dock, self.chain_dock):
             d.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
             d.setMinimumWidth(340)
+        self.chain_dock.setMinimumWidth(430)                 # seven columns need a little more room
         self.results_dock.hide()
         self.watch_dock.setObjectName("dock_watchlist")
         self.strategy_dock.setObjectName("dock_strategy")
@@ -1013,6 +1088,7 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addAction("Alerts", lambda: self.show_right_panel(self.alerts_dock))
         v.addAction("Strategy editor", lambda: self.show_right_panel(self.strategy_dock))
         v.addAction("Data window\t" + theme.sc("Alt+D"), lambda: self.show_right_panel(self.data_dock))
+        v.addAction("Option chain", lambda: self.show_right_panel(self.chain_dock))
         v.addAction("Hide side panel", lambda: self.show_right_panel(None))
         v.addSeparator()
         v.addAction(self.results_dock.toggleViewAction())
@@ -1150,7 +1226,8 @@ class MainWindow(QtWidgets.QMainWindow):
         add("Remove all drawings", "Drawing tool", lambda: ch.layer.clear())
         add("Hide / show drawings", "Drawing tool", lambda: ch.layer.set_hidden(not ch.layer.hidden), "Ctrl+Alt+H")
         for dock, text in ((self.watch_dock, "Watchlist"), (self.alerts_dock, "Alerts panel"),
-                           (self.strategy_dock, "Strategy editor"), (self.data_dock, "Data window")):
+                           (self.strategy_dock, "Strategy editor"), (self.data_dock, "Data window"),
+                           (self.chain_dock, "Option chain")):
             add(text, "Panel", lambda d=dock: self.show_right_panel(d), "Alt+D" if dock is self.data_dock else "",
                 dock.isVisible())
         add("Strategy Tester", "Panel", lambda: self.results_dock.setVisible(not self.results_dock.isVisible()), "",
@@ -1370,6 +1447,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_watchlist()
         if self.api is not None:
             self.api.stop()
+        self.live.stop()
+        self.chain.stop()
         super().closeEvent(e)
 
     def _save_watchlist(self):
@@ -1443,6 +1522,7 @@ class MainWindow(QtWidgets.QMainWindow):
             p.set_active(p is self.active)
         if self.active not in self.panels[:n]:
             self.set_active(self.panels[0])
+        self.live_sync()
 
     def _autoload_extra(self, panel, idx):
         syms = self.watchlist.symbols()
@@ -1533,6 +1613,9 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
         self._fill_api_sources()
         self._update_acct_dot()
+        self.live_sync()
+        if self.chain.isVisible():
+            self.chain.reload()
         added = getattr(dlg, "saved", "")
         if added and self.source.findData(f"api:{added}") >= 0 and not any(
                 str(self.source.itemData(i)).startswith("api:") and self.source.currentData() == self.source.itemData(i)
@@ -1815,7 +1898,9 @@ class MainWindow(QtWidgets.QMainWindow):
             last = float(df["Close"].iloc[-1])
             self.alerts.check(self._alert_key(panel), last, last, last)
         self._load_status(panel)
+        self.live_sync()
         if panel is self.active:
+            self.chain.follow(str(panel.params.get("symbol", "")))
             self._sync_toolbar()
             self._show_result(panel)
             self.watchlist.select(str(panel.params.get("symbol", "")).upper())
@@ -2460,6 +2545,15 @@ def selftest() -> int:
         app.processEvents()
     ok = (p.chart.df is not None and not win.grab().isNull() and p.result is not None
           and p.chart.price.vb.viewRange()[0][1] > 0)
+    # real-time prices: the socket module and its TLS plug-in must be inside the app, and a tick must move the bar
+    from PySide6 import QtNetwork
+    from . import live
+    ws = live.QtWebSockets is not None
+    tls = bool(QtNetwork.QSslSocket.supportsSsl())
+    px = float(c[-1]) * 1.02
+    tick = p.on_tick(px, None) == "same" and abs(float(p.df["Close"].iloc[-1]) - px) < 1e-6
+    print(f"live: websockets={ws} tls={tls} tick={tick}", flush=True)
+    ok = ok and ws and tls and tick
     print(("SELFTEST OK " if ok else "SELFTEST FAILED ") + win.version, flush=True)
     quit_cleanly(win, 0 if ok else 1)
     return 0 if ok else 1

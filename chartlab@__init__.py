@@ -1,2 +1,1 @@
-"""ChartLab - a TradingView-style charting + Python strategy backtesting desktop app."""
-__version__ = "0.26.0"
+__version__ = "0.27.0"

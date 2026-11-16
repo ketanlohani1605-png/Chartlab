@@ -18,7 +18,7 @@ from .gestures import TVViewBox
 # pyqtgraph drops mouse-move events that arrive faster than 100/s; Mac trackpads / ProMotion screens send
 # ~120/s, so crosshair and drags would skip. Qt already compresses moves when busy, so take every one.
 pg.setConfigOption("mouseRateLimit", 0)
-from .render import CandleItem, VolumeItem
+from .render import BandFill, CandleItem, VolumeItem
 
 _QWIDGETSIZE_MAX = 16777215
 STYLES = ["candles", "hollow", "bars", "heikin", "line", "linemark", "step", "area", "baseline"]
@@ -111,6 +111,10 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
                 w[0] = 0
         self._weight = w
         self._levels = {int(k): np.flatnonzero(w >= k) for k in range(1, 8)}
+
+    def share_index(self, other):
+        self._index, self.intraday = other._index, other.intraday
+        self._weight, self._levels = other._weight, other._levels
 
     def tickValues(self, minVal, maxVal, size):
         idx = self._index
@@ -441,6 +445,10 @@ class ChartWidget(QtWidgets.QWidget):
         self._last_trades = None
         self.auto_y = True
         self._limit = None            # replay: only bars [0, _limit) exist yet
+        self._ind_timer = QtCore.QTimer(self)                # live ticks: indicators follow at most once a second
+        self._ind_timer.setSingleShot(True)
+        self._ind_timer.setInterval(1000)
+        self._ind_timer.timeout.connect(self._refresh_indicators)
         self.replay = {"active": False, "picking": False, "playing": False, "speed": 1.0}
         self._enabled: set[str] = set()
         self._ind_items: dict[str, list] = {}
@@ -699,6 +707,9 @@ class ChartWidget(QtWidgets.QWidget):
                 f = getattr(it, "_full", None)
                 if f is not None:
                     it.setData(f[0][:n], f[1][:n])
+                elif hasattr(it, "limit"):               # the Bollinger fill follows the replay position too
+                    it.limit = self._limit
+                    it.update()
         for it, _name in self._strategy_items:
             f = getattr(it, "_full", None)
             if f is not None:
@@ -1175,8 +1186,9 @@ class ChartWidget(QtWidgets.QWidget):
         self._wipe()
         self.df, self.label = df, label
         n = len(df)
-        for a in self.axes:
-            a.set_index(df.index)
+        self.axes[0].set_index(df.index)
+        for a in self.axes[1:]:                              # same bars on every pane: work the labels out once
+            a.share_index(self.axes[0])
         self._times = df.index.to_numpy().astype("datetime64[s]").astype("int64").astype(float)
 
         self._base = float(df["Close"].iloc[0])
@@ -1214,6 +1226,90 @@ class ChartWidget(QtWidgets.QWidget):
         self.go_latest()
         self._update_last_tag()
         self._update_header(n - 1)
+
+    def update_last(self, close, high=None, low=None, volume=None, open_=None) -> bool:
+        """A live price for the newest bar. Only that bar, the last-price label, the legend and (at most once a
+        second) the indicators change: no rebuild, the view and the drawings are not touched."""
+        df = self.df
+        if df is None or not len(df) or self._limit is not None or self.candles is None:
+            return False
+        n = len(df) - 1
+        for name in ("_opens", "_highs", "_lows", "_closes", "_vols"):
+            a = getattr(self, name)
+            if not a.flags.writeable:
+                setattr(self, name, np.array(a, float))
+        o = float(self._opens[n] if open_ is None else open_)
+        c = float(close)
+        h = max(float(self._highs[n] if high is None else high), c, o)
+        lo = min(float(self._lows[n] if low is None else low), c, o)
+        v = float(self._vols[n] if volume is None else volume)
+        if (o, h, lo, c, v) == (self._opens[n], self._highs[n], self._lows[n], self._closes[n], self._vols[n]):
+            return False
+        cp = getattr(self, "_colpos", None)
+        if cp is None or cp[0] is not df:                    # column positions: looked up once per data set
+            pos = {k: df.columns.get_loc(k) for k in ("Open", "High", "Low", "Close", "Volume")}
+            cp = self._colpos = (df, pos, {k: df.dtypes.iloc[j].kind in "iu" for k, j in pos.items()})
+        _, pos, ints = cp
+        for col, val, arr in (("Open", o, self._opens), ("High", h, self._highs), ("Low", lo, self._lows),
+                              ("Close", c, self._closes), ("Volume", v, self._vols)):
+            if arr[n] != val:
+                arr[n] = val
+                df.iat[n, pos[col]] = int(val) if ints[col] else val
+        if self.candles.isVisible():
+            if not self.candles.set_last(o, h, lo, c):
+                self.candles.set_data(df, self.style, self.ty)
+        else:
+            self._apply_style()                              # line / area / baseline: cheap redraw of the line
+        if self.volbars is not None:
+            self.volbars.set_last(v, c >= o)
+        self._update_last_tag()
+        if self.auto_y:
+            y0, y1 = self.price.vb.viewRange()[1]
+            x1 = self.price.vb.viewRange()[0][1]
+            if x1 >= n and not (y0 <= float(self.ty(lo)) and float(self.ty(h)) <= y1):
+                self._autoscale()                            # the bar grew out of the pane
+        hi = getattr(self, "_hover_i", None)
+        if hi is None or hi >= n:
+            self._update_header(n)
+        if self._ind_items and not self._ind_timer.isActive():
+            # indicators follow once a second; on very long histories less often, so the chart never stutters
+            self._ind_timer.start(int(max(1000, 25 * getattr(self, "_ind_cost", 0.0))))
+        return True
+
+    def replace_values(self, df) -> bool:
+        """Same bars, newer numbers (a quiet refresh): swap the data under the items that are already on screen."""
+        if (self.df is None or self.candles is None or self._limit is not None or len(df) != len(self.df)
+                or self.replay["active"]):
+            return False
+        self.df = df
+        self._lows = df["Low"].to_numpy(float)
+        self._highs = df["High"].to_numpy(float)
+        self._vols = df["Volume"].to_numpy(float)
+        self._opens = df["Open"].to_numpy(float)
+        self._closes = df["Close"].to_numpy(float)
+        self._apply_style()
+        if self.volbars is not None:
+            self.volbars.set_data(df)
+        self._ind_timer.stop()
+        self._refresh_indicators()
+        self._update_last_tag()
+        if self.auto_y:
+            self._autoscale()
+        return True
+
+    def _refresh_indicators(self):
+        if self.df is None or self._limit is not None:
+            return
+        import time as _time
+        t0 = _time.perf_counter()
+        for key in list(self._ind_items):
+            if key in self._enabled:
+                self._remove_indicator(key)
+                self._build_indicator(key)
+        self._rebuild_legend()
+        self._ind_cost = (_time.perf_counter() - t0) * 1000
+        hi = getattr(self, "_hover_i", None)
+        self._update_header(len(self.df) - 1 if hi is None else min(hi, len(self.df) - 1))
 
     def go_latest(self):
         n = self._n()
@@ -1327,13 +1423,16 @@ class ChartWidget(QtWidgets.QWidget):
             item._full = (x, yy)
             item._legend_color = color
             plot.addItem(item)
+            item.setClipToView(True)                         # only the part on screen is turned into a path:
+            item.setDownsampling(auto=True, method="peak")   # 100,000 bars pan as smoothly as 500
             if self._limit is not None:
                 item.setData(x[:self._limit], item._full[1][:self._limit])
             items.append((plot, item, name))
         if key == "bb" and len(items) == 3:              # TradingView fills between the bands
-            fill = pg.FillBetweenItem(items[1][1], items[2][1], brush=pg.mkBrush(33, 150, 243, 22))
+            fill = BandFill(items[1][1]._full[1], items[2][1]._full[1], pg.mkBrush(33, 150, 243, 22))
+            fill.limit = self._limit
             fill.setZValue(-8)
-            self.price.addItem(fill)
+            self.price.addItem(fill, ignoreBounds=True)
             items.append((self.price, fill, None))
         if key == "rsi":
             band = pg.LinearRegionItem(values=(30, 70), orientation="horizontal", movable=False,
@@ -1495,7 +1594,7 @@ class ChartWidget(QtWidgets.QWidget):
     def _update_last_tag(self):
         if self.df is None or self._n() == 0:
             return
-        last, prev = float(self.df["Close"].iloc[self._n() - 1]), float(self.df["Open"].iloc[self._n() - 1])
+        last, prev = float(self._closes[self._n() - 1]), float(self._opens[self._n() - 1])
         color = theme.UP if last >= prev else theme.DOWN
         self.last_tag.fill = pg.mkBrush(color)
         self.last_tag.setText(f" {self.axis_label(float(self.ty(last)))} ")
@@ -1505,17 +1604,19 @@ class ChartWidget(QtWidgets.QWidget):
         self.last_line.setVisible(bool(settings.get()['last_line']))
         nt = self.name_tag                                 # TradingView: the symbol name sits left of the price
         name = self.ticker()
-        nt.setText(name)
-        nt.setStyleSheet(f"QLabel {{ background: {color}; color: #ffffff; font-size: 12px; font-weight: 500;"
-                         f" padding: 2px 5px; border-radius: 2px; }}")
-        nt.adjustSize()
+        if (name, color) != getattr(self, "_nt_key", None):   # live ticks come many times a second: restyle only on change
+            self._nt_key = (name, color)
+            nt.setText(name)
+            nt.setStyleSheet(f"QLabel {{ background: {color}; color: #ffffff; font-size: 12px; font-weight: 500;"
+                             f" padding: 2px 5px; border-radius: 2px; }}")
+            nt.adjustSize()
         self._place_last_tag()
 
     def _place_last_tag(self):
         if self.df is None or self.last_tag.isHidden():
             return
         xr = self.price.vb.viewRange()[0][1]
-        y = float(self.ty(float(self.df["Close"].iloc[self._n() - 1])))
+        y = float(self.ty(float(self._closes[self._n() - 1])))
         self.last_tag.setPos(xr, y)
         self.cd_tag.setPos(xr, y)
         nt = self.name_tag
@@ -1822,16 +1923,41 @@ class ChartWidget(QtWidgets.QWidget):
     def display_name(self) -> str:
         """TradingView's legend shows the description: 'Nifty 50 Index', 'Reliance Industries Ltd'."""
         t = self.ticker()
+        o = self._option()
+        if o:
+            from .dhan_core import option_name
+            return option_name(*o)
         try:
             from .tvui import NAMES
             return NAMES.get(t.upper(), t)
         except Exception:  # noqa: BLE001
             return t
 
+    def _option(self):
+        """(underlying, expiry, strike, kind) when this chart is an option contract, else None."""
+        u = self._raw_symbol().upper()
+        hit = getattr(self, "_opt_memo", None)
+        if hit and hit[0] == u:
+            return hit[1]
+        out = None
+        try:
+            from .dhan_core import _TV_OPT
+            import datetime as _dt
+            m = _TV_OPT.match(u)
+            if m:
+                out = (m[1], _dt.date(2000 + int(m[2]), int(m[3]), int(m[4])), float(m[6]), "CE" if m[5] == "C" else "PE")
+        except Exception:  # noqa: BLE001
+            out = None
+        self._opt_memo = (u, out)
+        return out
+
     def exchange_tag(self) -> str:
         u = self._raw_symbol().upper()
         if not u:
             return ""
+        o = self._option()
+        if o:
+            return "BSE" if o[0] in ("SENSEX", "BANKEX") else "NSE"
         if u.endswith(".BO") or u == "^BSESN":
             return "BSE"
         if u.endswith("=X"):

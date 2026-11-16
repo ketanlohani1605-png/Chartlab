@@ -117,6 +117,14 @@ def datawin(p, r, c):
         p.drawLine(QtCore.QPointF(13.5, y), QtCore.QPointF(16.5, y))
 
 
+def chain(p, r, c):
+    """Option chain: two columns of rows either side of a strike spine."""
+    p.drawLine(QtCore.QPointF(12, 4.5), QtCore.QPointF(12, 19.5))
+    for y in (7, 12, 17):
+        p.drawLine(QtCore.QPointF(4.5, y), QtCore.QPointF(9.5, y))
+        p.drawLine(QtCore.QPointF(14.5, y), QtCore.QPointF(19.5, y))
+
+
 def eraser(p, r, c):
     p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(5, 14), QtCore.QPointF(13, 6), QtCore.QPointF(19, 12),
                                    QtCore.QPointF(13, 18), QtCore.QPointF(9, 18)]))
@@ -435,7 +443,7 @@ def t_daterange(p, r, c):
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
-    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin", "st_bars", "st_candles", "st_hollow", "st_heikin", "st_line",
+    "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin", "chain", "st_bars", "st_candles", "st_hollow", "st_heikin", "st_line",
     "st_linemark", "st_step", "st_area", "st_baseline", "t_ext", "t_arrow", "t_ellipse", "t_long", "t_short",
     "t_pricerange", "t_daterange")}
 
