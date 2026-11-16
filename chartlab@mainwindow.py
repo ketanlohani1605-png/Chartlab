@@ -478,6 +478,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acct_btn.setToolTip("Broker accounts: API data + run one script on many accounts")
         m_ = QtWidgets.QMenu(self.acct_btn)
         m_.addAction("Manage broker accounts…", self.manage_accounts)
+        m_.addAction("All accounts: status, balance, P&&L…", self.accounts_overview)
+        ar = m_.addAction("Renew tokens automatically (Dhan: 24 h)")
+        ar.setCheckable(True)
+        ar.setChecked(self.settings.value("auto_renew", "false") == "true")
+        ar.setToolTip("When a connected account's token has under 4 hours left, swap it for a fresh 24-hour one")
+        ar.triggered.connect(self.set_auto_renew)
+        m_.setToolTipsVisible(True)
+        m_.addSeparator()
         m_.addAction("Run script on multiple accounts…", self.run_on_accounts)
         self.auto_act = m_.addAction("Auto-trade strategy on accounts…", self.toggle_auto_trade)
         m_.addAction("Stop all runs", self.stop_script)
@@ -1600,9 +1608,54 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acct_btn.setText(" Accounts")
         self.acct_btn.setToolTip(tip)
 
+    def accounts_overview(self):
+        acctmod.OverviewDialog(self).exec()
+        self._update_acct_dot()
+        self.live_sync()
+
+    def set_auto_renew(self, on: bool):
+        if on and QtWidgets.QMessageBox.question(
+                self, "Renew tokens automatically",
+                "Dhan access tokens stop working after 24 hours.\n\nWith this on, ChartLab asks Dhan for a fresh "
+                "24-hour token whenever a connected account has under 4 hours left, and saves it. The old token "
+                "stops working at once, so anything else using it (another app, a token typed into a script) needs "
+                "the new one.\n\nIt only works while ChartLab is open, for tokens made on Dhan Web that have not "
+                "expired yet. Turn it on?") != QtWidgets.QMessageBox.StandardButton.Yes:
+            on = False
+            for a in self.acct_btn.menu().actions():
+                if a.isCheckable() and a.text().startswith("Renew tokens"):
+                    a.setChecked(False)
+        self.settings.setValue("auto_renew", "true" if on else "false")
+        if on:
+            self.acct_poller.refresh()
+
+    def _auto_renew(self, name, st):
+        """Called after each status check: renew a token that is close to its end (only when the user switched it on)."""
+        if self.settings.value("auto_renew", "false") != "true" or not st or st.get("state") not in ("ok", "expiring"):
+            return
+        d = st.get("days_left")
+        tried = getattr(self, "_renew_tried", {})
+        import time as _t
+        if d is None or not 0 < d * 24 < acctmod.EXPIRING_HOURS or _t.time() - tried.get(name, 0) < 1800:
+            return
+        tried[name] = _t.time()
+        self._renew_tried = tried
+        job = acctmod._Job(lambda: acctmod.renew_saved(name), self)
+
+        def done(msg):
+            self.statusBar().showMessage(msg, 8000)
+            self._warned = getattr(self, "_warned", set()) - {name}
+            self.acct_poller.refresh([a for a in acctmod.load_accounts() if a["name"] == name], force=True)
+            self.live_sync()
+        job.done.connect(done)
+        job.failed.connect(lambda e: self.statusBar().showMessage(
+            f"Account '{name}': the token could not be renewed ({e[:120]}). Paste a fresh one in Accounts.", 15000))
+        job.start()
+
     def _acct_status_changed(self, name):
         self._update_acct_dot()
         st = acctmod.STATUS.get(name)
+        self._auto_renew(name, st)
         if st and st["state"] in ("expired", "auth", "expiring") and name not in getattr(self, "_warned", set()):
             self._warned = getattr(self, "_warned", set()) | {name}
             self.statusBar().showMessage(f"Account '{name}': {st['msg']}  (Accounts -> Manage broker accounts)", 10000)

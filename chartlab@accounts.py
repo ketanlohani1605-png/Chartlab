@@ -197,7 +197,8 @@ def _parse_validity(s) -> float | None:
 def get_status(acct: dict) -> dict:
     """Never raises. {state: ok|expiring|expired|auth|offline|error, msg, client, validity, days_left, funds, segments, plan}"""
     st = {"state": "error", "msg": "", "client": acct.get("client_id", ""), "validity": "", "days_left": None,
-          "funds": None, "segments": "", "plan": "", "ts": dt.datetime.now().strftime("%H:%M:%S")}
+          "funds": None, "segments": "", "plan": "", "data": None, "open": None, "pnl": None,
+          "ts": dt.datetime.now().strftime("%H:%M:%S")}
     if acct.get("broker") != "dhan":
         st["msg"] = "Unsupported broker"
         return st
@@ -219,19 +220,116 @@ def get_status(acct: dict) -> dict:
     st["segments"] = str(js.get("activeSegment", "")).replace(",", ", ")
     st["plan"] = ("Data API active" if str(js.get("dataPlan", "")).lower() == "active" else
                   f"Data plan: {js.get('dataPlan', '-')}")
+    st["data"] = str(js.get("dataPlan", "")).lower() == "active"
     try:
         fl = json.loads(_http(f"{DHAN}/fundlimit", None, hdr, timeout=12))
         st["funds"] = float(fl.get("availabelBalance", fl.get("availableBalance", 0)) or 0)
     except Exception:  # noqa: BLE001 - funds are a bonus, never fail the check for them
         pass
+    try:
+        pos = json.loads(_http(f"{DHAN}/positions", None, hdr, timeout=12))
+        if isinstance(pos, list):
+            st["open"] = sum(1 for x in pos if str(x.get("positionType", "")).upper() != "CLOSED"
+                             and float(x.get("netQty") or 0) != 0)
+            st["pnl"] = sum(float(x.get("realizedProfit") or 0) + float(x.get("unrealizedProfit") or 0) for x in pos)
+    except Exception:  # noqa: BLE001 - positions are a bonus too
+        pass
     d = st["days_left"]
     if d is not None and d <= 0:
-        st.update(state="expired", msg="Token has expired")
-    elif d is not None and d < 2:
-        st.update(state="expiring", msg=f"Connected - token expires in {max(d, 0) * 24:.0f} h")
+        st.update(state="expired", msg="Token has expired - paste a fresh access token")
+    elif d is not None and d * 24 < EXPIRING_HOURS:      # Dhan tokens live 24 hours: warn in the last few
+        st.update(state="expiring", msg=f"Connected - token expires in {max(d, 0) * 24:.1f} h")
     else:
-        st.update(state="ok", msg="Connected")
+        st.update(state="ok", msg="Connected" + (f" - token good for {d * 24:.0f} h" if d is not None and d < 2 else ""))
     return st
+
+
+EXPIRING_HOURS = 4.0
+
+
+def _find_token(obj):
+    """The new access token inside Dhan's answer, whatever the field is called."""
+    import re
+    pat = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
+    if isinstance(obj, dict):
+        for k in ("accessToken", "access_token", "token", "jwtToken"):
+            v = obj.get(k)
+            if isinstance(v, str) and pat.match(v.strip()):
+                return v.strip()
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for v in obj:
+            t = _find_token(v) if isinstance(v, (dict, list)) else (v.strip() if isinstance(v, str) and pat.match(v.strip()) else None)
+            if t:
+                return t
+    return None
+
+
+def renew_token(acct: dict) -> str:
+    """Ask Dhan for a fresh 24-hour token in exchange for the current one (which must still be valid and must have
+    been generated on Dhan Web). Returns the new token. Dhan switches the old one off when it answers."""
+    if acct.get("broker") != "dhan":
+        raise RuntimeError("Only Dhan tokens can be renewed")
+    raw = _http(f"{DHAN}/RenewToken", None, {"access-token": acct.get("access_token", ""),
+                                             "dhanClientId": str(acct.get("client_id", ""))}, timeout=15)
+    try:
+        js = json.loads(raw)
+    except ValueError:
+        js = raw.decode("utf8", "replace")
+    tok = _find_token(js if not isinstance(js, str) else [js.strip()])
+    if not tok:
+        raise RuntimeError("Dhan answered, but without a new token: " + str(js)[:160])
+    return tok
+
+
+def renew_saved(name: str, path: Path | None = None) -> str:
+    """Renew one saved account's token and write it to accounts.json straight away. -> message for the user."""
+    accts = load_accounts(path)
+    a = next((x for x in accts if x["name"] == name), None)
+    if a is None:
+        raise KeyError(name)
+    tok = renew_token(a)
+    accts = load_accounts(path)                               # re-read: do not undo an edit made meanwhile
+    for x in accts:
+        if x["name"] == name:
+            x["access_token"] = tok
+    save_accounts(accts, path)
+    return f"{name}: token renewed for another 24 hours"
+
+
+def parse_bulk(text: str) -> tuple[list[dict], list[str]]:
+    """Many accounts pasted at once, one per line: 'name, client id, token' (commas, tabs or spaces; 'client id, token'
+    alone is fine - the client id becomes the name). -> (accounts, lines that could not be read)."""
+    import re
+    out, bad, seen = [], [], set()
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip().strip('"').strip("'") for x in re.split(r"[,;\t|]+|\s{1,}", line) if x.strip()]
+        if parts and parts[0].lower() in ("name", "account", "client", "clientid", "client_id") and len(out) == 0 and \
+                not any(len(x) > 60 for x in parts):
+            continue                                          # a header row
+        tok = next((x for x in parts if len(x) > 60), None)
+        if tok is None:
+            bad.append(raw.strip()[:60])
+            continue
+        rest = [x for x in parts if x != tok]
+        cid = next((x for x in rest if x.isdigit() and 6 <= len(x) <= 14), None)
+        if cid is None:
+            bad.append(raw.strip()[:60])
+            continue
+        words = [x for x in rest if x != cid and x.lower() not in ("live", "paper", "dhan")]
+        name = " ".join(words) or cid
+        k = 2
+        base = name
+        while name in seen:
+            name = f"{base} {k}"
+            k += 1
+        seen.add(name)
+        out.append({"name": name, "broker": "dhan", "client_id": cid, "access_token": tok, "live": False,
+                    "qty_mult": 1.0})
+    return out, bad
 
 
 STATE_COLOR = {"ok": "#089981", "expiring": "#ff9800", "expired": "#f23645", "auth": "#f23645",
@@ -405,6 +503,16 @@ class AccountsDialog(QtWidgets.QDialog):
         self.empty.setObjectName("sub")
         self.empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         lv.addWidget(self.empty, 1)
+        many = QtWidgets.QHBoxLayout()
+        bm = QtWidgets.QPushButton("Add many\u2026")
+        bm.setToolTip("Paste a list of accounts (name, client id, token) and connect them all in one go")
+        bm.clicked.connect(self.add_many)
+        bo = QtWidgets.QPushButton("All accounts")
+        bo.setToolTip("Every account in one table: connection, token time left, balance, positions, today's P&L")
+        bo.clicked.connect(self.overview)
+        many.addWidget(bm)
+        many.addWidget(bo)
+        lv.addLayout(many)
         root.addWidget(left)
 
         right = QtWidgets.QWidget()
@@ -484,6 +592,11 @@ class AccountsDialog(QtWidgets.QDialog):
         d.clicked.connect(self.delete)
         btns.addWidget(d)
         btns.addStretch(1)
+        self.rbtn = rb = QtWidgets.QPushButton("Renew token")
+        rb.setToolTip("Dhan tokens last 24 hours. This swaps the saved token for a fresh 24-hour one, while the old one "
+                      "is still valid (tokens made on Dhan Web only). The old token stops working.")
+        rb.clicked.connect(self.renew)
+        btns.addWidget(rb)
         self.tbtn = tb = QtWidgets.QPushButton("Test connection")
         tb.clicked.connect(self.test)
         btns.addWidget(tb)
@@ -523,13 +636,18 @@ class AccountsDialog(QtWidgets.QDialog):
             rows.append(f"Client <b>{st['client']}</b>")
         if st.get("validity"):
             d = st.get("days_left")
-            rows.append(f"Token valid until <b>{st['validity']}</b>" + (f"  ({d:.1f} days left)" if d is not None and d > 0 else ""))
+            left = "" if d is None or d <= 0 else (f"  ({d * 24:.0f} hours left)" if d < 2 else f"  ({d:.1f} days left)")
+            rows.append(f"Token valid until <b>{st['validity']}</b>" + left)
         if st.get("segments"):
             rows.append(f"Segments: {st['segments']}")
         if st.get("plan"):
             rows.append(st["plan"])
         if st.get("funds") is not None:
             rows.append(f"Available balance <b>\u20B9{st['funds']:,.2f}</b>")
+        if st.get("open") is not None:
+            pc = theme.UP if (st.get("pnl") or 0) >= 0 else theme.DOWN
+            rows.append(f"Open positions <b>{st['open']}</b> &nbsp; today's P&amp;L "
+                        f"<b style='color:{pc}'>\u20B9{st.get('pnl') or 0:+,.2f}</b>")
         rows.append(f"<span style='color:#787b86'>checked {st.get('ts', '')}</span>")
         self.card.setText("<br>".join(rows))
 
@@ -558,6 +676,7 @@ class AccountsDialog(QtWidgets.QDialog):
         if 0 <= i < len(self.accts):
             self.editing = i
             self.del_btn.show()
+            self.rbtn.show()
             a = self.accts[i]
             self.title.setText(a["name"])
             self.name.setText(a["name"])
@@ -574,6 +693,7 @@ class AccountsDialog(QtWidgets.QDialog):
     def _new(self):
         self.editing = -1
         self.del_btn.hide()                                  # nothing saved yet -> nothing to delete
+        self.rbtn.hide()
         self.list.blockSignals(True)
         self.list.setCurrentRow(-1)
         self.list.blockSignals(False)
@@ -629,6 +749,373 @@ class AccountsDialog(QtWidgets.QDialog):
         if self.editing < 0:
             self._pending_new = key
         self.poller.refresh([cur], force=True)
+
+
+    # ------------------------------------------------------------------ many accounts
+    def renew(self):
+        if not 0 <= self.editing < len(self.accts):
+            return
+        name = self.accts[self.editing]["name"]
+        self.rbtn.setEnabled(False)
+        self._say("Asking Dhan for a fresh token\u2026")
+        job = _Job(lambda: renew_saved(name, self.path), self)
+
+        def done(msg):
+            self.rbtn.setEnabled(True)
+            self.accts = load_accounts(self.path)
+            self._fill(name)
+            self._say(msg, True)
+            self.poller.refresh([a for a in self.accts if a["name"] == name], force=True)
+
+        def failed(msg):
+            self.rbtn.setEnabled(True)
+            self._say("Could not renew: " + msg[:200] + "  (an expired token cannot be renewed: paste a new one)", False)
+        job.done.connect(done)
+        job.failed.connect(failed)
+        job.start()
+
+    def add_many(self):
+        d = BulkAddDialog(self, {a["name"] for a in self.accts})
+        if d.exec() and d.result_accounts:
+            by = {a["name"]: i for i, a in enumerate(self.accts)}
+            for a in d.result_accounts:
+                if a["name"] in by:
+                    self.accts[by[a["name"]]] = a
+                else:
+                    self.accts.append(a)
+            save_accounts(self.accts, self.path)
+            self.saved = d.result_accounts[0]["name"]
+            self._fill(self.saved)
+            self._say(f"Added {len(d.result_accounts)} accounts (all PAPER until you tick Live orders).", True)
+            self.poller.refresh(self.accts, force=False)
+
+    def overview(self):
+        OverviewDialog(self, self.path).exec()
+        self.accts = load_accounts(self.path)                 # tokens may have been renewed there
+        keep = self.accts[self.editing]["name"] if 0 <= self.editing < len(self.accts) else ""
+        self._fill(keep)
+
+
+class _Job(QtCore.QThread):
+    done = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self.fn())
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
+def check_many(accts: list[dict]) -> dict:
+    """Check every account at the same time (one thread each). -> {name: status}"""
+    import concurrent.futures as cf
+    if not accts:
+        return {}
+    with cf.ThreadPoolExecutor(max_workers=min(8, len(accts))) as pool:
+        sts = list(pool.map(get_status, accts))
+    out = {}
+    for a, st in zip(accts, sts):
+        st["_at"] = dt.datetime.now()
+        out[a["name"]] = st
+    return out
+
+
+_DLG = ("QDialog { background: #1e1e1e; } QLabel#h { font-size: 16px; font-weight: 700; color: white; } "
+        "QLabel#sub { color: #868993; font-size: 12px; } "
+        "QPlainTextEdit { background: #121212; border: 1px solid #3a3a3a; border-radius: 8px; padding: 8px; "
+        "font-family: Menlo, monospace; font-size: 12px; } "
+        "QTableWidget { background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; gridline-color: #262626; } "
+        "QHeaderView::section { background: #161616; color: #868993; border: 0; border-bottom: 1px solid #2a2a2a; "
+        "padding: 6px 8px; font-size: 11px; }")
+
+
+class BulkAddDialog(QtWidgets.QDialog):
+    """Paste many accounts, check them all with Dhan at once, add the ones that connect."""
+
+    def __init__(self, parent=None, existing: set | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Add many accounts")
+        self.resize(760, 560)
+        self.setStyleSheet(_DLG)
+        self.existing = set(existing or ())
+        self.result_accounts: list[dict] = []
+        self._parsed: list[dict] = []
+        self._status: dict = {}
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(22, 18, 22, 16)
+        v.setSpacing(8)
+        h = QtWidgets.QLabel("Add many accounts")
+        h.setObjectName("h")
+        v.addWidget(h)
+        sub = QtWidgets.QLabel("One account per line:  <b>name, client id, access token</b>  (commas, tabs or spaces; a line "
+                               "copied from Excel works). The token stays on this Mac. Every account is added as "
+                               "<b>PAPER</b> - you switch on live orders yourself, one account at a time.")
+        sub.setObjectName("sub")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+        self.text = QtWidgets.QPlainTextEdit()
+        self.text.setPlaceholderText("Papa, 1100000001, eyJ0eXAiOiJKV1QiLCJhbGciOi...\nFund 2, 1100000002, eyJ0eXAiOiJKV1QiLCJhbGciOi...")
+        self.text.setFixedHeight(130)
+        v.addWidget(self.text)
+        row = QtWidgets.QHBoxLayout()
+        self.file_btn = QtWidgets.QPushButton("Open a CSV / text file\u2026")
+        self.file_btn.clicked.connect(self._open)
+        row.addWidget(self.file_btn)
+        row.addStretch(1)
+        self.check_btn = QtWidgets.QPushButton("Check with Dhan")
+        self.check_btn.clicked.connect(self.check)
+        row.addWidget(self.check_btn)
+        v.addLayout(row)
+        self.tbl = QtWidgets.QTableWidget(0, 4)
+        self.tbl.setHorizontalHeaderLabels(["Name", "Client ID", "Result", "Balance"])
+        self.tbl.verticalHeader().hide()
+        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        v.addWidget(self.tbl, 1)
+        self.note = QtWidgets.QLabel("")
+        self.note.setObjectName("sub")
+        self.note.setWordWrap(True)
+        v.addWidget(self.note)
+        b = QtWidgets.QHBoxLayout()
+        b.addStretch(1)
+        c = QtWidgets.QPushButton("Cancel")
+        c.clicked.connect(self.reject)
+        b.addWidget(c)
+        self.add_btn = QtWidgets.QPushButton("Add accounts")
+        self.add_btn.setObjectName("primary")
+        self.add_btn.setEnabled(False)
+        self.add_btn.clicked.connect(self._add)
+        b.addWidget(self.add_btn)
+        v.addLayout(b)
+
+    def _open(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Accounts list", str(Path.home()),
+                                                        "Lists (*.csv *.txt *.tsv);;All files (*)")
+        if path:
+            try:
+                self.text.setPlainText(Path(path).read_text(errors="replace"))
+            except OSError as e:
+                self.note.setText(f"<span style='color:{theme.DOWN}'>Could not read the file: {e}</span>")
+
+    def check(self):
+        accts, bad = parse_bulk(self.text.toPlainText())
+        self._parsed, self._status = accts, {}
+        self._show()
+        msg = []
+        if bad:
+            msg.append(f"<span style='color:{theme.DOWN}'>{len(bad)} line(s) not understood "
+                       f"(need a client id and a token): {', '.join(bad[:3])}</span>")
+        if not accts:
+            self.note.setText("<br>".join(msg) or "Paste at least one line first.")
+            return
+        self.note.setText("<br>".join(msg + [f"Checking {len(accts)} accounts with Dhan\u2026"]))
+        self.check_btn.setEnabled(False)
+        job = _Job(lambda: check_many(accts), self)
+        job.done.connect(lambda res, m=msg: self._checked(res, m))
+        job.failed.connect(lambda e: (self.check_btn.setEnabled(True), self.note.setText(e[:200])))
+        job.start()
+
+    def _checked(self, res, msg):
+        self.check_btn.setEnabled(True)
+        self._status = res
+        STATUS.update(res)
+        self._show()
+        ok = [a for a in self._parsed if res.get(a["name"], {}).get("state") in ("ok", "expiring")]
+        off = [a for a in self._parsed if res.get(a["name"], {}).get("state") == "offline"]
+        self._ok = ok + off                                   # offline: cannot tell - add them, check later
+        clash = [a["name"] for a in self._ok if a["name"] in self.existing]
+        if clash:
+            msg = msg + [f"Already saved and will be updated: {', '.join(clash[:5])}"]
+        msg = msg + [f"<b>{len(ok)}</b> of {len(self._parsed)} connected" +
+                     (f", {len(off)} could not be checked (no internet)" if off else "") + "."]
+        self.note.setText("<br>".join(msg))
+        self.add_btn.setEnabled(bool(self._ok))
+        self.add_btn.setText(f"Add {len(self._ok)} account{'s' if len(self._ok) != 1 else ''}")
+
+    def _show(self):
+        t = self.tbl
+        t.setRowCount(len(self._parsed))
+        for r, a in enumerate(self._parsed):
+            st = self._status.get(a["name"])
+            cells = [a["name"], a["client_id"], (st["msg"] or st["state"]) if st else "checking\u2026",
+                     f"\u20B9{st['funds']:,.0f}" if st and st.get("funds") is not None else ""]
+            for c, txt in enumerate(cells):
+                it = QtWidgets.QTableWidgetItem(txt)
+                if c == 2:
+                    it.setForeground(QtGui.QColor(STATE_COLOR.get(st["state"] if st else None) if st else "#868993"))
+                t.setItem(r, c, it)
+        t.resizeColumnsToContents()
+        t.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+
+    def _add(self):
+        self.result_accounts = list(getattr(self, "_ok", []))
+        self.accept()
+
+
+class OverviewDialog(QtWidgets.QDialog):
+    """Every account in one table, checked at the same time; renew tokens for all with one button."""
+    COLS = ["Account", "Client ID", "Orders", "Connection", "Token left", "Data API", "Balance", "Open pos.", "Today's P&L"]
+
+    def __init__(self, parent=None, path: Path | None = None):
+        super().__init__(parent)
+        self.path = path
+        self.setWindowTitle("All accounts")
+        self.resize(980, 520)
+        self.setStyleSheet(_DLG)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(22, 18, 22, 16)
+        v.setSpacing(8)
+        top = QtWidgets.QHBoxLayout()
+        h = QtWidgets.QLabel("All accounts")
+        h.setObjectName("h")
+        top.addWidget(h)
+        top.addStretch(1)
+        self.renew_btn = QtWidgets.QPushButton("Renew all tokens")
+        self.renew_btn.setToolTip("Swap every connected account's token for a fresh 24-hour one (Dhan Web tokens that are "
+                                  "still valid). The old tokens stop working.")
+        self.renew_btn.clicked.connect(self.renew_all)
+        self.renew_btn.setAutoDefault(False)
+        top.addWidget(self.renew_btn)
+        self.check_btn = QtWidgets.QPushButton("Check all now")
+        self.check_btn.setObjectName("primary")
+        self.check_btn.setDefault(True)
+        self.check_btn.clicked.connect(self.check)
+        top.addWidget(self.check_btn)
+        v.addLayout(top)
+        self.tbl = QtWidgets.QTableWidget(0, len(self.COLS))
+        self.tbl.setHorizontalHeaderLabels(self.COLS)
+        self.tbl.verticalHeader().hide()
+        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setShowGrid(False)
+        self.tbl.verticalHeader().setDefaultSectionSize(30)
+        v.addWidget(self.tbl, 1)
+        self.note = QtWidgets.QLabel("")
+        self.note.setObjectName("sub")
+        self.note.setWordWrap(True)
+        self.note.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        v.addWidget(self.note)
+        b = QtWidgets.QHBoxLayout()
+        b.addStretch(1)
+        c = QtWidgets.QPushButton("Close")
+        c.clicked.connect(self.accept)
+        b.addWidget(c)
+        v.addLayout(b)
+        self._show()
+        QtCore.QTimer.singleShot(0, self.check)
+
+    def check(self):
+        accts = load_accounts(self.path)
+        if not accts or not self.check_btn.isEnabled():
+            return
+        self.check_btn.setEnabled(False)
+        self.check_btn.setText("Checking\u2026")
+        job = _Job(lambda: check_many(accts), self)
+        job.done.connect(self._checked)
+        job.failed.connect(lambda e: self._checked({}))
+        job.start()
+
+    def _checked(self, res):
+        STATUS.update(res)
+        self.check_btn.setEnabled(True)
+        self.check_btn.setText("Check all now")
+        self._show()
+
+    def renew_all(self):
+        accts = [a for a in load_accounts(self.path)
+                 if (STATUS.get(a["name"]) or {}).get("state") in ("ok", "expiring")]
+        if not accts:
+            self.note.setText("No connected account to renew. (An expired token cannot be renewed: paste a new one.)")
+            return
+        if QtWidgets.QMessageBox.question(
+                self, "Renew tokens",
+                f"Ask Dhan for a fresh 24-hour token for {len(accts)} account(s)?\n\nThe tokens saved now stop working "
+                "at once - anything else that uses them (another app, a script with the token typed in) must be "
+                "given the new token.") != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self.renew_btn.setEnabled(False)
+        path = self.path
+
+        def work():
+            out = []
+            for a in accts:                                   # one after another: each writes accounts.json
+                try:
+                    out.append((True, renew_saved(a["name"], path)))
+                except Exception as e:  # noqa: BLE001
+                    out.append((False, f"{a['name']}: {str(e)[:120]}"))
+            return out
+        job = _Job(work, self)
+
+        def done(res):
+            self.renew_btn.setEnabled(True)
+            self.note.setText("<br>".join(f"<span style='color:{theme.UP if ok else theme.DOWN}'>{m}</span>"
+                                          for ok, m in res))
+            self.check()
+        job.done.connect(done)
+        job.failed.connect(lambda e: (self.renew_btn.setEnabled(True), self.note.setText(e[:200])))
+        job.start()
+
+    def _show(self):
+        accts = load_accounts(self.path)
+        t = self.tbl
+        t.setRowCount(len(accts) + (1 if accts else 0))
+        A = QtCore.Qt.AlignmentFlag
+        tot_f = tot_p = 0.0
+        tot_o = n_ok = 0
+        for r, a in enumerate(accts):
+            st = STATUS.get(a["name"]) or {}
+            d = st.get("days_left")
+            left = "" if d is None else ("expired" if d <= 0 else (f"{d * 24:.1f} h" if d < 2 else f"{d:.0f} days"))
+            funds, pnl, op = st.get("funds"), st.get("pnl"), st.get("open")
+            n_ok += st.get("state") in ("ok", "expiring")
+            tot_f += funds or 0
+            tot_p += pnl or 0
+            tot_o += op or 0
+            cells = [a["name"], str(a.get("client_id", "")), "LIVE" if a.get("live") else "PAPER",
+                     st.get("msg") or ("checking\u2026" if not st else st.get("state", "")), left,
+                     "" if st.get("data") is None else ("active" if st["data"] else "not active"),
+                     "" if funds is None else f"\u20B9{funds:,.2f}", "" if op is None else str(op),
+                     "" if pnl is None else f"\u20B9{pnl:+,.2f}"]
+            for c, txt in enumerate(cells):
+                it = QtWidgets.QTableWidgetItem(txt)
+                if c >= 6:
+                    it.setTextAlignment(A.AlignRight | A.AlignVCenter)
+                if c == 2:
+                    it.setForeground(QtGui.QColor(theme.DOWN if a.get("live") else "#868993"))
+                elif c == 3:
+                    it.setForeground(QtGui.QColor(STATE_COLOR.get(st.get("state"))))
+                elif c == 4 and d is not None and d * 24 < EXPIRING_HOURS:
+                    it.setForeground(QtGui.QColor(theme.DOWN if d <= 0 else "#ff9800"))
+                elif c == 5 and st.get("data") is False:
+                    it.setForeground(QtGui.QColor("#ff9800"))
+                    it.setToolTip("Dhan's Data API plan is needed for candles, live prices and the option chain")
+                elif c == 8 and pnl is not None:
+                    it.setForeground(QtGui.QColor(theme.UP if pnl >= 0 else theme.DOWN))
+                t.setItem(r, c, it)
+        if accts:
+            r = len(accts)
+            bold = QtGui.QFont(t.font())
+            bold.setBold(True)
+            cells = [f"{n_ok} of {len(accts)} connected", "", "", "", "", "", f"\u20B9{tot_f:,.2f}", str(tot_o),
+                     f"\u20B9{tot_p:+,.2f}"]
+            for c, txt in enumerate(cells):
+                it = QtWidgets.QTableWidgetItem(txt)
+                it.setFont(bold)
+                if c >= 6:
+                    it.setTextAlignment(A.AlignRight | A.AlignVCenter)
+                if c == 8:
+                    it.setForeground(QtGui.QColor(theme.UP if tot_p >= 0 else theme.DOWN))
+                t.setItem(r, c, it)
+        t.resizeColumnsToContents()
+        t.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        if not accts:
+            self.note.setText("No accounts yet. Close this and use  + Add  or  Add many\u2026")
 
 
 class PickAccountsDialog(QtWidgets.QDialog):

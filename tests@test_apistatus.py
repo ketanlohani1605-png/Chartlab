@@ -15,7 +15,7 @@ def mk(valid_days, fund=1234.5, fail=None):
         return json.dumps({"availabelBalance": fund}).encode()
     return fake
 acct = {"name": "A1", "broker": "dhan", "client_id": "111", "access_token": "x" * 50}
-for days, state in ((5, "ok"), (0.5, "expiring"), (-1, "expired")):
+for days, state in ((5, "ok"), (0.5, "ok"), (0.1, "expiring"), (-1, "expired")):      # Dhan tokens live 24 h: warn in the last 4
     A._http = mk(days)
     st = A.get_status(acct); assert st["state"] == state, (days, st)
 assert A.get_status(acct)["funds"] == 1234.5
