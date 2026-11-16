@@ -461,7 +461,7 @@ class AccountsDialog(QtWidgets.QDialog):
         self.msg.setWordWrap(True)
         rv.addWidget(self.msg)
         btns = QtWidgets.QHBoxLayout()
-        d = QtWidgets.QPushButton("Delete")
+        self.del_btn = d = QtWidgets.QPushButton("Delete")
         d.setObjectName("danger")
         d.clicked.connect(self.delete)
         btns.addWidget(d)
@@ -539,6 +539,7 @@ class AccountsDialog(QtWidgets.QDialog):
     def _select(self, i):
         if 0 <= i < len(self.accts):
             self.editing = i
+            self.del_btn.show()
             a = self.accts[i]
             self.title.setText(a["name"])
             self.name.setText(a["name"])
@@ -554,6 +555,7 @@ class AccountsDialog(QtWidgets.QDialog):
 
     def _new(self):
         self.editing = -1
+        self.del_btn.hide()                                  # nothing saved yet -> nothing to delete
         self.list.blockSignals(True)
         self.list.setCurrentRow(-1)
         self.list.blockSignals(False)

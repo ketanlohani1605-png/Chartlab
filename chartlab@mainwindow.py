@@ -81,7 +81,9 @@ class BacktestWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, settings: QtCore.QSettings | None = None):
         super().__init__()
-        self.setWindowTitle("ChartLab")
+        from . import __version__
+        self.version = __version__
+        self.setWindowTitle(f"ChartLab {__version__}")      # so it is always clear which build is running
         self.setUnifiedTitleAndToolBarOnMac(True)
         self.settings = settings or QtCore.QSettings("ChartLab", "ChartLab")
         theme.check_icon_path()                       # tick image used by checkboxes in the style sheet
@@ -115,6 +117,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStatusBar(QtWidgets.QStatusBar())
         self.api_label = QtWidgets.QLabel("")
         self.statusBar().addPermanentWidget(self.api_label)
+        ver = QtWidgets.QLabel(f"v{self.version}  ")
+        ver.setStyleSheet("color:#6a6d78;")
+        ver.setToolTip("ChartLab version")
+        self.statusBar().addPermanentWidget(ver)
+        about = QtGui.QAction("About ChartLab", self)
+        about.setMenuRole(QtGui.QAction.MenuRole.AboutRole)
+        about.triggered.connect(self.show_about)
+        self.addAction(about)
+        self._about_action = about
         self._shortcuts()
         QtWidgets.QApplication.instance().installEventFilter(self)
         self.apply_chart_settings()
@@ -338,7 +349,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f = b.font()
             f.setPixelSize(14)
             f.setWeight(QtGui.QFont.Weight.DemiBold)
-            b.setMinimumWidth(QtGui.QFontMetrics(f).horizontalAdvance(b.text()) + 22)    # never elide to "..."
+            b.setMinimumWidth(QtGui.QFontMetrics(f).horizontalAdvance(b.text()) + 13)    # never elide to "..."
             b.setToolTip({"m": " minute", "h": " hour", "D": " day", "W": " week", "M": " month"}
                          .get(text[-1], "").join([text[:-1], ""]).strip() + ("s" if text[:-1] not in ("1", "") else ""))
             tb.addWidget(b)
@@ -494,7 +505,48 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sync_src_btn(self):
         if hasattr(self, "src_btn"):
             name = self.source.currentText().replace("Provider: ", "")
-            self.src_btn.setText(f"{name} \u00b7 {self.range.currentText()}  \u25be")
+            self._src_full = f"{name} \u00b7 {self.range.currentText()}  \u25be"
+            self._src_short = f"{name}  \u25be"
+            self.src_btn.setText(self._src_full)
+            self._fit_topbar()
+
+    def _fit_topbar(self):
+        """Keep every top-bar button on screen on a 13" laptop: when the window is narrow, labels fold away one by
+        one (Replay, Alert, history length, Indicators, Run) and only their icons stay - TradingView does the same."""
+        tb = getattr(self, "topbar", None)
+        if tb is None or not hasattr(self, "run_btn") or getattr(self, "_fitting", False):
+            return
+        self._fitting = True
+        try:
+            TB = QtCore.Qt.ToolButtonStyle
+            on = self.auto.active if hasattr(self, "auto") else False
+            steps = [(self.replay_btn, " Replay"), (self.alert_btn, " Alert"), (self.src_btn, None),
+                     (self.ind_btn, " Indicators"), (self.run_btn, "\u25b6  Run")]
+            for b, full in steps:                                   # everything at full size first
+                if b is self.src_btn:
+                    b.setText(getattr(self, "_src_full", b.text()))
+                elif b is self.run_btn:
+                    b.setText(full)
+                else:
+                    b.setText(full)
+                    b.setToolButtonStyle(TB.ToolButtonTextBesideIcon)
+            for b, _full in steps:
+                tb.layout().invalidate()
+                if tb.sizeHint().width() <= self.width() - 4:
+                    break
+                if b is self.src_btn:
+                    b.setText(getattr(self, "_src_short", b.text()))
+                elif b is self.run_btn:
+                    b.setText("\u25b6")
+                else:
+                    b.setToolButtonStyle(TB.ToolButtonIconOnly)
+            del on
+        finally:
+            self._fitting = False
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit_topbar()
 
     def _fill_src_menu(self):
         m = self.src_menu
@@ -1127,6 +1179,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ch.replay_begin()
         self.replay_btn.setChecked(ch.replay["active"])
 
+    def show_about(self):
+        QtWidgets.QMessageBox.about(
+            self, "About ChartLab",
+            f"<b style='font-size:16px'>ChartLab {self.version}</b><br><br>TradingView-style charts, Python strategies, "
+            "multi-account orders.<br><br>If this number is lower than the build you downloaded, an older copy of the "
+            "app is still being opened: delete the old ChartLab from Applications and put the new one there.")
+
     def _escape(self):
         pop = QtWidgets.QApplication.activePopupWidget()     # Esc first closes an open menu / autocomplete list
         if pop is not None:
@@ -1148,7 +1207,11 @@ class MainWindow(QtWidgets.QMainWindow):
         iv = st.value("interval", "1d")
         if iv in self.interval_btns:
             self.interval_btns[iv].setChecked(True)
-        i = self.source.findData(st.value("source", "auto"))
+        src = st.value("source", "auto")
+        if src == "yahoo" and st.value("auto_source_offered", "") != "1":
+            src = "auto"                    # one time: older versions only knew Yahoo; Auto = my data -> API -> Yahoo
+        st.setValue("auto_source_offered", "1")
+        i = self.source.findData(src)
         self.source.setCurrentIndex(max(i, 0))
         code = st.value("strategy", "")
         if not code:
@@ -2210,6 +2273,47 @@ def _setup_logging():
         sys.__excepthook__(exc_type, exc, tb)
 
     sys.excepthook = hook
+
+
+def selftest() -> int:
+    """`ChartLab --selftest`: start the real window without a screen, load bars, draw, run a strategy, leave.
+    The Mac build runs this so a build that cannot open never reaches the download page."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import tempfile
+    import numpy as np
+    import pandas as pd
+    theme.apply_pg_config()
+    app = QtWidgets.QApplication(sys.argv[:1])
+    app.setStyle("Fusion")
+    theme.check_icon_path()
+    app.setStyleSheet(theme.STYLESHEET)
+    win = MainWindow(QtCore.QSettings(os.path.join(tempfile.mkdtemp(), "t.ini"), QtCore.QSettings.Format.IniFormat))
+    win.resize(1440, 860)
+    win.show()
+    rng = np.random.default_rng(3)
+    c = 1000 * np.exp(np.cumsum(rng.normal(0, 0.01, 400)))
+    df = pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99, "Close": c * 1.003, "Volume": 1e5},
+                      index=pd.bdate_range(end="2026-10-30", periods=400))
+    p = win.active
+    p.set_dataframe(df, "SELFTEST")
+    for k in ("sma20", "bb", "rsi"):
+        win.ind_actions[k].setChecked(True)
+    win.start_auto_update()
+    win.set_auto_refresh(0)
+    win.set_strategy_code(FALLBACK_STRATEGY)
+    win.run_backtest()
+    t = QtCore.QElapsedTimer()
+    t.start()
+    while t.elapsed() < 15000 and not win.run2_btn.isEnabled():
+        app.processEvents()
+    for _ in range(20):
+        app.processEvents()
+    ok = (p.chart.df is not None and not win.grab().isNull() and p.result is not None
+          and p.chart.price.vb.viewRange()[0][1] > 0)
+    print(("SELFTEST OK " if ok else "SELFTEST FAILED ") + win.version, flush=True)
+    quit_cleanly(win, 0 if ok else 1)
+    return 0 if ok else 1
 
 
 def main():
