@@ -79,7 +79,7 @@ app.processEvents()
 assert len(ch.layer.drawings) == 0, "Delete key should remove the selected drawing"
 
 # --- Esc cancels a half-finished drawing
-w.draw_actions["rect"].trigger()
+w.tool_actions["rect"].trigger()        # (the shapes group starts on the brush, like TradingView)
 click(n - 50, float(df.Close.iloc[-50]))
 assert len(ch.layer.pending) == 1
 QTest.keyClick(w, QtCore.Qt.Key.Key_Escape)

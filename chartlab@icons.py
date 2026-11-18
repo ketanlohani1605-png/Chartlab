@@ -1,19 +1,24 @@
-"""Small vector icons (drawn with QPainter, crisp on Retina) in the TradingView toolbar style."""
+"""Small vector icons (drawn with QPainter, crisp on Retina) in the TradingView toolbar style: a 28 px box,
+1-point lines, #b8b8b8 (TradingView's icon colour, measured), white under the mouse. The drawings are ChartLab's own
+(generic symbols: a clock, a rewind sign, a bar chart ...)."""
 from __future__ import annotations
 
 from PySide6 import QtCore, QtGui
 
-_COLOR = "#d1d4dc"
+_COLOR = "#b8b8b8"
+_HOT = "#ffffff"
+_BOX = 28                         # TradingView's toolbar icons are 28 x 28
 _cache: dict = {}
 
 
-def _icon(name: str, draw, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:
+def _icon(name: str, draw, color: str = _COLOR, size: int = _BOX) -> QtGui.QIcon:
     key = (name, color, size)
     if key in _cache:
         return _cache[key]
     ic = QtGui.QIcon()
-    for mode, col in ((QtGui.QIcon.Mode.Normal, color), (QtGui.QIcon.Mode.Active, "#ffffff"),
-                      (QtGui.QIcon.Mode.Disabled, "#5d606b")):
+    k = size / 24.0                # the drawings use a 24-unit grid, centred in the box
+    for mode, col in ((QtGui.QIcon.Mode.Normal, color), (QtGui.QIcon.Mode.Active, _HOT),
+                      (QtGui.QIcon.Mode.Disabled, "#5d5d5d")):
         for state_on in (False, True):
             dpr = 2
             pm = QtGui.QPixmap(size * dpr, size * dpr)
@@ -21,13 +26,19 @@ def _icon(name: str, draw, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:
             pm.fill(QtCore.Qt.GlobalColor.transparent)
             p = QtGui.QPainter(pm)
             p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-            c = QtGui.QColor("#ffffff" if (state_on and mode == QtGui.QIcon.Mode.Normal) else col)
-            pen = QtGui.QPen(c, 1.25)
+            c = QtGui.QColor(_HOT if (state_on and mode == QtGui.QIcon.Mode.Normal) else col)
+            if size >= 26:                         # big toolbar box: the 24-grid drawing at its natural size, centred
+                off = (size - 24) / 2.0
+                p.translate(off, off)
+                pen = QtGui.QPen(c, 1.0)           # 1 point, like TradingView
+            else:
+                p.scale(k, k)
+                pen = QtGui.QPen(c, 1.15 / k)
             pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
             p.setPen(pen)
             p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-            draw(p, QtCore.QRectF(0, 0, size, size), c)
+            draw(p, QtCore.QRectF(0, 0, 24, 24), c)
             p.end()
             ic.addPixmap(pm, mode, QtGui.QIcon.State.On if state_on else QtGui.QIcon.State.Off)
     _cache[key] = ic
@@ -42,8 +53,9 @@ def _dot(p, x, y, r=2.2):
 
 
 def cross(p, r, c):
-    p.drawLine(QtCore.QPointF(12, 4), QtCore.QPointF(12, 20))
-    p.drawLine(QtCore.QPointF(4, 12), QtCore.QPointF(20, 12))
+    """The crosshair cursor: four arms with an open centre."""
+    for a, b in (((12, 3.5), (12, 9.5)), ((12, 14.5), (12, 20.5)), ((3.5, 12), (9.5, 12)), ((14.5, 12), (20.5, 12))):
+        p.drawLine(QtCore.QPointF(*a), QtCore.QPointF(*b))
 
 
 def cursor(p, r, c):
@@ -169,20 +181,21 @@ def close(p, r, c):
 
 
 def replay_icon(p, r, c):
-    p.drawArc(QtCore.QRectF(5, 5, 14, 14), 40 * 16, 280 * 16)
-    p.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(4, 6), QtCore.QPointF(6.5, 9.5), QtCore.QPointF(10, 7.5)]))
-    p.setBrush(p.pen().color())
-    p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(10.5, 9), QtCore.QPointF(15, 12), QtCore.QPointF(10.5, 15)]))
+    """Bar replay: a rewind sign (two triangles pointing back)."""
+    for x0 in (4.5, 11.5):
+        p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(x0 + 7.5, 6.5), QtCore.QPointF(x0, 12),
+                                       QtCore.QPointF(x0 + 7.5, 17.5)]))
 
 
 def bell(p, r, c):
-    path = QtGui.QPainterPath(QtCore.QPointF(6, 16))
-    path.cubicTo(8, 15, 8, 12, 8, 10)
-    path.cubicTo(8, 6.5, 16, 6.5, 16, 10)
-    path.cubicTo(16, 12, 16, 15, 18, 16)
-    path.closeSubpath()
-    p.drawPath(path)
-    p.drawArc(QtCore.QRectF(10, 16, 4, 4), 200 * 16, 140 * 16)
+    """Alerts: an alarm clock with a small plus (create alert)."""
+    p.drawEllipse(QtCore.QPointF(11.5, 13), 7, 7)
+    p.drawLine(QtCore.QPointF(11.5, 9), QtCore.QPointF(11.5, 13))
+    p.drawLine(QtCore.QPointF(11.5, 13), QtCore.QPointF(14, 14.5))
+    p.drawArc(QtCore.QRectF(2.5, 3, 6, 6), 100 * 16, 80 * 16)        # the two bells on top
+    p.drawArc(QtCore.QRectF(14.5, 3, 6, 6), 0, 80 * 16)
+    p.drawLine(QtCore.QPointF(19, 17), QtCore.QPointF(19, 23))       # plus
+    p.drawLine(QtCore.QPointF(16, 20), QtCore.QPointF(22, 20))
 
 
 def watchlist(p, r, c):
@@ -210,16 +223,32 @@ def candles_icon(p, r, c):
 
 
 def layout_icon(p, r, c):
-    p.drawRect(QtCore.QRectF(4, 5, 16, 14))
-    p.drawLine(QtCore.QPointF(12, 5), QtCore.QPointF(12, 19))
-    p.drawLine(QtCore.QPointF(4, 12), QtCore.QPointF(20, 12))
+    """Chart layout: the shape of the current layout (one chart = one square, like TradingView's button)."""
+    p.drawRoundedRect(QtCore.QRectF(4.5, 4.5, 15, 15), 2, 2)
+
+
+def layout_2h(p, r, c):
+    p.drawRoundedRect(QtCore.QRectF(4.5, 4.5, 15, 15), 2, 2)
+    p.drawLine(QtCore.QPointF(12, 4.5), QtCore.QPointF(12, 19.5))
+
+
+def layout_2v(p, r, c):
+    p.drawRoundedRect(QtCore.QRectF(4.5, 4.5, 15, 15), 2, 2)
+    p.drawLine(QtCore.QPointF(4.5, 12), QtCore.QPointF(19.5, 12))
+
+
+def layout_4(p, r, c):
+    layout_2h(p, r, c)
+    p.drawLine(QtCore.QPointF(4.5, 12), QtCore.QPointF(19.5, 12))
 
 
 def fx(p, r, c):
-    f = QtGui.QFont("Helvetica Neue", 11)
-    f.setItalic(True)
-    p.setFont(f)
-    p.drawText(QtCore.QRectF(2, 2, 22, 20), QtCore.Qt.AlignmentFlag.AlignCenter, "fx")
+    """Indicators: a small bar chart with a rising line across it."""
+    for x, top in ((5.5, 14), (9.5, 11), (13.5, 13), (17.5, 8)):
+        p.drawLine(QtCore.QPointF(x, top), QtCore.QPointF(x, 19.5))
+    p.drawLine(QtCore.QPointF(3.5, 19.5), QtCore.QPointF(20.5, 19.5))
+    p.drawPolyline([QtCore.QPointF(4, 11), QtCore.QPointF(9.5, 6.5), QtCore.QPointF(13.5, 9),
+                    QtCore.QPointF(20, 3.5)])
 
 
 def play(p, r, c):
@@ -464,11 +493,12 @@ def t_daterange(p, r, c):
 
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
-    "watchlist", "code", "table", "candles_icon", "layout_icon", "fx", "play", "latest",
+    "watchlist", "code", "table", "candles_icon", "layout_icon", "layout_2h", "layout_2v", "layout_4", "fx", "play",
+    "latest",
     "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin", "chain", "st_bars", "st_candles", "st_hollow", "st_heikin", "st_line",
     "st_linemark", "st_step", "st_area", "st_baseline", "t_ext", "t_arrow", "t_ellipse", "t_long", "t_short",
     "t_pricerange", "t_daterange", "t_channel", "t_brush", "t_stay")}
 
 
-def get(name: str, color: str = _COLOR, size: int = 24) -> QtGui.QIcon:
+def get(name: str, color: str = _COLOR, size: int = _BOX) -> QtGui.QIcon:
     return _icon(name, _DRAWERS[name], color, size)

@@ -526,16 +526,18 @@ def legend_logo_html(sym: str) -> str:
 
 def status_pill_html(state: str, bg: str = "#000000") -> str:
     """TradingView's market-status pill after the legend title (its DOM: 18 px tall capsule, 2 px / 6 px padding, an
-    18 px icon, 12 px text #b8b8b8 on rgba(184,184,184,0.2)). 'closed' -> a dash and 'Closed'; 'pre' -> 'Pre-market'
-    in orange. Nothing while the market is open (TradingView shows nothing then either)."""
-    if state not in ("closed", "pre"):
+    18 px icon, 12 px text #b8b8b8 on rgba(184,184,184,0.2)). 'closed' -> a dash and 'Closed'; 'open' -> a teal dot
+    and 'Open' (#42bda8 on rgba(34,171,148,0.2), measured); 'pre' -> 'Pre-market' in orange."""
+    look = {"closed": (AXIS_TEXT, "Closed", AXIS_TEXT), "open": ("#42bda8", "Open", "#22ab94"),
+            "pre": ("#ff9100", "Pre-market", "#ff9100")}.get(state)
+    if look is None:
         return ""
-    col, text = (AXIS_TEXT, "Closed") if state == "closed" else ("#ff9100", "Pre-market")
+    col, text, tint = look
     f = QtGui.QFont()
     f.setPixelSize(12)
     tw = QtGui.QFontMetricsF(f).horizontalAdvance(text)
     w, h = 2 + 18 + 2 + tw + 6, 18.0
-    fill = _blend(col, 0.2, bg)
+    fill = _blend(tint, 0.2, bg)
 
     def draw(qp):
         path = QtGui.QPainterPath()
@@ -543,10 +545,10 @@ def status_pill_html(state: str, bg: str = "#000000") -> str:
         qp.fillPath(path, fill)
         qp.setPen(QtCore.Qt.PenStyle.NoPen)
         qp.setBrush(QtGui.QColor(col))
-        if state == "closed":                       # TradingView's icon: M12 7a2 2 0 1 1 0 4H6a2 2 0 1 1 0-4z
+        if state == "closed":                       # a dash
             qp.drawRoundedRect(QtCore.QRectF(2 + 4, 7, 10, 4), 2, 2)
-        else:
-            qp.drawEllipse(QtCore.QPointF(2 + 9, 9), 3, 3)
+        else:                                       # a dot (radius 4 in the 18 px icon)
+            qp.drawEllipse(QtCore.QPointF(2 + 9, 9), 4, 4)
         qp.setPen(QtGui.QColor(col))
         qp.setFont(f)
         qp.drawText(QtCore.QRectF(2 + 18 + 2, 0, tw + 2, h), QtCore.Qt.AlignmentFlag.AlignLeft |
@@ -1066,6 +1068,17 @@ class ChartWidget(QtWidgets.QWidget):
                                       "QToolButton:hover{background:#2e2e2e;}")
         self.latest_btn.clicked.connect(self.scroll_to_latest)
         self.latest_btn.hide()
+        # TradingView: a settings button in the corner where the price and time scales meet
+        self.axis_gear = QtWidgets.QToolButton(self.glw)
+        self.axis_gear.setIcon(icons.get("gear"))
+        self.axis_gear.setIconSize(QtCore.QSize(18, 18))
+        self.axis_gear.setFixedSize(26, 26)
+        self.axis_gear.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.axis_gear.setToolTip("Chart settings")
+        self.axis_gear.setStyleSheet("QToolButton{background:transparent;border:0;border-radius:4px;padding:0;}"
+                                     "QToolButton:hover{background:#2e2e2e;}")
+        self.axis_gear.clicked.connect(self.settingsRequested.emit)
+        self.axis_gear.hide()
 
         self.price.vb.sigXRangeChanged.connect(self._autoscale)
         self.price.vb.sigXRangeChanged.connect(lambda *_: self._sync_latest_btn())
@@ -1494,10 +1507,26 @@ class ChartWidget(QtWidgets.QWidget):
         self._cross_key = key
         self._mouse_moved(self.glw.mapToScene(vp), refresh=True)
 
+    def _place_axis_gear(self):
+        g = self.axis_gear
+        bp = self._bottom_plot() if self.df is not None else None
+        if bp is None or not bp.getAxis("bottom").isVisible():
+            g.hide()
+            return
+        vt = self.glw.viewportTransform()
+        ra = axis_rect(self.price.getAxis("right"))
+        ba = axis_rect(bp.getAxis("bottom"))
+        x0, x1 = vt.map(QtCore.QPointF(ra.left(), 0)).x(), vt.map(QtCore.QPointF(ra.right(), 0)).x()
+        y0, y1 = vt.map(QtCore.QPointF(0, ba.top())).y(), vt.map(QtCore.QPointF(0, ba.bottom())).y()
+        g.move(int((x0 + x1 - g.width()) / 2), int((y0 + y1 - g.height()) / 2))
+        g.show()
+        g.raise_()
+
     def _place_overlays(self):
         self.corners.setGeometry(self.glw.rect())
         self.corners.raise_()
         self._sync_latest_btn()
+        self._place_axis_gear()
         if not self.draw_bar.isHidden():
             self.draw_bar.place()
             self.draw_bar.raise_()

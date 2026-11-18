@@ -117,16 +117,20 @@ class MainWindow(QtWidgets.QMainWindow):
             if act.menu():
                 hm.addMenu(act.menu())
         self.menu_btn.setMenu(hm)
+        # TradingView has no status bar: messages show as a small toast over the chart instead, and the live-feed /
+        # Claude-link labels sit in the bottom bar next to the clock
         self.setStatusBar(QtWidgets.QStatusBar())
-        self.live_label = QtWidgets.QLabel("")
-        self.live_label.hide()
-        self.statusBar().addPermanentWidget(self.live_label)
-        self.api_label = QtWidgets.QLabel("")
-        self.statusBar().addPermanentWidget(self.api_label)
-        ver = QtWidgets.QLabel(f"v{self.version}  ")
-        ver.setStyleSheet("color:#6a6d78;")
-        ver.setToolTip("ChartLab version")
-        self.statusBar().addPermanentWidget(ver)
+        self.statusBar().hide()
+        self.toast = QtWidgets.QLabel(self)
+        self.toast.setObjectName("toast")
+        self.toast.setStyleSheet("QLabel#toast { background: #1e1e1e; color: #dbdbdb; border: 1px solid #2e2e2e;"
+                                 " border-radius: 6px; padding: 7px 14px; font-size: 13px; }")
+        self.toast.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.toast.hide()
+        self.statusBar().messageChanged.connect(self._show_toast)
+        self._toast_timer = QtCore.QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self.toast.hide)
         about = QtGui.QAction("About ChartLab", self)
         about.setMenuRole(QtGui.QAction.MenuRole.AboutRole)
         about.triggered.connect(self.show_about)
@@ -180,6 +184,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active = self.panels[0]
         self.active.set_active(True)
 
+    def _quiet_status(self, text: str):
+        """A routine status line (loading, bar count): kept for the API / tests, never shown as a toast."""
+        self._quiet = True
+        try:
+            self.statusBar().showMessage(text)
+        finally:
+            self._quiet = False
+
+    def _show_toast(self, text: str):
+        t = self.toast
+        if not text or getattr(self, "_quiet", False):
+            t.hide()
+            return
+        t.setText(text)
+        t.adjustSize()
+        t.setMaximumWidth(max(200, self.width() - 160))
+        y = self.height() - t.height() - 56                   # just above the bottom bar, centred
+        t.move(max(8, (self.width() - t.width()) // 2), max(8, y))
+        t.show()
+        t.raise_()
+        self._toast_timer.start(4000)                         # a toast never stays on screen
+
     def _build_strip(self):
         """TradingView's bottom bar: 1D 5D 1M 3M 6M YTD 1Y 5Y All  ...  clock."""
         bar = QtWidgets.QFrame()
@@ -200,8 +226,14 @@ class MainWindow(QtWidgets.QMainWindow):
         gd.clicked.connect(self._goto_date)
         h.addWidget(gd)
         h.addStretch(1)
+        self.live_label = QtWidgets.QLabel("")                # live feed / Claude link, next to the clock
+        self.live_label.hide()
+        self.api_label = QtWidgets.QLabel("")
+        for lab in (self.live_label, self.api_label):
+            lab.setStyleSheet("color:#b8b8b8; font-size:12px; padding-right:10px;")
+            h.addWidget(lab)
         self.clock = QtWidgets.QLabel("")
-        self.clock.setStyleSheet(f"color:{theme.TEXT}; font-size:13px; padding-right:10px;")
+        self.clock.setStyleSheet("color:#b8b8b8; font-size:13px; padding-right:10px;")
         h.addWidget(self.clock)
         sep = QtWidgets.QFrame()
         sep.setObjectName("vsep")
@@ -209,7 +241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         h.addWidget(sep)
         adj = QtWidgets.QLabel("  ADJ")
         adj.setToolTip("Prices are adjusted for splits / dividends")
-        adj.setStyleSheet(f"color:{theme.TEXT}; font-size:13px;")
+        adj.setStyleSheet("color:#b8b8b8; font-size:13px;")
         h.addWidget(adj)
         self._clock_timer = QtCore.QTimer(self)
         self._clock_timer.timeout.connect(self._tick_clock)
@@ -221,8 +253,95 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tv_interval(text: str) -> str:
         return {"1D": "D", "1W": "W", "1M": "M"}.get(text, text[:-1] if text.endswith("m") else text)
 
+    def leftbar_mode(self, action):
+        """Popup mode of a drawing-toolbar button (TradingView: icon = tool, narrow strip on its right = list)."""
+        for tb in self.findChildren(QtWidgets.QToolBar):
+            if tb.objectName() == "leftrail":
+                w_ = tb.widgetForAction(action)
+                return w_.popupMode() if w_ is not None else None
+        return None
+
     def _sync_interval_label(self):
         self.interval_btn.setText("\u2304")              # the chevron after the favourites opens the full list
+
+    # ---- favourite intervals (TradingView: a star in the interval list puts it on the toolbar)
+    DEFAULT_FAV_INTERVALS = ["1m", "5m", "15m", "1h", "1d"]
+
+    def _load_fav_intervals(self) -> list:
+        import json as _json
+        try:
+            raw = self.settings.value("fav_intervals", "")
+            favs = _json.loads(raw) if raw else list(self.DEFAULT_FAV_INTERVALS)
+        except Exception:  # noqa: BLE001
+            favs = list(self.DEFAULT_FAV_INTERVALS)
+        known = [v for v, _ in INTERVALS]
+        return [v for v in known if v in favs]
+
+    def _apply_fav_intervals(self):
+        """Show the favourite intervals and, like TradingView, the current one even when it is not a favourite."""
+        acts = getattr(self, "interval_btn_actions", {})
+        for v, a in acts.items():
+            a.setVisible(v in self.fav_intervals or self.interval_btns[v].isChecked())
+        if hasattr(self, "run_btn"):
+            self._fit_topbar()
+
+    def toggle_fav_interval(self, val: str, on: bool | None = None):
+        import json as _json
+        on = (val not in self.fav_intervals) if on is None else bool(on)
+        favs = set(self.fav_intervals)
+        favs.add(val) if on else favs.discard(val)
+        self.fav_intervals = [v for v, _ in INTERVALS if v in favs]
+        self.settings.setValue("fav_intervals", _json.dumps(self.fav_intervals))
+        self._apply_fav_intervals()
+        self._sync_interval_menu()
+
+    def _interval_row(self, menu, val: str, text: str):
+        """One line of the interval list: the name picks the interval, the star on the right adds it to / removes
+        it from the toolbar (TradingView's favourites)."""
+        row = QtWidgets.QWidget()
+        row.setObjectName("ivrow")
+        row.setStyleSheet("QWidget#ivrow { background: transparent; border-radius: 0; }"
+                          " QWidget#ivrow:hover { background: #2e2e2e; }"
+                          " QPushButton { background: transparent; border: 0; color: #dbdbdb; text-align: left;"
+                          " padding: 7px 8px 7px 16px; font-size: 13px; }"
+                          " QPushButton:hover { background: transparent; }"
+                          " QToolButton { background: transparent; border: 0; color: #6a6a6a; font-size: 15px;"
+                          " padding: 0 12px 0 6px; } QToolButton:hover { color: #dbdbdb; background: transparent; }"
+                          " QToolButton:checked { color: #f5a623; }")
+        row.setAttribute(QtCore.Qt.WidgetAttribute.WA_Hover)
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        name = QtWidgets.QPushButton(text)
+        name.setMinimumWidth(150)
+        name.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        star = QtWidgets.QToolButton()
+        star.setCheckable(True)
+        star.setToolTip("Add to favourites (shown on the toolbar)")
+        star.setText("\u2605")
+        h.addWidget(name, 1)
+        h.addWidget(star)
+        act = QtWidgets.QWidgetAction(menu)
+        act.setDefaultWidget(row)
+        menu.addAction(act)
+
+        def pick():
+            menu.close()
+            self.interval_btns[val].click()
+        name.clicked.connect(pick)
+        star.clicked.connect(lambda on, v=val: self.toggle_fav_interval(v, on))
+        act.name_btn, act.star = name, star
+        self.interval_stars[val] = star
+        return act
+
+    def _sync_interval_menu(self):
+        for v, act in getattr(self, "interval_menu_actions", {}).items():
+            cur = self.interval_btns[v].isChecked()
+            f = act.name_btn.font()
+            f.setWeight(QtGui.QFont.Weight.DemiBold if cur else QtGui.QFont.Weight.Normal)
+            act.name_btn.setFont(f)
+            act.name_btn.setStyleSheet("color: #ffffff;" if cur else "")
+            act.star.setChecked(v in self.fav_intervals)
 
     def _zoom_x(self, f):
         vb = self.active.chart.price.vb
@@ -287,7 +406,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb = self.addToolBar("Data")
         tb.setObjectName("topbar")
         tb.setMovable(False)
-        tb.setIconSize(QtCore.QSize(22, 22))
+        tb.setIconSize(QtCore.QSize(28, 28))                  # TradingView: 28 px icons in 38 px buttons
         self.topbar = tb
 
         def vsep():
@@ -319,15 +438,15 @@ class MainWindow(QtWidgets.QMainWindow):
         ph.setContentsMargins(0, 0, 0, 0)
         ph.setSpacing(0)
         self.sym_btn = QtWidgets.QToolButton()
-        self.sym_btn.setObjectName("symbtn")
-        self.sym_btn.setIcon(icons.get("search"))
-        self.sym_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.sym_btn.setObjectName("symbtn")                 # TradingView: the symbol in a #303030 pill, no icon
+        self.sym_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.sym_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.sym_btn.setToolTip("Symbol Search  (just start typing on the chart)")
         self.sym_btn.clicked.connect(lambda: self.open_symbol_search(""))
         ph.addWidget(self.sym_btn)
         ph.addWidget(self.symbol)
-        self.symbol.textChanged.connect(lambda t: self.sym_btn.setText(" " + (t.strip().upper() or "Symbol")))
-        self.sym_btn.setText(" Symbol")
+        self.symbol.textChanged.connect(lambda t: self.sym_btn.setText(t.strip().upper() or "Symbol"))
+        self.sym_btn.setText("Symbol")
         tb.addWidget(pill)
         cmp_ = QtWidgets.QToolButton()
         cmp_.setIcon(icons.get("compare"))
@@ -354,6 +473,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.interval_group = QtWidgets.QButtonGroup(self)
         self.interval_btns = {}
+        self.interval_btn_actions = {}                        # TradingView: favourite intervals + the current one
+        self.fav_intervals = self._load_fav_intervals()
         for val, text in INTERVALS:
             b = QtWidgets.QToolButton(self)
             b.setText(text)
@@ -369,7 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
             b.setMinimumWidth(QtGui.QFontMetrics(f).horizontalAdvance(b.text()) + 13)    # never elide to "..."
             b.setToolTip({"m": " minute", "h": " hour", "D": " day", "W": " week", "M": " month"}
                          .get(text[-1], "").join([text[:-1], ""]).strip() + ("s" if text[:-1] not in ("1", "") else ""))
-            tb.addWidget(b)
+            self.interval_btn_actions[val] = tb.addWidget(b)
         self.interval_btns["1d"].setChecked(True)
         self.interval_btn = QtWidgets.QToolButton()
         self.interval_btn.setToolTip("Time interval  (type a number on the chart)")
@@ -380,20 +501,21 @@ class MainWindow(QtWidgets.QMainWindow):
                   ("HOURS", [("1h", "1 hour")]),
                   ("DAYS", [("1d", "1 day"), ("1wk", "1 week"), ("1mo", "1 month")]))
         self.interval_menu_actions = {}
+        self.interval_stars = {}
         for title, items in groups:
             if title != "MINUTES":
                 im.addSeparator()
             theme.menu_section(im, title)
             for val, text in items:
-                act = im.addAction(text, lambda v=val: self.interval_btns[v].click())
-                act.setCheckable(True)
+                act = self._interval_row(im, val, text)
                 self.interval_menu_actions[val] = act
-        im.aboutToShow.connect(lambda: [a_.setChecked(self.interval_btns[v].isChecked())
-                                        for v, a_ in self.interval_menu_actions.items()])
+        im.aboutToShow.connect(self._sync_interval_menu)
+        self.interval_menu = im
         self.interval_btn.setMenu(im)
         tb.addWidget(self.interval_btn)
-        self.interval_group.buttonToggled.connect(lambda *_: self._sync_interval_label())
+        self.interval_group.buttonToggled.connect(lambda *_: (self._sync_interval_label(), self._apply_fav_intervals()))
         self._sync_interval_label()
+        self._apply_fav_intervals()
         vsep()
 
         style_menu = QtWidgets.QMenu(self)
@@ -430,13 +552,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.layout_group = QtGui.QActionGroup(self)
         self.layout_actions = {}
         for key, text in LAYOUTS.items():
-            a = layout_menu.addAction(icons.get("layout_icon"), text)
+            a = layout_menu.addAction(icons.get({"1": "layout_icon", "2h": "layout_2h", "2v": "layout_2v",
+                                                 "4": "layout_4"}[key]), text)
             a.setCheckable(True)
             self.layout_group.addAction(a)
             a.triggered.connect(lambda _=False, k=key: self.set_layout(k))
             self.layout_actions[key] = a
         self.layout_actions["1"].setChecked(True)
-        self._menu_button(tb, "", layout_menu, icon="layout_icon", tip="Chart layout")
+        self.layout_btn = self._menu_button(tb, "", layout_menu, icon="layout_icon", tip="Chart layout")
         vsep()
 
         self.alert_btn = QtWidgets.QToolButton()
@@ -485,6 +608,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_src_btn()
 
         self.acct_btn = QtWidgets.QToolButton()
+        self.acct_btn.setObjectName("tradepill")              # styled like TradingView's "Trade" pill
+        self.acct_btn.setFixedHeight(28)
         self.acct_btn.setText("Accounts")
         self.acct_btn.setToolTip("Broker accounts: API data + run one script on many accounts")
         m_ = QtWidgets.QMenu(self.acct_btn)
@@ -513,7 +638,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_acct_dot()
         vsep()
 
-        tbtn("zoom", f"Quick search  ({theme.sc('Ctrl+K')})", self.quick_search)
+        tbtn("search", f"Quick search  ({theme.sc('Ctrl+K')})", self.quick_search)
         tbtn("gear", "Settings", self.open_settings)
         tbtn("fullscreen", f"Full screen  ({theme.sc('Shift+F')})", self.toggle_fullscreen)
         tbtn("camera", "Save chart image", self.save_chart_image)
@@ -529,6 +654,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self._gap(4))
         self.run_btn = QtWidgets.QPushButton("\u25b6  Run")
         self.run_btn.setObjectName("pill")
+        self.run_btn.setFixedHeight(28)                       # TradingView: 28 px pills (Upgrade / Trade)
         self.run_btn.setToolTip("Run the strategy / script  (Cmd+R)")
         self.run_btn.clicked.connect(self.run_backtest)
         tb.addWidget(self.run_btn)
@@ -553,10 +679,15 @@ class MainWindow(QtWidgets.QMainWindow):
             TB = QtCore.Qt.ToolButtonStyle
             on = self.auto.active if hasattr(self, "auto") else False
             steps = [(self.replay_btn, " Replay"), (self.alert_btn, " Alert"), (self.src_btn, None),
-                     (self.ind_btn, " Indicators"), (self.run_btn, "\u25b6  Run"), (self.acct_btn, None)]
+                     (self.ind_btn, " Indicators"), ("favs", None), (self.run_btn, "\u25b6  Run"), (self.acct_btn, None)]
+            ivs = getattr(self, "interval_btn_actions", {})
             for b, full in steps:                                   # everything at full size first
-                if b is self.acct_btn:
+                if b == "favs":
+                    for v, a in ivs.items():
+                        a.setVisible(v in self.fav_intervals or self.interval_btns[v].isChecked())
+                elif b is self.acct_btn:
                     b.setToolButtonStyle(TB.ToolButtonTextBesideIcon)
+                    self._set_folded(b, False)
                 elif b is self.src_btn:
                     b.setText(getattr(self, "_src_full", b.text()))
                 elif b is self.run_btn:
@@ -568,19 +699,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 tb.layout().invalidate()
                 if tb.sizeHint().width() <= self.width() - 4:
                     break
-                if b is self.src_btn:
+                if b == "favs":                                     # then only the current interval (TradingView)
+                    for v, a in ivs.items():
+                        a.setVisible(self.interval_btns[v].isChecked())
+                elif b is self.src_btn:
                     b.setText(getattr(self, "_src_short", b.text()))
                 elif b is self.run_btn:
                     b.setText("\u25b6")
                 else:
                     b.setToolButtonStyle(TB.ToolButtonIconOnly)
+                    if b is self.acct_btn:                          # just the status dot, without the pill outline
+                        self._set_folded(b, True)
             del on
         finally:
             self._fitting = False
 
+    @staticmethod
+    def _set_folded(b, on: bool):
+        if b.property("folded") != on:
+            b.setProperty("folded", on)
+            b.style().unpolish(b)
+            b.style().polish(b)
+
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         self._fit_topbar()
+        if hasattr(self, "toast") and not self.toast.isHidden():    # keep a showing toast above the bottom bar
+            t = self.toast
+            t.move(max(8, (self.width() - t.width()) // 2), max(8, self.height() - t.height() - 56))
 
     def _fill_src_menu(self):
         m = self.src_menu
@@ -674,7 +820,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setObjectName("leftrail")
         tb.setOrientation(QtCore.Qt.Orientation.Vertical)
         tb.setMovable(False)
-        tb.setIconSize(QtCore.QSize(24, 24))
+        tb.setIconSize(QtCore.QSize(28, 28))                  # TradingView: 52 x 38 buttons, 28 px icons
         self.addToolBar(QtCore.Qt.ToolBarArea.LeftToolBarArea, tb)
         self.draw_group = QtGui.QActionGroup(self)
         self.draw_actions = {}
@@ -685,21 +831,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.draw_group.addAction(cur)
         cur.triggered.connect(lambda: self._tool_clicked(None))
         self.draw_actions[None] = cur
-        tb.addSeparator()
         ICON = {"hray": "ray", "crossline": "cross", "ext": "t_ext", "arrow": "t_arrow", "ellipse": "t_ellipse",
                 "pricerange": "t_pricerange", "daterange": "t_daterange", "long": "t_long", "short": "t_short",
                 "channel": "t_channel", "brush": "t_brush"}
         SC = {"trend": "Alt+T", "hline": "Alt+H", "hray": "Alt+J", "vline": "Alt+V", "crossline": "Alt+C",
               "fib": "Alt+F", "rect": "Shift+Alt+R"}
+        # TradingView's order: cursor, trend tools, Gann & Fibonacci, forecasting, shapes (brush first), text |
+        # measure, zoom | magnet, keep drawing, lock, hide | remove
         GROUPS = [("Trend lines", ["trend", "ray", "ext", "hray", "hline", "vline", "crossline", "channel"]),
                   ("Gann and Fibonacci", ["fib"]),
-                  ("Brush  (drag to draw freehand)", ["brush"]),
                   ("Forecasting and measurement", ["long", "short", "pricerange", "daterange"]),
-                  ("Geometric shapes", ["rect", "ellipse", "arrow"]),
+                  ("Geometric shapes  (the brush draws freehand)", ["brush", "rect", "ellipse", "arrow"]),
                   ("Text and notes", ["text"]),
-                  ("Measure", ["measure"])]              # TradingView's order; the ruler is its own button
+                  (None, None),
+                  ("Measure", ["measure"])]
         self.tool_groups = {}
+        self.tool_actions = {}                                # one action per tool (the group lists)
         for gname, keys in GROUPS:
+            if gname is None:
+                tb.addSeparator()
+                continue
             ga = tb.addAction(icons.get(ICON.get(keys[0], keys[0])), "")
             ga.setCheckable(True)
             ga.setToolTip(gname)
@@ -710,24 +861,26 @@ class MainWindow(QtWidgets.QMainWindow):
             ga.setData(keys[0])
             ga.triggered.connect(lambda _=False, ga=ga: self._tool_clicked(ga.data()))
             if len(keys) == 1:
+                self.tool_actions[keys[0]] = ga
                 continue
             menu = QtWidgets.QMenu(self)
             for k in keys:
                 act = menu.addAction(icons.get(ICON.get(k, k)), TOOL_LABELS[k] + (f"\t{theme.sc(SC[k])}" if k in SC else ""))
                 act.triggered.connect(lambda _=False, k=k, ga=ga: (ga.setIcon(icons.get(ICON.get(k, k))), ga.setData(k), self._tool_clicked(k)))
+                self.tool_actions[k] = act
             ga.setMenu(menu)
-            btn = tb.widgetForAction(ga)
-            btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+            btn = tb.widgetForAction(ga)                      # TradingView: the icon picks the tool, the narrow
+            btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.MenuButtonPopup)   # strip on its right lists it
         self._tool_icon = ICON
+        zi = tb.addAction(icons.get("zoom"), "")
+        zi.setToolTip("Zoom in")
+        zi.triggered.connect(lambda: self._zoom_x(0.7))
         tb.addSeparator()
         self.magnet_action = tb.addAction(icons.get("magnet"), "")
         self.magnet_action.setCheckable(True)
         self.magnet_action.setChecked(True)
         self.magnet_action.setToolTip("Magnet: snap drawings to candle open/high/low/close")
         self.magnet_action.toggled.connect(self._magnet_toggled)
-        zi = tb.addAction(icons.get("zoom"), "")
-        zi.setToolTip("Zoom in")
-        zi.triggered.connect(lambda: self._zoom_x(0.7))
         st = tb.addAction(icons.get("t_stay"), "")
         st.setCheckable(True)
         st.setToolTip("Stay in drawing mode: the tool stays selected after each drawing")
@@ -740,19 +893,23 @@ class MainWindow(QtWidgets.QMainWindow):
         hd.setCheckable(True)
         hd.setToolTip("Hide all drawings")
         hd.toggled.connect(lambda on: [p.chart.layer.set_hidden(on) for p in self.panels])
-        d = tb.addAction(icons.get("eraser"), "")
-        d.setToolTip("Delete selected drawing  (Delete)")
-        d.triggered.connect(lambda: self.active.chart.layer.delete_selected())
-        c = tb.addAction(icons.get("trash"), "")
+        tb.addSeparator()
+        c = tb.addAction(icons.get("trash"), "")             # TradingView: one Remove button with a list
         c.setToolTip("Remove all drawings on this chart")
         c.triggered.connect(lambda: self.active.chart.layer.clear())
+        rm = QtWidgets.QMenu(self)
+        rm.addAction(icons.get("eraser"), f"Remove selected drawing\t{theme.sc('Del')}",
+                     lambda: self.active.chart.layer.delete_selected())
+        rm.addAction(icons.get("trash"), "Remove all drawings", lambda: self.active.chart.layer.clear())
+        c.setMenu(rm)
+        tb.widgetForAction(c).setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.MenuButtonPopup)
 
     def _build_right_rail(self):
         tb = QtWidgets.QToolBar("Panels")
         tb.setObjectName("rightrail")
         tb.setOrientation(QtCore.Qt.Orientation.Vertical)
         tb.setMovable(False)
-        tb.setIconSize(QtCore.QSize(24, 24))
+        tb.setIconSize(QtCore.QSize(28, 28))
         self.addToolBar(QtCore.Qt.ToolBarArea.RightToolBarArea, tb)
         self.right_docks = [self.watch_dock, self.alerts_dock, self.strategy_dock, self.data_dock, self.chain_dock]
         self.rail_actions = {}
@@ -1548,6 +1705,9 @@ class MainWindow(QtWidgets.QMainWindow):
             name = "1"
         self.layout_name = name
         self.layout_actions[name].setChecked(True)
+        if hasattr(self, "layout_btn"):                       # the button shows the current layout's shape
+            self.layout_btn.setIcon(icons.get({"1": "layout_icon", "2h": "layout_2h", "2v": "layout_2v",
+                                               "4": "layout_4"}[name]))
         n = LAYOUT_COUNT[name]
         H, V = QtCore.Qt.Orientation.Horizontal, QtCore.Qt.Orientation.Vertical
         sizes = getattr(self, "_split_sizes", {})
@@ -1985,7 +2145,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tool_changed(self, tool):
         self._syncing = True
         try:
-            self.draw_actions.get(tool, self.draw_actions[None]).setChecked(True)
+            ga = self.draw_actions.get(tool, self.draw_actions[None])
+            ga.setChecked(True)
+            if tool is not None and ga in getattr(self, "tool_groups", {}) and ga.data() != tool:
+                ga.setData(tool)                              # TradingView: a group shows the tool used last
+                ga.setIcon(icons.get(self._tool_icon.get(tool, tool)))
         finally:
             self._syncing = False
 
@@ -2029,7 +2193,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_load_started(self, panel):
         if panel is self.active:
             self.load_btn.setEnabled(False)
-        self.statusBar().showMessage(f"Loading {panel.params['symbol']}…")
+        self._quiet_status(f"Loading {panel.params['symbol']}…")
 
     def _on_loaded(self, panel):
         self.load_btn.setEnabled(True)
@@ -2196,7 +2360,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 took += " from the saved copy, fetching fresh bars\u2026"
             elif getattr(panel, "fresh_ms", None):
                 took += f", fresh bars after {panel.fresh_ms / 1000:.1f} s"
-        self.statusBar().showMessage(
+        self._quiet_status(                                     # (TradingView shows nothing when a chart loads)
             f"{panel.chart.ticker()}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} \u2192 {df.index[-1]:%d %b %Y}{took}")
 
     def _on_refreshed(self, panel):

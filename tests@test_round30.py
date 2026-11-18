@@ -215,10 +215,11 @@ assert "border-top-right-radius: 2px" in yt.styleSheet() and "border-bottom-left
 assert yt.width() < ch.price.getAxis("right").width()                  # as wide as its text, not the whole scale
 # the line really is one crisp row: render the chart and look at the pixels left of the '+'
 img = ch.glw.grab().toImage()
-sx = int((pb.x() - 40) * img.devicePixelRatio())
-rows = [y for y in range(img.height()) if QtGui.QColor(img.pixel(sx, y)).name() == "#9c9c9c"
-        or QtGui.QColor(img.pixel(sx + 6, y)).name() == "#9c9c9c"]
 d = img.devicePixelRatio()
+sx = int((pb.x() - 60) * d)
+cols = range(sx, sx + int(24 * d))                     # wider than one dash period: some column is always "on"
+rows = sorted({y for y in range(int((yt.y() - 4) * d), int((yt.y() + yt.height() + 4) * d))
+               for x in cols if QtGui.QColor(img.pixel(x, y)).name() == "#9c9c9c"})
 assert rows and min(rows) >= line_row * d - 1 and max(rows) <= (line_row + 1) * d, (rows[:6], line_row, d)
 # the crosshair runs through every pane, the value label shows in the hovered one
 for pn in ch.panes:
@@ -280,9 +281,9 @@ assert lab.endswith(ch.df.index[ch._hover_i].strftime("%H:%M")) and "'26   " in 
 # the legend: logo circle before the title, TradingView's status pill after it (none while the market is open)
 st = ch.market_status()
 assert st in ("open", "pre", "closed")
-assert ch.header.text().count("<img") == 1 + (st != "open"), ch.header.text()[:300]
+assert ch.header.text().count("<img") == 2, ch.header.text()[:300]       # TradingView shows "Open" too
 from chartlab.chart import status_pill_html
-assert status_pill_html("open") == "" and "<img" in status_pill_html("closed")
+assert all("<img" in status_pill_html(k) for k in ("open", "closed", "pre")) and status_pill_html("") == ""
 assert theme.fmt_vol(342_550_000) == "342.55\u202fM"           # TradingView's narrow space before the unit
 move_to(at(0.985, 0.4))
 fut = ch.axes[0]._future
@@ -322,6 +323,39 @@ w._sync_watch_price(p)
 q = w.watchlist.quotes["NIFTY"]
 prev_close = float(dfi[dfi.index.normalize() < dfi.index[-1].normalize()]["Close"].iloc[-1])
 assert abs(q[0] - dfi["Close"].iloc[-1]) < 1e-9 and abs(q[1] - (dfi["Close"].iloc[-1] / prev_close - 1)) < 1e-12
+
+# ---------------------------------------------------------------- 4b) TradingView's toolbars
+tb = w.topbar
+assert w.sym_btn.icon().isNull() and w.sym_btn.text() and w.acct_btn.objectName() == "tradepill"
+assert tb.iconSize() == QtCore.QSize(28, 28)
+assert w.statusBar().isHidden()                                         # TradingView has no status bar
+w.statusBar().showMessage("hello")
+pump(30)
+assert w.toast.isVisible() and w.toast.text() == "hello"
+w.statusBar().clearMessage()
+pump(30)
+assert w.toast.isHidden()
+vis = [v for v, a in w.interval_btn_actions.items() if a.isVisible()]
+cur = next(v for v, b in w.interval_btns.items() if b.isChecked())
+assert set(vis) == set(w.fav_intervals) | {cur}, (vis, w.fav_intervals, cur)
+w.toggle_fav_interval("3m", True)
+assert w.interval_btn_actions["3m"].isVisible() and "3m" in json.loads(w.settings.value("fav_intervals"))
+w.toggle_fav_interval("3m", False)
+assert not w.interval_btn_actions["3m"].isVisible() or cur == "3m"
+groups = list(w.tool_groups.items())
+assert [ks[0] for _a, ks in groups][:5] == ["trend", "fib", "long", "brush", "text"], [ks for _a, ks in groups]
+shapes = next(a for a, ks in groups if "rect" in ks)
+assert w.leftbar_mode(shapes) == QtWidgets.QToolButton.ToolButtonPopupMode.MenuButtonPopup
+w.tool_actions["rect"].trigger()
+assert ch.layer.tool == "rect" and shapes.data() == "rect"              # the group now shows the rectangle
+w.draw_actions[None].trigger()
+ch._place_overlays()
+assert ch.axis_gear.isVisible()
+seen_settings = []
+ch.settingsRequested.disconnect()                                       # (the window would open the modal dialog)
+ch.settingsRequested.connect(lambda: seen_settings.append(1))
+ch.axis_gear.click()
+assert seen_settings
 
 # ---------------------------------------------------------------- 5) indicators and chart type come back after a restart
 w.ind_actions["macd"].setChecked(True)
