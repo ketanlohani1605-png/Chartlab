@@ -39,9 +39,9 @@ FALLBACK_STRATEGY = '''def strategy(df):
 INTERVALS = [("1m", "1m"), ("3m", "3m"), ("5m", "5m"), ("15m", "15m"), ("30m", "30m"), ("1h", "1h"),
              ("1d", "1D"), ("1wk", "1W"), ("1mo", "1M")]
 RANGES = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
-INDICATORS = {"sma20": "SMA 20", "sma50": "SMA 50", "sma200": "SMA 200", "ema20": "EMA 20", "ema50": "EMA 50",
-              "bb": "Bollinger Bands (20, 2)", "supertrend": "Supertrend (10, 3)", "vwap": "VWAP",
-              "rsi": "RSI (14)  —  separate pane"}
+from . import studies as STUDY
+INDICATORS = {k: STUDY.STUDIES[k].legend(STUDY.defaults(k)) + ("  —  separate pane" if STUDY.STUDIES[k].pane else "")
+              for k in STUDY.KEYS}
 LAYOUTS = {"1": "Single chart", "2h": "Two charts — side by side", "2v": "Two charts — stacked",
            "4": "Four charts"}
 LAYOUT_COUNT = {"1": 1, "2h": 2, "2v": 2, "4": 4}
@@ -280,7 +280,8 @@ class MainWindow(QtWidgets.QMainWindow):
         off = now.utcoffset().total_seconds() / 3600
         sign = "+" if off >= 0 else "-"
         hh, mm = int(abs(off)), int(round((abs(off) % 1) * 60))
-        self.clock.setText(f"{now:%H:%M:%S}  UTC{sign}{hh}" + (f":{mm:02d}" if mm else ""))
+        zone = "UTC" if not (hh or mm) else f"UTC{sign}{hh}" + (f":{mm:02d}" if mm else "")   # TradingView: "UTC"
+        self.clock.setText(f"{now:%H:%M:%S} {zone}")
 
     def _build_toolbar(self):
         tb = self.addToolBar("Data")
@@ -642,7 +643,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _suggestions() -> list[str]:
         base = ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN",
-                "ITC", "LT", "BHARTIARTL", "TATAMOTORS", "TATASTEEL", "AXISBANK", "KOTAKBANK", "HINDUNILVR",
+                "ITC", "LT", "BHARTIARTL", "TMPV", "TMCV", "TATASTEEL", "AXISBANK", "KOTAKBANK", "HINDUNILVR",
                 "BAJFINANCE", "MARUTI", "SUNPHARMA", "WIPRO", "HCLTECH", "ADANIENT", "ADANIPORTS", "ONGC",
                 "NTPC", "POWERGRID", "COALINDIA", "ASIANPAINT", "ULTRACEMCO", "TITAN", "M&M", "JSWSTEEL",
                 "TECHM", "NESTLEIND", "DRREDDY", "CIPLA", "EICHERMOT", "HEROMOTOCO", "BPCL", "GRASIM",
@@ -1470,7 +1471,38 @@ class MainWindow(QtWidgets.QMainWindow):
             self.restoreState(state, 3)
         vis = [d for d in self.right_docks if d.isVisible()]
         self.show_right_panel(vis[0] if vis else (None if state else self.watch_dock))
+        self._restore_panel_state()
         self._source_changed()
+
+    def _restore_panel_state(self):
+        """Each chart comes back with the indicators (and their order / hidden ones) and the chart type it had."""
+        try:
+            data = json.loads(self.settings.value("panel_state", "") or "[]")
+        except (TypeError, ValueError):
+            return
+        for p, d in zip(self.panels, data if isinstance(data, list) else []):
+            if not isinstance(d, dict):
+                continue
+            for k in d.get("on", []):
+                if k in STUDY.STUDIES:
+                    p.chart.set_indicator(k, True)
+            p.chart._ind_hidden = {k for k in d.get("hidden", []) if k in STUDY.STUDIES}
+            if d.get("style") in STYLES:
+                p.chart.set_style(d["style"])
+        self._sync_toolbar()
+
+    def _save_panel_state(self):
+        data = [{"on": p.chart._ordered_enabled(), "hidden": sorted(p.chart._ind_hidden), "style": p.chart.style}
+                for p in self.panels]
+        self.settings.setValue("panel_state", json.dumps(data))
+
+    def _panel_state_changed(self):
+        if not hasattr(self, "_pstate_timer"):
+            self._pstate_timer = QtCore.QTimer(self)
+            self._pstate_timer.setSingleShot(True)
+            self._pstate_timer.setInterval(400)
+            self._pstate_timer.timeout.connect(self._save_panel_state)
+        self._pstate_timer.start()
 
     def reset_layout(self):
         self.restoreState(self._default_state, 3)
@@ -1487,6 +1519,7 @@ class MainWindow(QtWidgets.QMainWindow):
         st.setValue("geometry", self.saveGeometry())
         st.setValue("dock_state_v4", self.saveState(3))
         self._save_watchlist()
+        self._save_panel_state()
         if self.api is not None:
             self.api.stop()
         self.live.stop()
@@ -1641,6 +1674,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acct_btn.setIcon(QtGui.QIcon(pm))
         self.acct_btn.setText(" Accounts")
         self.acct_btn.setToolTip(tip)
+        ready = any(a.get("access_token") for a in acctmod.load_accounts())
+        for pn in getattr(self, "panels", []):              # Buy / Sell on the chart only once a broker is connected
+            if pn.chart.trading_ready != ready:
+                pn.chart.trading_ready = ready
+                pn.chart._place_overlays()
 
     def accounts_overview(self):
         acctmod.OverviewDialog(self).exec()
@@ -1863,15 +1901,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.load_into(self.active, "file", self.active.params.get("symbol", ""), val, "max", path)
 
     # what the Indicators dialog shows: (title, category, extra search words)
-    IND_INFO = {"sma20": ("Moving Average Simple (20)", "Moving averages", "sma ma 20"),
-                "sma50": ("Moving Average Simple (50)", "Moving averages", "sma ma 50"),
-                "sma200": ("Moving Average Simple (200)", "Moving averages", "sma ma 200"),
-                "ema20": ("Moving Average Exponential (20)", "Moving averages", "ema ma 20"),
-                "ema50": ("Moving Average Exponential (50)", "Moving averages", "ema ma 50"),
-                "bb": ("Bollinger Bands (20, 2)", "Volatility", "bb bands bollinger"),
-                "supertrend": ("Supertrend (10, 3)", "Trend", "super trend atr"),
-                "vwap": ("VWAP \u2014 Volume Weighted Average Price", "Volume", "vwap volume"),
-                "rsi": ("Relative Strength Index (14)", "Oscillators", "rsi oscillator momentum")}
+    IND_INFO = {k: (STUDY.STUDIES[k].title + ("" if not STUDY.STUDIES[k].inputs else
+                                               " (" + ", ".join(f"{STUDY.defaults(k)[n]:g}" for n, *_ in STUDY.STUDIES[k].inputs
+                                                                if not n.startswith("ma_")) + ")"),
+                    STUDY.STUDIES[k].cat, STUDY.STUDIES[k].search) for k in STUDY.KEYS}
 
     def open_indicators(self, text: str = ""):
         """TradingView's Indicators dialog ( / ): click to add or remove, strategies load into the editor and run."""
@@ -1905,6 +1938,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ind_params_changed(self, panel):
         """Inputs changed on one pane (legend -> gear): every pane uses them, and they are remembered."""
         self.settings.setValue("ind_params", json.dumps(panel.chart.ind_params))
+        self._panel_state_changed()
         for p in self.panels:
             if p is not panel:
                 for k, v in panel.chart.ind_params.items():
@@ -1914,6 +1948,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         p.chart.blockSignals(False)
 
     def _ind_toggled_on_chart(self, panel, key, on):
+        self._panel_state_changed()
         if panel is self.active and key in self.ind_actions:
             self._syncing = True
             try:
@@ -1924,6 +1959,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _indicator_toggled(self, key, on):
         if not self._syncing:
             self.active.chart.set_indicator(key, on)
+            self._panel_state_changed()
 
     def _style_chosen(self, key):
         if hasattr(self, "style_btn"):
@@ -1932,6 +1968,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.style_actions[key].setChecked(True)
         if not self._syncing:
             self.active.chart.set_style(key)
+            self._panel_state_changed()
 
     def _magnet_toggled(self, on):
         for p in self.panels:
@@ -2004,6 +2041,7 @@ class MainWindow(QtWidgets.QMainWindow):
             last = float(df["Close"].iloc[-1])
             self.alerts.check(self._alert_key(panel), last, last, last)
         self._load_status(panel)
+        self._sync_watch_price(panel)
         self.live_sync()
         if panel is self.active:
             self.chain.follow(str(panel.params.get("symbol", "")))
@@ -2035,6 +2073,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._daily_timer.timeout.connect(self._daily_download)
         self._daily_timer.start(30 * 60 * 1000)
         QtCore.QTimer.singleShot(20000, self._daily_download)
+        # the watchlist keeps itself current like TradingView's: every minute in market hours, else every 10
+        self._watch_timer = QtCore.QTimer(self)
+        self._watch_timer.timeout.connect(self._watch_tick)
+        self._watch_timer.start(30 * 1000)
+        QtCore.QTimer.singleShot(2500, lambda: self._watch_tick(force=True))
+
+    def _watch_tick(self, force: bool = False):
+        import time as _t
+        from .live import market_open
+        if not force and (QtWidgets.QApplication.activeModalWidget() is not None or not self.isVisible()):
+            return
+        gap = 55 if market_open() else 600
+        if force or _t.time() - getattr(self, "_watch_last", 0.0) >= gap:
+            self._watch_last = _t.time()
+            self.watchlist.refresh()
+
+    def _sync_watch_price(self, panel):
+        """Chart and watchlist row of the same symbol never disagree: the row takes the chart's newest close."""
+        df = panel.df
+        if df is None or len(df) < 2 or panel.params.get("source") == "file":
+            return
+        sym = str(panel.params.get("symbol", "")).strip().upper()
+        sym = datamod.RENAMED.get(sym, sym)
+        if sym not in self.watchlist.symbols():
+            return
+        idx = df.index
+        last = float(df["Close"].iloc[-1])
+        if panel.chart.axes[0].intraday:
+            prev = df["Close"][idx.normalize() < idx[-1].normalize()]
+            pc = float(prev.iloc[-1]) if len(prev) else None
+        else:
+            pc = float(df["Close"].iloc[-2])
+        self.watchlist.chart_price(sym, last, pc)
 
     def set_auto_refresh(self, seconds: int):
         self.settings.setValue("auto_refresh", int(seconds))
@@ -2131,6 +2202,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_refreshed(self, panel):
         """New bars arrived from a quiet auto refresh: keep alerts, strategy and labels in step."""
         df = panel.df
+        self._sync_watch_price(panel)
         if panel is self.active and getattr(panel, "fresh_ms", None):
             self._load_status(panel)
             panel.fresh_ms = None

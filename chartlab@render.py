@@ -139,6 +139,16 @@ class CandleItem(pg.GraphicsObject):
             p.drawRects([QR(a - w, b, 2 * w, d) for a, b, d in zip(x.tolist(), oo.tolist(), hgt.tolist())])
 
 
+_TV_VOLUME = {"#089981": "#26a69a", "#f23645": "#ef5350"}   # TradingView's default candle -> volume colours
+
+
+def vol_color(up: bool) -> QtGui.QColor:
+    """Volume colour for an up / down bar: TradingView's own volume colours while the candles have the default
+    colours, otherwise the candle colour."""
+    c = str(settings.get()['up' if up else 'down']).lower()
+    return QtGui.QColor(_TV_VOLUME.get(c, c))
+
+
 class VolumeItem(pg.GraphicsObject):
     def __init__(self, df=None):
         super().__init__()
@@ -153,14 +163,17 @@ class VolumeItem(pg.GraphicsObject):
 
     @staticmethod
     def _c(up):
-        """Volume colour = candle colour at ~43% over the chart background, pre-blended (opaque = fast)."""
+        """TradingView's volume bars: the volume colour at 50% over the chart background, pre-blended (opaque = fast).
+        (Measured on TradingView: #26a69a / #ef5350 at half strength over black.)"""
         S = settings.get()
-        key = (S['up' if up else 'down'], S.get('bg', '#000000'))
+        base = vol_color(up)
+        key = (base.name(), S.get('bg', '#000000'))
         col = VolumeItem._cache.get(key)
         if col is None:
-            a, b, al = QtGui.QColor(key[0]), QtGui.QColor(key[1]), 110 / 255
-            col = QtGui.QColor(int(a.red() * al + b.red() * (1 - al)), int(a.green() * al + b.green() * (1 - al)),
-                               int(a.blue() * al + b.blue() * (1 - al)))
+            a, b, al = base, QtGui.QColor(key[1]), 0.5
+            col = QtGui.QColor(int(round(a.red() * al + b.red() * (1 - al))),
+                               int(round(a.green() * al + b.green() * (1 - al))),
+                               int(round(a.blue() * al + b.blue() * (1 - al))))
             VolumeItem._cache[key] = col
         return col
 
@@ -188,6 +201,29 @@ class VolumeItem(pg.GraphicsObject):
         if self.overlay is not None:
             return QtCore.QRectF(-1, -1e9, n + 2, 2e9)
         return QtCore.QRectF(-1, 0, n + 2, max(float(np.nanmax(self.v)), 1.0))
+
+    def last_value(self):
+        """(y in the price pane, volume, up) of the newest bar's volume as drawn - where TradingView puts the volume
+        label on the price scale. None when there is nothing to label."""
+        n = len(self.v) if self.limit is None else min(len(self.v), self.limit)
+        if n == 0 or self.overlay is None:
+            return None
+        i0, i1, g = _visible(self, n)
+        if i1 <= i0:
+            i0, i1, g = max(0, n - 1), n, 1
+        vis = self.v[i0:i1]
+        if g > 1:
+            vis = np.add.reduceat(vis, np.arange(i0, i1, g) - i0)
+        vmax = float(np.nanmax(vis)) if len(vis) else 0.0
+        last = float(self.v[n - 1])
+        if not np.isfinite(last) or last <= 0 or vmax <= 0:
+            return None
+        drawn = last
+        if g > 1 and i1 >= n:                          # the newest drawn bar is a group of g bars
+            e = i0 + ((n - 1 - i0) // g) * g
+            drawn = float(np.nansum(self.v[e:n]))
+        (y0, y1) = self.overlay.viewRange()[1]
+        return y0 + min(drawn / vmax, 1.0) * 0.16 * (y1 - y0), last, bool(self.up[n - 1])
 
     def paint(self, p, *args):
         n = len(self.v)
@@ -217,19 +253,22 @@ class VolumeItem(pg.GraphicsObject):
 
 
 class BandFill(pg.GraphicsObject):
-    """The shaded area between two lines (Bollinger bands). Only the part on screen is drawn, so a band over
-    100,000 bars costs the same as one over 100."""
+    """The shaded area between two lines (Bollinger bands, channels, the Ichimoku cloud). Only the part on screen
+    is drawn, so a band over 100,000 bars costs the same as one over 100. With brush_dn the colour follows which
+    line is on top (Ichimoku: green cloud / red cloud), split exactly where the lines cross."""
 
-    def __init__(self, upper, lower, brush):
+    def __init__(self, upper, lower, brush, offset: int = 0, brush_dn=None):
         super().__init__()
         self.u, self.l = np.asarray(upper, float), np.asarray(lower, float)
-        self.brush = brush
+        self.brush, self.brush_dn = brush, brush_dn
+        self.offset = int(offset)
         self.limit = None
         ok = np.isfinite(self.u) & np.isfinite(self.l)
         self._first = int(np.argmax(ok)) if ok.any() else len(self.u)
         if ok.any():
-            lo, hi = float(np.nanmin(self.l)), float(np.nanmax(self.u))
-            self._rect = QtCore.QRectF(-1, lo, len(self.u) + 2, max(hi - lo, 1e-9))
+            lo = float(np.nanmin(np.minimum(self.l, self.u)))
+            hi = float(np.nanmax(np.maximum(self.u, self.l)))
+            self._rect = QtCore.QRectF(-1 + self.offset, lo, len(self.u) + 2, max(hi - lo, 1e-9))
         else:
             self._rect = QtCore.QRectF()
 
@@ -237,22 +276,129 @@ class BandFill(pg.GraphicsObject):
         return self._rect
 
     def paint(self, p, *args):
-        i0, i1, g = _visible(self, len(self.u))
-        i0 = max(i0, self._first)
+        n = len(self.u)
+        vb = self.getViewBox()
+        if vb is None or n < 2:
+            return
+        lim = n if self.limit is None else min(n, self.limit)
+        x0, x1 = vb.viewRange()[0]
+        i0 = max(self._first, int(np.floor(x0)) - 2 - self.offset)
+        i1 = min(lim, int(np.ceil(x1)) + 3 - self.offset)
         if i1 - i0 < 2:
             return
-        xs = np.arange(i0, i1, g, dtype=float)
-        u, lo = self.u[i0:i1:g], self.l[i0:i1:g]
+        px = max(vb.width(), 50.0)
+        g = max(1, int(np.ceil((i1 - i0) * MIN_BAR_PX / px)))
+        idx = np.arange(i0, i1, g)
+        u, lo = self.u[idx], self.l[idx]
         ok = np.isfinite(u) & np.isfinite(lo)
         if ok.sum() < 2:
             return
-        xs, u, lo = xs[ok], u[ok], lo[ok]
-        P = QtCore.QPointF
-        pts = [P(a, b) for a, b in zip(xs.tolist(), u.tolist())]
-        pts += [P(a, b) for a, b in zip(xs[::-1].tolist(), lo[::-1].tolist())]
+        xs = idx[ok].astype(float) + self.offset
+        u, lo = u[ok], lo[ok]
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(self.brush)
-        p.drawPolygon(QtGui.QPolygonF(pts))
+        P = QtCore.QPointF
+        if self.brush_dn is None:
+            pts = [P(a, b) for a, b in zip(xs.tolist(), u.tolist())]
+            pts += [P(a, b) for a, b in zip(xs[::-1].tolist(), lo[::-1].tolist())]
+            p.setBrush(self.brush)
+            p.drawPolygon(QtGui.QPolygonF(pts))
+            return
+        up = u >= lo
+        start = 0
+        m = len(xs)
+        for k in range(1, m + 1):
+            if k < m and up[k] == up[start]:
+                continue
+            seg_x, seg_u, seg_l = list(xs[start:k]), list(u[start:k]), list(lo[start:k])
+            if start > 0:                                  # begin at the crossing with the previous run
+                cx, cy = self._cross(xs, u, lo, start - 1)
+                seg_x, seg_u, seg_l = [cx] + seg_x, [cy] + seg_u, [cy] + seg_l
+            if k < m:                                      # end at the crossing with the next run
+                cx, cy = self._cross(xs, u, lo, k - 1)
+                seg_x, seg_u, seg_l = seg_x + [cx], seg_u + [cy], seg_l + [cy]
+            if len(seg_x) >= 2:
+                pts = [P(a, b) for a, b in zip(seg_x, seg_u)] + [P(a, b) for a, b in zip(seg_x[::-1], seg_l[::-1])]
+                p.setBrush(self.brush if up[start] else self.brush_dn)
+                p.drawPolygon(QtGui.QPolygonF(pts))
+            start = k
+
+    @staticmethod
+    def _cross(xs, u, lo, k):
+        """Where the two lines cross between point k and k + 1 (straight lines in between)."""
+        d0, d1 = u[k] - lo[k], u[k + 1] - lo[k + 1]
+        t = d0 / (d0 - d1) if d0 != d1 else 0.5
+        return float(xs[k] + t * (xs[k + 1] - xs[k])), float(u[k] + t * (u[k + 1] - u[k]))
+
+
+class HistItem(pg.GraphicsObject):
+    """Columns from zero (MACD histogram). colour index per bar into palette; only visible bars are drawn."""
+
+    def __init__(self, values, color_idx, palette, width: float = 0.32):
+        super().__init__()
+        self.v = np.asarray(values, float)
+        self.ci = np.asarray(color_idx, int)
+        self.palette = [QtGui.QColor(c) for c in palette]
+        self.w = width
+        self.limit = None
+        fin = self.v[np.isfinite(self.v)]
+        lo, hi = (min(0.0, float(fin.min())), max(0.0, float(fin.max()))) if len(fin) else (0.0, 1.0)
+        self._rect = QtCore.QRectF(-1, lo, len(self.v) + 2, max(hi - lo, 1e-9))
+
+    def boundingRect(self):
+        return self._rect
+
+    def paint(self, p, *args):
+        n = len(self.v)
+        i0, i1, g = _visible(self, n)
+        if i1 <= i0:
+            return
+        xs = np.arange(i0, i1, g)
+        v, ci = self.v[xs], self.ci[xs]
+        ok = np.isfinite(v)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        w = self.w * g
+        QR = QtCore.QRectF
+        for k, col in enumerate(self.palette):
+            m = ok & (ci == k)
+            if m.any():
+                p.setBrush(col)
+                p.drawRects([QR(a - w, 0.0, 2 * w, b) for a, b in zip(xs[m].astype(float).tolist(), v[m].tolist())])
+
+
+class DotsItem(pg.GraphicsObject):
+    """Small round markers at (bar, value) - Parabolic SAR. Size in screen pixels, only visible bars."""
+
+    def __init__(self, values, color, size_px: float = 3.0):
+        super().__init__()
+        self.v = np.asarray(values, float)
+        self.color = QtGui.QColor(color)
+        self.size = size_px
+        self.limit = None
+        fin = self.v[np.isfinite(self.v)]
+        lo, hi = (float(fin.min()), float(fin.max())) if len(fin) else (0.0, 1.0)
+        self._rect = QtCore.QRectF(-1, lo, len(self.v) + 2, max(hi - lo, 1e-9))
+
+    def boundingRect(self):
+        return self._rect
+
+    def paint(self, p, *args):
+        n = len(self.v)
+        i0, i1, g = _visible(self, n)
+        vb = self.getViewBox()
+        if i1 <= i0 or vb is None:
+            return
+        xs = np.arange(i0, i1, g)
+        v = self.v[xs]
+        ok = np.isfinite(v)
+        if not ok.any():
+            return
+        pw, ph = vb.viewPixelSize()
+        rx, ry = self.size / 2 * pw, self.size / 2 * ph
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(self.color)
+        for a, b in zip(xs[ok].astype(float).tolist(), v[ok].tolist()):
+            p.drawEllipse(QtCore.QPointF(a, b), rx, ry)
 
 
 class TradeMarkers(pg.GraphicsObject):

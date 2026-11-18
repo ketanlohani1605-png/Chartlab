@@ -2,6 +2,7 @@
 crosshair with price+date tags, last-price tag, drawing tools and trade markers."""
 from __future__ import annotations
 
+import math
 import re
 
 import numpy as np
@@ -12,17 +13,102 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import icons
 from . import indicators as ta
 from . import settings, theme
+from . import studies as STD
 from .drawings import DrawingLayer
 from .gestures import TVViewBox
 
 # pyqtgraph drops mouse-move events that arrive faster than 100/s; Mac trackpads / ProMotion screens send
 # ~120/s, so crosshair and drags would skip. Qt already compresses moves when busy, so take every one.
 pg.setConfigOption("mouseRateLimit", 0)
-from .render import BandFill, CandleItem, VolumeItem
+from .render import BandFill, CandleItem, DotsItem, HistItem, VolumeItem, vol_color
 
 _QWIDGETSIZE_MAX = 16777215
 STYLES = ["candles", "hollow", "bars", "heikin", "line", "linemark", "step", "area", "baseline"]
-INDICATOR_KEYS = ["sma20", "sma50", "sma200", "ema20", "ema50", "bb", "rsi"]
+INDICATOR_KEYS = list(STD.KEYS)
+
+
+# Measured pixel by pixel on TradingView (dark theme, Retina): the crosshair is #9c9c9c, 1 point wide, dashed 5 on /
+# 6 off; its labels are #303030 with white 12 px text; the '+' box turns #636363 under the mouse; scale text #b8b8b8.
+XHAIR_COLOR = "#9c9c9c"
+XHAIR_FILL = "#303030"
+XHAIR_HOT = "#636363"
+AXIS_TEXT = "#b8b8b8"
+LEGEND_TEXT = "#dbdbdb"          # legend titles and the O H L C letters
+PANE_LINE = "#2e2e2e"            # the line between the price chart and an indicator pane
+PRICE_TAG_H = 17                 # last-price / alert labels on the price scale
+XHAIR_TAG_H = 21                 # the crosshair's price label (and the '+' box next to it)
+TIME_TAG_H = 24                  # the crosshair's time label, flush with the top of the time scale
+TIME_TEXT_TOP = 7                # time-scale text sits this far below the top of the scale (labels line up with it)
+PRICE_TEXT_LEFT = 10             # price-scale text starts this far right of the scale's edge
+_PEN_STYLES = {"solid": QtCore.Qt.PenStyle.SolidLine, "dash": QtCore.Qt.PenStyle.DashLine,
+               "dot": QtCore.Qt.PenStyle.DotLine}
+
+
+def _plus_pixmap(hot: bool, size: int = XHAIR_TAG_H, dpr: float = 2.0) -> QtGui.QPixmap:
+    """TradingView's '+' left of the price scale: a #303030 box against the scale (rounded on its left side only),
+    a white 15 px ring with an 8 px plus in it - all lines 1 point. Under the mouse the box turns #636363."""
+    dpr = max(2.0, float(dpr))
+    pm = QtGui.QPixmap(int(round(size * dpr)), int(round(size * dpr)))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(QtCore.Qt.GlobalColor.transparent)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    box = QtGui.QColor(XHAIR_HOT if hot else XHAIR_FILL)
+    path = QtGui.QPainterPath()
+    path.addRoundedRect(QtCore.QRectF(0, 0, size, size), 2, 2)
+    p.fillPath(path, box)
+    p.fillRect(QtCore.QRectF(size / 2, 0, size / 2, size), box)      # square on the side that touches the scale
+    pen = QtGui.QPen(QtGui.QColor("#ffffff"), 1.0)
+    pen.setCapStyle(QtCore.Qt.PenCapStyle.FlatCap)
+    p.setPen(pen)
+    p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+    c = size / 2
+    p.drawEllipse(QtCore.QPointF(c, c), 7.0, 7.0)
+    p.drawLine(QtCore.QPointF(c - 4, c), QtCore.QPointF(c + 4, c))
+    p.drawLine(QtCore.QPointF(c, c - 4), QtCore.QPointF(c, c + 4))
+    p.end()
+    return pm
+
+
+def _project_times(idx: pd.DatetimeIndex, count: int) -> pd.DatetimeIndex:
+    """The times of the next `count` bars after the last one, following the market's own hours: an NSE 1-minute
+    chart goes 15:28, 15:29, then the next weekday 09:15 (TradingView keeps the time scale going like this)."""
+    if len(idx) < 3 or count <= 0:
+        return pd.DatetimeIndex([])
+    d = np.diff(idx.values[-300:]).astype("timedelta64[s]").astype(np.int64)
+    d = d[d > 0]
+    if not len(d):
+        return pd.DatetimeIndex([])
+    step = int(np.median(d))
+    last = idx[-1]
+    tail = idx[-3000:]
+    weekends = bool((tail.dayofweek >= 5).any())
+    out = []
+    if step >= 27 * 86400:                                  # monthly
+        out = [last + pd.DateOffset(months=k) for k in range(1, count + 1)]
+    elif step >= 6 * 86400:                                 # weekly
+        out = [last + pd.Timedelta(days=7 * k) for k in range(1, count + 1)]
+    elif step >= int(86400 * 0.9):                          # daily
+        t = last
+        while len(out) < count:
+            t = t + pd.Timedelta(days=1)
+            if weekends or t.dayofweek < 5:
+                out.append(t)
+    else:                                                   # intraday: inside the usual session hours
+        tod = np.asarray((tail - tail.normalize()).total_seconds(), dtype=np.int64)
+        start_s, end_s = int(tod.min()), int(tod.max())
+        t = last
+        one = pd.Timedelta(seconds=step)
+        while len(out) < count:
+            t2 = t + one
+            if t2.normalize() != t.normalize() or (t2 - t2.normalize()).total_seconds() > end_s:
+                nd = t.normalize() + pd.Timedelta(days=1)
+                while not weekends and nd.dayofweek >= 5:
+                    nd = nd + pd.Timedelta(days=1)
+                t2 = nd + pd.Timedelta(seconds=start_s)
+            out.append(t2)
+            t = t2
+    return pd.DatetimeIndex(out)
 
 
 class _DotGridMixin:
@@ -51,43 +137,89 @@ class _DotGridMixin:
             return specs
 
 
-class PriceAxis(_DotGridMixin, pg.AxisItem):
+class _BoldLabelsMixin:
+    """TradingView draws some scale labels bold (measured on its canvas: same colour, ~1.5x thicker strokes):
+    every other price label (the even multiples of the step: 25,400 / 25,440 / 25,480 bold, 25,420 / 25,460 not),
+    and on the time scale the most important boundaries in view (the day '17' among hours, 'Aug' among days).
+    tickStrings() fills self._bold; the strings in it are painted with the bold font."""
+    _bold: frozenset = frozenset()
+
+    def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
+        bold = self._bold
+        heavy = [t for t in textSpecs if t[2] in bold] if bold else []
+        if not heavy:
+            return super().drawPicture(p, axisSpec, tickSpecs, textSpecs)
+        super().drawPicture(p, axisSpec, tickSpecs, [t for t in textSpecs if t[2] not in bold])
+        f = QtGui.QFont(self.style["tickFont"]) if self.style.get("tickFont") is not None else QtGui.QFont(p.font())
+        f.setWeight(QtGui.QFont.Weight.Bold)
+        p.setFont(f)
+        p.setPen(self.textPen())
+        for rect, flags, text in heavy:
+            p.drawText(rect, int(flags), text)
+
+
+class PriceAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
     chart = None
+    is_price = True
 
     def tickStrings(self, values, scale, spacing):
+        out = self._tick_strings(values, scale, spacing)
+        self._bold = frozenset(s for v, s in zip(values, out)
+                               if s and spacing and int(round(float(v) / float(spacing))) % 2 == 0)
+        return out
+
+    def _tick_strings(self, values, scale, spacing):
         ch = self.chart
         if ch is not None and ch.df is not None:
+            if not self.is_price:                          # an indicator pane: its own number format
+                pn = next((pn for pn in ch.panes if pn.plot.getAxis("right") is self), None)
+                st = STD.STUDIES.get(pn.keys[0]) if pn is not None and pn.keys else None
+                return [ch._fmt_study(st, v) if st is not None else f"{v:,.2f}" for v in values]
             if ch.scale_mode == "percent":
                 return [ch.axis_label(v) for v in values]
             return [ch.axis_price(float(ch.iy(v))) for v in values]
         return super().tickStrings(values, scale, spacing)
 
-    """Right axis with TradingView-like tick density (a label every ~40 px)."""
+    """Right axis with TradingView's tick density (a label every 30+ px, measured ~33 px on its chart)."""
+
+    def tickValues(self, minVal, maxVal, size):
+        levels = super().tickValues(minVal, maxVal, size)
+        if maxVal <= minVal or size <= 0:
+            return levels
+        edge = 9.0 * (maxVal - minVal) / size                # 9 px from the top / bottom of the pane
+        return [(sp, [v for v in vals if minVal + edge <= v <= maxVal - edge]) for sp, vals in levels]
 
     def tickSpacing(self, minVal, maxVal, size):
         span = maxVal - minVal
         if span <= 0 or size <= 0:
             return super().tickSpacing(minVal, maxVal, size)
-        raw = span / max(size / 40.0, 2)
+        raw = span / max(size / 30.0, 2)        # TradingView: labels at least 2.5 x the font size (30 px) apart
         mag = 10 ** np.floor(np.log10(raw))
         step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
         return [(step, 0)]
 
 
-class DateAxis(_DotGridMixin, pg.AxisItem):
+class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
     """X axis that plots bar numbers (no weekend gaps, like TradingView) but shows dates."""
 
     def __init__(self, orientation="bottom", **kw):
         super().__init__(orientation, **kw)
         self._index = None
+        self._future = None
         self.intraday = False
         self.h24 = True
         self.dow = True
         self.datefmt = "%d %b '%y"
 
-    def set_index(self, index: pd.DatetimeIndex):
-        self._index = index
+    def set_index(self, index: pd.DatetimeIndex, future: pd.DatetimeIndex | None = None):
         self.intraday = bool(len(index)) and bool(((index.hour != 0) | (index.minute != 0)).any())
+        self._future = future if future is not None and len(future) else None
+        if self._future is not None:                        # label the empty space right of the newest bar too
+            try:
+                index = index.append(self._future)
+            except (TypeError, ValueError):                 # (time zones that do not mix): no future labels
+                self._future = None
+        self._index = index
         # how "important" each bar is as a place for a time label (TradingView puts labels ON calendar boundaries:
         # a new year beats a new month beats a new day beats a round hour ...)
         n = len(index)
@@ -115,13 +247,17 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
     def share_index(self, other):
         self._index, self.intraday = other._index, other.intraday
         self._weight, self._levels = other._weight, other._levels
+        self._future = getattr(other, "_future", None)
 
     def tickValues(self, minVal, maxVal, size):
         idx = self._index
         if idx is None or not len(idx) or maxVal <= minVal or size <= 0:
             return super().tickValues(minVal, maxVal, size)
         n = len(idx)
-        gap = max(1.0, 82.0 * (maxVal - minVal) / size)          # bars between two labels (~82 px apart)
+        # bars between two labels. TradingView (measured at its default 6 px bars): intraday labels every hour at
+        # 72 px but never the half hours at 36 px; daily charts show only the months ~125 px apart
+        gap_px = 64.0 if self.intraday else 82.0
+        gap = max(1.0, gap_px * (maxVal - minVal) / size)
         lo, hi = max(int(np.ceil(minVal)), 0), min(int(np.floor(maxVal)), n - 1)
         if hi < lo:
             return []
@@ -170,15 +306,17 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
                         return
 
     def tickStrings(self, values, scale, spacing):
-        idx, out = self._index, []
+        idx, out, ks = self._index, [], []
         w = getattr(self, "_weight", None)
         for v in values:
             i = int(round(v))
             if idx is None or i < 0 or i >= len(idx):
                 out.append("")
+                ks.append(-1)
                 continue
             t = idx[i]
             k = int(w[i]) if w is not None and i < len(w) else 0
+            ks.append(k)
             if k >= 7:
                 out.append(str(t.year))
             elif k == 6:
@@ -187,6 +325,10 @@ class DateAxis(_DotGridMixin, pg.AxisItem):
                 out.append(str(t.day) if k == 5 else t.strftime("%H:%M" if self.h24 else "%I:%M %p"))
             else:
                 out.append(str(t.day))
+        # TradingView: the most important boundaries in view are bold (a day among hours, a month among days, a
+        # year among months); with only hours and quarter hours in view the round hours are
+        top = max((k for k, s in zip(ks, out) if s), default=-1)
+        self._bold = frozenset(s for k, s in zip(ks, out) if s and k >= top) if top >= 0 else frozenset()
         return out
 
 
@@ -226,7 +368,7 @@ class OverlayLabel(QtWidgets.QLabel):
         self.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("background: transparent; font-size: 14px;")
+        self.setStyleSheet("background: transparent; font-size: 13px;")
 
     def setText(self, t):
         if t == self.text():                      # rich-text re-layout is the costly part of a hover update
@@ -326,6 +468,92 @@ class ReplayBar(QtWidgets.QFrame):
         self.move(max(x, 8), max(int(vr.y()) - self.height() - 14, 8))
 
 
+def _scale_font(S=None) -> QtGui.QFont:
+    """The price / time scale font: TradingView uses the system font at 12 px, regular weight."""
+    S = S or settings.get()
+    f = QtGui.QFont()
+    f.setPixelSize(int(S.get("text_size", 12)))
+    f.setWeight(QtGui.QFont.Weight.Normal)
+    return f
+
+
+_LEGEND_IMG_DIR = None
+
+
+def _legend_img(key: str, w: float, h: float, draw) -> str:
+    """A small picture for the legend's rich text (logo circle, status pill): written once as name.png and
+    name@2x.png (Qt picks the sharp one on Retina); returns the <img> tag."""
+    import hashlib
+    import os
+    import tempfile
+    global _LEGEND_IMG_DIR
+    if _LEGEND_IMG_DIR is None:
+        _LEGEND_IMG_DIR = os.path.join(tempfile.gettempdir(), "chartlab_legend")
+        os.makedirs(_LEGEND_IMG_DIR, exist_ok=True)
+    name = hashlib.md5(key.encode()).hexdigest()[:16]
+    base = os.path.join(_LEGEND_IMG_DIR, name)
+    if not os.path.exists(base + "@2x.png"):
+        for scale, suffix in ((1.0, ""), (2.0, "@2x")):
+            img = QtGui.QImage(int(round(w * scale)), int(round(h * scale)), QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(QtCore.Qt.GlobalColor.transparent)
+            img.setDevicePixelRatio(scale)
+            qp = QtGui.QPainter(img)
+            qp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            qp.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
+            draw(qp)
+            qp.end()
+            img.save(base + suffix + ".png")
+    return f"<img src='{base}.png' width='{int(round(w))}' height='{int(round(h))}' style='vertical-align: middle;'>"
+
+
+def _blend(fg: str, alpha: float, bg: str) -> QtGui.QColor:
+    a, b = QtGui.QColor(fg), QtGui.QColor(bg)
+    return QtGui.QColor(int(round(a.red() * alpha + b.red() * (1 - alpha))),
+                        int(round(a.green() * alpha + b.green() * (1 - alpha))),
+                        int(round(a.blue() * alpha + b.blue() * (1 - alpha))))
+
+
+def legend_logo_html(sym: str) -> str:
+    """The 18 px symbol circle TradingView shows before the legend title (ChartLab's own letter logo, the same
+    one the watchlist uses)."""
+    from .watchlist import draw_logo, logo_color
+    s = (sym or "?").upper()
+
+    def draw(qp):
+        draw_logo(qp, QtCore.QRectF(0, 0, 18, 18), s, QtGui.QFont())
+    return _legend_img(f"logo|{s}|{logo_color(s)}", 18, 18, draw)
+
+
+def status_pill_html(state: str, bg: str = "#000000") -> str:
+    """TradingView's market-status pill after the legend title (its DOM: 18 px tall capsule, 2 px / 6 px padding, an
+    18 px icon, 12 px text #b8b8b8 on rgba(184,184,184,0.2)). 'closed' -> a dash and 'Closed'; 'pre' -> 'Pre-market'
+    in orange. Nothing while the market is open (TradingView shows nothing then either)."""
+    if state not in ("closed", "pre"):
+        return ""
+    col, text = (AXIS_TEXT, "Closed") if state == "closed" else ("#ff9100", "Pre-market")
+    f = QtGui.QFont()
+    f.setPixelSize(12)
+    tw = QtGui.QFontMetricsF(f).horizontalAdvance(text)
+    w, h = 2 + 18 + 2 + tw + 6, 18.0
+    fill = _blend(col, 0.2, bg)
+
+    def draw(qp):
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(QtCore.QRectF(0, 0, w, h), h / 2, h / 2)
+        qp.fillPath(path, fill)
+        qp.setPen(QtCore.Qt.PenStyle.NoPen)
+        qp.setBrush(QtGui.QColor(col))
+        if state == "closed":                       # TradingView's icon: M12 7a2 2 0 1 1 0 4H6a2 2 0 1 1 0-4z
+            qp.drawRoundedRect(QtCore.QRectF(2 + 4, 7, 10, 4), 2, 2)
+        else:
+            qp.drawEllipse(QtCore.QPointF(2 + 9, 9), 3, 3)
+        qp.setPen(QtGui.QColor(col))
+        qp.setFont(f)
+        qp.drawText(QtCore.QRectF(2 + 18 + 2, 0, tw + 2, h), QtCore.Qt.AlignmentFlag.AlignLeft |
+                    QtCore.Qt.AlignmentFlag.AlignVCenter, text)
+    return _legend_img(f"pill|{state}|{bg}|{QtGui.QFontInfo(f).family()}", w, h, draw)
+
+
 def axis_rect(ax) -> QtCore.QRectF:
     """Scene rect of an axis' own strip. (sceneBoundingRect() also covers the grid lines = the whole plot.)"""
     return QtCore.QRectF(ax.mapToScene(QtCore.QPointF(0, 0)), QtCore.QSizeF(ax.width(), ax.height()))
@@ -336,21 +564,46 @@ class AxisTag(QtWidgets.QLabel):
     kind: 'y' = on the price scale at a price, 'below' = under the last-price tag (countdown),
     'x' = on the time scale at a bar."""
 
-    def __init__(self, chart, plot, kind: str, fill: str, under=None):
+    def __init__(self, chart, plot, kind: str, fill: str, under=None, height: int | None = None):
         super().__init__(chart.glw)
         self.chart, self.plot, self.kind, self.under = chart, plot, kind, under
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setIndent(0)            # Qt adds half an 'x' of indent on the aligned side otherwise: the text would sit
+        self.setMargin(0)            # ~3 px off the scale's own numbers
         self._fill = fill
         self._pos = None
+        self._h = int(height or (TIME_TAG_H if kind == "x" else PRICE_TAG_H))
+        self._joined = False                     # a countdown label sits right under this one (one box, TradingView)
         self._restyle()
         self.hide()
 
     def _restyle(self):
+        """TradingView's scale labels: regular-weight 12 px text; a price label is square where it touches the scale
+        and rounded on the other side, a time label hangs from the top of the time scale, rounded at the bottom."""
         q = QtGui.QColor(self._fill)
         light = 0.2126 * q.redF() + 0.7152 * q.greenF() + 0.0722 * q.blueF() > 0.7   # e.g. a yellow / white line
-        self.setStyleSheet(f"QLabel {{ background: {self._fill}; color: {'#000000' if light else '#ffffff'};"
-                           f" font-size: 12px; font-weight: 600; padding: 2px 4px; border-radius: 2px; }}")
+        txt = "#000000" if light else "#ffffff"
+        if self.kind == "x":
+            shape = (f"padding: {TIME_TEXT_TOP}px 10px 0px 10px; border-bottom-left-radius: 2px;"
+                     " border-bottom-right-radius: 2px;")
+            align = QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop
+        else:
+            pl = PRICE_TEXT_LEFT - 1                       # the label starts 1 px inside the scale
+            tr = "0px" if self.kind == "below" else "2px"
+            br = "0px" if self._joined else "2px"
+            shape = (f"padding: 0px 6px 1px {pl}px; border-top-right-radius: {tr}; border-bottom-right-radius: {br};")
+            align = QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        self.setStyleSheet(f"QLabel {{ background: {self._fill}; color: {txt}; font-size: 12px; font-weight: 400;"
+                           f" {shape} }}")
+        self.setAlignment(align)
+        self.setFixedHeight(self._h)
+
+    def set_joined(self, on: bool):
+        """Square off the bottom-right corner while the bar countdown hangs under this label."""
+        if bool(on) != self._joined:
+            self._joined = bool(on)
+            self._restyle()
 
     @property
     def fill(self):
@@ -369,7 +622,7 @@ class AxisTag(QtWidgets.QLabel):
             return
         n = len(t)
         super().setText(t)
-        if n != getattr(self, "_n", -1):          # digits are fixed-width: only re-measure when length changes
+        if self.kind == "x" or n != getattr(self, "_n", -1):   # digits are fixed-width; dates / names are not
             self._n = n
             self.adjustSize()
         if self._pos is not None:
@@ -387,21 +640,32 @@ class AxisTag(QtWidgets.QLabel):
         g = self.chart.glw
         vb = self.plot.vb
         vr = vb.sceneBoundingRect()
+        vt = g.viewportTransform()
         if self.kind in ("y", "below"):
             ax = axis_rect(self.plot.getAxis("right"))
+            h = self.height()
             sy = vb.mapViewToScene(QtCore.QPointF(x, y)).y()
-            sy = min(max(sy, vr.top() + self.height() / 2), vr.bottom() - self.height() / 2)
-            pt = g.mapFromScene(QtCore.QPointF(ax.left(), sy))
-            self.setFixedWidth(max(int(ax.width()) - 2, self.sizeHint().width()))
-            top = int(pt.y() - self.height() / 2)
-            if self.kind == "below" and self.under is not None:
-                top += self.under.height() + 1
-            self.move(int(pt.x()) + 1, top)
+            sy = min(max(sy, vr.top() + h / 2), vr.bottom() - h / 2)
+            pt = vt.map(QtCore.QPointF(ax.left(), sy))
+            self.setFixedWidth(self.sizeHint().width())          # as wide as its text, like TradingView
+            # centred on the pixel row the line is drawn on: the label's middle row IS the line
+            top = int(math.floor(pt.y())) - (h - 1) // 2
+            if self.kind == "below" and self.under is not None:  # the countdown: lower half of the price label
+                top = self.under.y() + self.under.height()
+                w = max(self.width(), self.under.width())
+                self.setFixedWidth(w)
+                if self.under.width() < w:
+                    self.under.setFixedWidth(w)
+            self.move(int(round(pt.x())) + 1, top)
         else:
             ax = axis_rect(self.plot.getAxis("bottom"))
             sx = vb.mapViewToScene(QtCore.QPointF(x, y)).x()
-            pt = g.mapFromScene(QtCore.QPointF(sx, ax.top()))
-            self.move(int(pt.x() - self.width() / 2), int(pt.y()) + 1)
+            pt = vt.map(QtCore.QPointF(sx, ax.top()))
+            left = vt.map(vr.topLeft()).x()
+            right = vt.map(vr.topRight()).x()
+            tx = int(round(pt.x() - self.width() / 2))
+            tx = max(int(left) + 1, min(tx, int(right) - self.width() - 1))   # never cut off at the pane edges
+            self.move(tx, int(round(pt.y())))
         self.raise_()
 
 
@@ -422,14 +686,8 @@ def _watermark_pixmap(size: int = 64, opacity: float = 0.22) -> QtGui.QPixmap:
     return out
 
 
-IND_DEFAULTS = {"sma20": {"len": 20, "color": "#2962ff"}, "sma50": {"len": 50, "color": "#ff9800"},
-                "sma200": {"len": 200, "color": "#e040fb"}, "ema20": {"len": 20, "color": "#00bcd4"},
-                "ema50": {"len": 50, "color": "#ffeb3b"}, "bb": {"len": 20, "mult": 2.0, "color": "#2962ff"},
-                "supertrend": {"len": 10, "mult": 3.0}, "vwap": {"color": "#2962ff"},
-                "rsi": {"len": 14, "color": "#7e57c2"}}
-IND_TITLES = {"sma20": "Moving Average (SMA)", "sma50": "Moving Average (SMA)", "sma200": "Moving Average (SMA)",
-              "ema20": "Moving Average Exponential (EMA)", "ema50": "Moving Average Exponential (EMA)",
-              "bb": "Bollinger Bands", "supertrend": "Supertrend", "vwap": "VWAP", "rsi": "Relative Strength Index"}
+IND_DEFAULTS = {k: STD.defaults(k) for k in STD.KEYS}      # (kept for older callers)
+IND_TITLES = {k: STD.STUDIES[k].title for k in STD.KEYS}
 
 
 class _IndButtons(QtWidgets.QFrame):
@@ -438,14 +696,14 @@ class _IndButtons(QtWidgets.QFrame):
     def __init__(self, chart):
         super().__init__(chart.glw)
         self.chart, self.key = chart, None
-        self.setStyleSheet("QFrame{background:#1e222d;border:1px solid #363a45;border-radius:5px;}"
+        self.setStyleSheet("QFrame{background:#1f1f1f;border:1px solid #303030;border-radius:5px;}"
                            "QToolButton{background:transparent;border:0;border-radius:3px;padding:1px;}"
-                           "QToolButton:hover{background:#2a2e39;}")
+                           "QToolButton:hover{background:#2e2e2e;}")
         h = QtWidgets.QHBoxLayout(self)
         h.setContentsMargins(3, 2, 3, 2)
         h.setSpacing(1)
         self.btns = {}
-        for name, icon, tip, fn in (("eye", "eye", "Hide / show", self._eye), ("gear", "gear", "Settings\u2026", self._gear),
+        for name, icon, tip, fn in (("eye", "eye", "Hide / show", self._eye), ("gear", "gear", "Settings…", self._gear),
                                     ("x", "close", "Remove", self._remove)):
             b = QtWidgets.QToolButton()
             b.setIcon(icons.get(icon))
@@ -466,7 +724,8 @@ class _IndButtons(QtWidgets.QFrame):
     def show_for(self, key, x, y):
         self._off.stop()
         self.key = key
-        self.btns["gear"].setVisible(bool({"len", "mult", "color"} & set(IND_DEFAULTS.get(key, {}))))
+        st = STD.STUDIES.get(key)
+        self.btns["gear"].setVisible(bool(st and (st.inputs or st.colors)))
         self.adjustSize()
         self.move(int(x), int(y))
         self.show()
@@ -494,48 +753,56 @@ class _IndButtons(QtWidgets.QFrame):
 
 
 class _IndicatorSettings(QtWidgets.QDialog):
-    """Inputs of one indicator: length, multiplier, colour."""
+    """TradingView's indicator settings: Inputs (lengths, factors) and Style (one colour per line)."""
 
     def __init__(self, chart, key: str):
         super().__init__(chart)
         from .drawbar import COLORS, swatch
         self.chart, self.key = chart, key
+        self.st = st = STD.STUDIES[key]
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setWindowTitle(IND_TITLES.get(key, key))
-        self.setMinimumWidth(340)
-        P, D = chart.ind_params[key], IND_DEFAULTS[key]
+        self.setWindowTitle(st.title)
+        self.setMinimumWidth(360)
+        P = chart._P(key)
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(20, 16, 20, 14)
         v.setSpacing(10)
-        form = QtWidgets.QFormLayout()
-        form.setSpacing(8)
-        self.len = self.mult = None
-        if "len" in D:
-            self.len = QtWidgets.QSpinBox()
-            self.len.setRange(1, 2000)
-            self.len.setValue(int(P.get("len", D["len"])))
-            form.addRow("Length", self.len)
-        if "mult" in D:
-            self.mult = QtWidgets.QDoubleSpinBox()
-            self.mult.setRange(0.1, 50.0)
-            self.mult.setSingleStep(0.1)
-            self.mult.setDecimals(2)
-            self.mult.setValue(float(P.get("mult", D["mult"])))
-            form.addRow("StdDev" if key == "bb" else "Factor", self.mult)
-        self.color = P.get("color") or D.get("color")
-        self.color_btn = None
-        if "color" in D:
-            self.color_btn = QtWidgets.QPushButton()
-            m = QtWidgets.QMenu(self.color_btn)
-            for name, c in COLORS:
-                m.addAction(swatch(c), name, lambda c=c: self._pick(c))
-            m.addSeparator()
-            m.addAction("Other colour\u2026", self._custom)
-            self.color_btn.setMenu(m)
-            self._swatch = swatch
-            self._pick(self.color)
-            form.addRow("Colour", self.color_btn)
-        v.addLayout(form)
+        self._swatch, self._colors_list = swatch, COLORS
+        self.inputs, self.colors, self.color_btns = {}, {}, {}
+        if st.inputs:
+            v.addWidget(self._head("Inputs"))
+            form = QtWidgets.QFormLayout()
+            form.setSpacing(8)
+            for name, lab, dflt, lo, hi in st.inputs:
+                if isinstance(dflt, int):
+                    w = QtWidgets.QSpinBox()
+                    w.setRange(int(lo), int(hi))
+                    w.setValue(int(P[name]))
+                else:
+                    w = QtWidgets.QDoubleSpinBox()
+                    w.setDecimals(3 if dflt < 0.1 else 2)
+                    w.setSingleStep(0.01 if dflt < 0.1 else 0.1)
+                    w.setRange(float(lo), float(hi))
+                    w.setValue(float(P[name]))
+                self.inputs[name] = w
+                form.addRow(lab, w)
+            v.addLayout(form)
+        if st.colors:
+            v.addWidget(self._head("Style"))
+            form = QtWidgets.QFormLayout()
+            form.setSpacing(8)
+            for name, lab, _dflt in st.colors:
+                b = QtWidgets.QPushButton()
+                m = QtWidgets.QMenu(b)
+                for cname, c in COLORS:
+                    m.addAction(swatch(c), cname, lambda c=c, n=name: self._pick(n, c))
+                m.addSeparator()
+                m.addAction("Other colour…", lambda n=name: self._custom(n))
+                b.setMenu(m)
+                self.color_btns[name] = b
+                self._pick(name, P[name])
+                form.addRow(lab, b)
+            v.addLayout(form)
         row = QtWidgets.QHBoxLayout()
         dflt = QtWidgets.QPushButton("Defaults")
         dflt.setAutoDefault(False)
@@ -549,43 +816,51 @@ class _IndicatorSettings(QtWidgets.QDialog):
         row.addWidget(bb)
         v.addLayout(row)
 
-    def _pick(self, c):
-        self.color = c
-        self.color_btn.setIcon(self._swatch(c))
-        self.color_btn.setText("  " + c)
+    @staticmethod
+    def _head(text):
+        lab = QtWidgets.QLabel(text)
+        lab.setStyleSheet("color:#9c9c9c;font-size:12px;font-weight:600;padding-top:4px;")
+        return lab
 
-    def _custom(self):
-        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.color), self, "Colour")
+    # (older tests / callers used .len, ._pick(colour), ._ok())
+    @property
+    def len(self):
+        return self.inputs.get("len")
+
+    def _pick(self, name, c=None):
+        if c is None:                                       # _pick("#rrggbb"): the first colour
+            name, c = self.st.colors[0][0], name
+        self.colors[name] = c
+        b = self.color_btns[name]
+        b.setIcon(self._swatch(c))
+        b.setText("  " + c)
+
+    def _custom(self, name):
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.colors[name]), self, "Colour")
         if c.isValid():
-            self._pick(c.name())
+            self._pick(name, c.name())
 
     def _defaults(self):
-        D = IND_DEFAULTS[self.key]
-        if self.len is not None:
-            self.len.setValue(D["len"])
-        if self.mult is not None:
-            self.mult.setValue(D["mult"])
-        if self.color_btn is not None:
-            self._pick(D["color"])
+        D = STD.defaults(self.key)
+        for name, w in self.inputs.items():
+            w.setValue(D[name])
+        for name in self.color_btns:
+            self._pick(name, D[name])
 
     def _ok(self):
-        kw = {}
-        if self.len is not None:
-            kw["len"] = int(self.len.value())
-        if self.mult is not None:
-            kw["mult"] = float(self.mult.value())
-        if self.color_btn is not None:
-            kw["color"] = self.color
+        kw = {name: (int(w.value()) if isinstance(w, QtWidgets.QSpinBox) else float(w.value()))
+              for name, w in self.inputs.items()}
+        kw.update(self.colors)
         self.chart.set_indicator_params(self.key, **kw)
         self.accept()
 
 
 class _PaneGrip(QtWidgets.QWidget):
-    """The thin strip between the price pane and the RSI pane: drag it to give either pane more room."""
+    """The thin strip on top of an indicator pane: drag it to give the pane (or the one above) more room."""
 
-    def __init__(self, chart):
+    def __init__(self, chart, pane):
         super().__init__(chart.glw)
-        self.chart = chart
+        self.chart, self.pane = chart, pane
         self.setFixedHeight(7)
         self.setCursor(QtCore.Qt.CursorShape.SplitVCursor)
         self.setToolTip("Drag to resize the panes")
@@ -593,20 +868,24 @@ class _PaneGrip(QtWidgets.QWidget):
         self.hide()
 
     def place(self):
-        ch = self.chart
-        if ch.rsi.isVisible():
-            r = ch.rsi.sceneBoundingRect()
-            tl = ch.glw.mapFromScene(r.topLeft())
-            self.setGeometry(int(tl.x()), int(tl.y()) - 3, int(ch.price.vb.sceneBoundingRect().width()), 7)
+        pl = self.pane.plot
+        if pl.isVisible() and pl.scene() is not None:
+            r = pl.sceneBoundingRect()
+            tl = self.chart.glw.mapFromScene(r.topLeft())
+            ax = axis_rect(pl.getAxis("right"))
+            right = self.chart.glw.mapFromScene(ax.topRight()).x()
+            self.setGeometry(int(tl.x()), int(tl.y()) - 4, int(right - tl.x()), 7)
             self.show()
             self.raise_()
         else:
             self.hide()
 
     def paintEvent(self, _ev):
+        p = QtGui.QPainter(self)
         if self.underMouse() or self._y is not None:
-            p = QtGui.QPainter(self)
             p.fillRect(0, 2, self.width(), 3, QtGui.QColor("#2962ff"))
+        else:                                              # the hairline TradingView draws between two panes
+            p.fillRect(0, 3, self.width(), 1, QtGui.QColor(PANE_LINE))
 
     def enterEvent(self, ev):
         self.update()
@@ -616,19 +895,39 @@ class _PaneGrip(QtWidgets.QWidget):
 
     def mousePressEvent(self, ev):
         self._y = ev.globalPosition().y()
-        self._h = self.chart.rsi.height()
+        self._h = self.pane.plot.height()
         self.update()
 
     def mouseMoveEvent(self, ev):
         if self._y is not None:
-            self.chart.set_rsi_height(self._h - (ev.globalPosition().y() - self._y))
+            self.chart.set_pane_height(self.pane, self._h - (ev.globalPosition().y() - self._y))
 
     def mouseReleaseEvent(self, ev):
         self._y = None
         self.update()
 
 
+class Pane:
+    """One indicator pane under the price chart (TradingView: RSI, MACD, ...) - its plot, legend and grip."""
+
+    def __init__(self, chart):
+        self.chart = chart
+        self.plot = chart._make_plot(None)
+        self.keys: list[str] = []
+        self.label = OverlayLabel(chart.glw)
+        self.label.hide()
+        self.grip = _PaneGrip(chart, self)
+        self.px = None                     # height in px once the user dragged it
+        self.rows: list = []               # legend rows: [(key, title, [(values, offset, colour)], study)]
+
+    def dispose(self):
+        for w in (self.label, self.grip, self.plot.ytag, self.plot.dtag):
+            w.hide()
+            w.deleteLater()
+
+
 class ChartWidget(QtWidgets.QWidget):
+    trading_ready = False
     replayChanged = QtCore.Signal()
     alertRequested = QtCore.Signal(float)
     activated = QtCore.Signal()
@@ -660,6 +959,7 @@ class ChartWidget(QtWidgets.QWidget):
         self._ind_timer.timeout.connect(self._refresh_indicators)
         self.replay = {"active": False, "picking": False, "playing": False, "speed": 1.0}
         self._enabled: set[str] = set()
+        self._ind_order: list[str] = []      # the order indicators were added in (panes keep it)
         self._ind_items: dict[str, list] = {}
         self._strategy_items: list = []
         self._marker_items: list = []
@@ -683,11 +983,9 @@ class ChartWidget(QtWidgets.QWidget):
         self.header.setText(f"<span style='color:{theme.MUTED}'>Open a data file or type a symbol and press Enter</span>")
         self.header.move(10, 6)
         self.vol_label = OverlayLabel(self.glw)
-        self.rsi_label = OverlayLabel(self.glw)
         self.ind_label = OverlayLabel(self.glw)
         self.ind_label.hide()
         self.vol_label.hide()
-        self.rsi_label.hide()
         self.header.raise_()
         self.sell_btn = self._trade_button("SELL", theme.DOWN)
         self.buy_btn = self._trade_button("BUY", "#2962ff")
@@ -695,18 +993,16 @@ class ChartWidget(QtWidgets.QWidget):
         self.spread_lbl.hide()
         self.collapse_btn = QtWidgets.QToolButton(self.glw)
         self.collapse_btn.setText("\u2303")
-        self.collapse_btn.setFixedSize(38, 22)
+        self.collapse_btn.setFixedSize(28, 19)                # TradingView's legend toggle: 28 x 19
         self.collapse_btn.setCheckable(True)
         self.collapse_btn.setToolTip("Hide / show the legend")
-        self.collapse_btn.setStyleSheet("QToolButton { background:#000; border:1px solid #2b2b2b; border-radius:4px; color:#d1d4dc; font-size:14px; } QToolButton:hover { background:#1a1a1a; }")
+        self.collapse_btn.setStyleSheet("QToolButton { background:#000; border:1px solid #3d3d3d; border-radius:4px; color:#dbdbdb; font-size:12px; padding:0; } QToolButton:hover { background:#1a1a1a; }")
         self.collapse_btn.toggled.connect(lambda _c: self._place_overlays())
         self.collapse_btn.hide()
-        self.plus_btn = QtWidgets.QToolButton(self.glw)
-        self.plus_btn.setText("+")
-        self.plus_btn.setFixedSize(20, 20)
-        self.plus_btn.setToolTip("Add alert at this price")
-        self.plus_btn.setStyleSheet("QToolButton{background:#2a2a2a;color:#fff;border:1px solid #4a4a4a;border-radius:10px;font-size:15px;padding:0;} QToolButton:hover{background:#2962ff;border-color:#2962ff;}")
-        self.plus_btn.clicked.connect(lambda: self.alertRequested.emit(float(self.iy(self._plus_y))))
+        self.plus_btn = QtWidgets.QLabel(self.glw)
+        self.plus_btn.setFixedSize(XHAIR_TAG_H, XHAIR_TAG_H)
+        self.plus_btn.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.plus_btn.setPixmap(_plus_pixmap(False))
         self.plus_btn.hide()
         self._plus_y = 0.0
         self.watermark = QtWidgets.QLabel(self.glw)
@@ -717,23 +1013,19 @@ class ChartWidget(QtWidgets.QWidget):
         self.watermark.hide()
 
         self.axes: list[DateAxis] = []
+        self.panes: list[Pane] = []                         # indicator panes under the price chart
+        self.plus_btn_hot = False
         self.price = self._make_plot(0)
         self.vol = self._make_plot(1)
-        self.rsi = self._make_plot(2)
         self.vol.setXLink(self.price)
-        self.rsi.setXLink(self.price)
-        self.price.getAxis("bottom").setStyle(showValues=False)
 
         grid = self.glw.ci.layout
-        grid.setSpacing(2)
+        grid.setSpacing(0)                                  # panes touch; a 1 px line separates them (TradingView)
         grid.setRowStretchFactor(0, 14)
-        grid.setRowStretchFactor(1, 2)
-        grid.setRowStretchFactor(2, 3)
-        self._set_rsi_visible(False)
         self.vol.setVisible(False)                      # volume is an overlay inside the price pane (like TradingView)
         grid.setRowFixedHeight(1, 0)
         self._refresh_axes()
-        for pl in (self.price, self.vol, self.rsi):          # no meaningless 0..1 labels before data arrives
+        for pl in (self.price, self.vol):                   # no meaningless 0..1 labels before data arrives
             pl.getAxis("right").setStyle(showValues=False)
 
         self._legend_rows: list = []                    # [(name, [(item, colour), ...])] shown under "Vol"
@@ -743,6 +1035,7 @@ class ChartWidget(QtWidgets.QWidget):
         self.ind_buttons = _IndButtons(self)
 
         # tags: last price, crosshair price (per pane) and crosshair date
+        self.vol_tag = AxisTag(self, self.price, "y", "#26a69a")   # TradingView: the newest bar's volume on the scale
         self.last_tag = AxisTag(self, self.price, "y", theme.UP)
         self.cd_tag = AxisTag(self, self.price, "below", "#2a2a2a", under=self.last_tag)
         self.name_tag = QtWidgets.QLabel(self.glw)
@@ -755,12 +1048,9 @@ class ChartWidget(QtWidgets.QWidget):
                                          pen=pg.mkPen(theme.UP, style=QtCore.Qt.PenStyle.DotLine))
         self.price.addItem(self.last_line, ignoreBounds=True)
         self.last_line.hide()
-        for p in (self.price, self.vol, self.rsi):
-            p.ytag = AxisTag(self, p, "y", "#363a45")
-        for p in (self.price, self.vol, self.rsi):
-            p.dtag = AxisTag(self, p, "x", "#363a45")
 
         self.stay_in_drawing = False                        # keep the tool after a drawing is placed
+        self.trading_ready = False                          # a broker account is connected (Buy / Sell buttons)
         self.layer = DrawingLayer(self)
         self.layer.changed.connect(self.drawingsChanged)
         from .drawbar import DrawBar
@@ -772,11 +1062,10 @@ class ChartWidget(QtWidgets.QWidget):
         self.latest_btn.setFixedSize(30, 30)
         self.latest_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.latest_btn.setToolTip(f"Scroll to the most recent bar  ({theme.sc('Alt+Shift+Right')})")
-        self.latest_btn.setStyleSheet("QToolButton{background:#1e222d;border:1px solid #363a45;border-radius:15px;}"
-                                      "QToolButton:hover{background:#2a2e39;}")
+        self.latest_btn.setStyleSheet("QToolButton{background:#1f1f1f;border:1px solid #303030;border-radius:15px;}"
+                                      "QToolButton:hover{background:#2e2e2e;}")
         self.latest_btn.clicked.connect(self.scroll_to_latest)
         self.latest_btn.hide()
-        self.pane_grip = _PaneGrip(self)
 
         self.price.vb.sigXRangeChanged.connect(self._autoscale)
         self.price.vb.sigXRangeChanged.connect(lambda *_: self._sync_latest_btn())
@@ -785,8 +1074,7 @@ class ChartWidget(QtWidgets.QWidget):
         # labels on the scales are QWidgets: re-place them once pyqtgraph has finished laying the plots out
         # (a resize / layout change moves the axes AFTER the viewport's resize event)
         self._relayout_pending = False
-        for sig in (self.price.getAxis("right").geometryChanged, self.price.vb.sigResized,
-                    self.rsi.geometryChanged, self.vol.geometryChanged):
+        for sig in (self.price.getAxis("right").geometryChanged, self.price.vb.sigResized, self.vol.geometryChanged):
             sig.connect(self._schedule_relayout)
         self.glw.scene().sigMouseMoved.connect(self._mouse_moved)
         self.glw.scene().sigMouseClicked.connect(self._mouse_clicked)
@@ -797,11 +1085,21 @@ class ChartWidget(QtWidgets.QWidget):
         self.glw.viewport().setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
 
     def _trade_button(self, text, color):
-        b = QtWidgets.QPushButton(text, self.glw)
-        b.setFixedSize(80, 40)
+        """TradingView's legend Sell / Buy button: 85 x 34, 1 px border, the price in 12 px semibold over the side
+        in 11 px (measured on its page)."""
+        b = QtWidgets.QPushButton("", self.glw)
+        b.setFixedSize(85, 34)
         b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        b.setStyleSheet(f"QPushButton {{ background:#000; color:{color}; border:1px solid {color}; border-radius:5px; "
-                        f"font-size:11px; padding:0; }} QPushButton:hover {{ background:{color}33; }}")
+        b.setStyleSheet(f"QPushButton {{ background:#000000; border:1px solid {color}; border-radius:6px; padding:0; }}"
+                        f" QPushButton:hover {{ background:{color}26; }}")
+        b.price_lbl = QtWidgets.QLabel("", b)
+        b.side_lbl = QtWidgets.QLabel(text, b)
+        for lab, top, h, css in ((b.price_lbl, 3, 16, "font-size:12px; font-weight:600;"),
+                                 (b.side_lbl, 18, 13, "font-size:11px; font-weight:400;")):
+            lab.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            lab.setStyleSheet(f"QLabel {{ background:transparent; color:{color}; {css} }}")
+            lab.setGeometry(1, top, 83, h)
         b.clicked.connect(lambda _=False, side=text: self.tradeRequested.emit(side, float(self.df["Close"].iloc[-1]) if self.df is not None else 0.0))
         b.hide()
         return b
@@ -813,45 +1111,177 @@ class ChartWidget(QtWidgets.QWidget):
         if last == getattr(self, "_tb_last", None):
             return
         self._tb_last = last
-        sp = max(round(last * 0.0005, 2), 0.01)
-        for b, px, t in ((self.sell_btn, last - sp / 2, "SELL"), (self.buy_btn, last + sp / 2, "BUY")):
-            b.setText(f"{px:,.2f}\n{t}")
-        self.spread_lbl.setText(f"<span style='color:#b8b8b8;font-size:12px'>{sp:.2f}</span>")
+        # TradingView without a bid / ask feed (an index, no broker): the last price on both buttons, spread 0.00
+        fp = self.fp(last)
+        for b in (self.sell_btn, self.buy_btn):
+            b.price_lbl.setText(fp)
+        self.spread_lbl.setText("<span style='color:#dbdbdb;font-size:10px'>0.00</span>")
 
     # ------------------------------------------------------------------ construction helpers
-    def _make_plot(self, row: int) -> pg.PlotItem:
+    def _make_plot(self, row) -> pg.PlotItem:
+        """A plot with TradingView's scales. row None = an indicator pane, added to the layout later."""
         axis = DateAxis("bottom")
         self.axes.append(axis)
-        p = self.glw.addPlot(row=row, col=0, axisItems={"bottom": axis, "right": PriceAxis("right")}, viewBox=TVViewBox(self, price=(row == 0)))
+        kw = dict(axisItems={"bottom": axis, "right": PriceAxis("right")}, viewBox=TVViewBox(self, price=(row == 0)))
+        p = self.glw.addPlot(row=row, col=0, **kw) if row is not None else pg.PlotItem(**kw)
         p.setMenuEnabled(False)
         p.hideButtons()
         p.showAxis("right")
         p.hideAxis("left")
         p.getAxis("right").chart = self
-        p.getAxis("right").setWidth(72)
-        f = QtGui.QFont()
-        f.setPixelSize(12)
-        f.setWeight(QtGui.QFont.Weight.DemiBold)
+        p.getAxis("right").is_price = row == 0
+        p.getAxis("right").setWidth(72 if not self.axes[1:] else self.price.getAxis("right").width())
+        S = settings.get()
+        f = _scale_font(S)
         for name in ("bottom", "right"):
             ax = p.getAxis(name)
-            gp = pg.mkPen("#262626", style=QtCore.Qt.PenStyle.DotLine)
-            ax.setPen(pg.mkPen("#1a1a1a"))
-            ax.setTextPen(pg.mkPen("#d1d4dc"))
-            ax.setStyle(tickFont=f, tickLength=0, tickTextOffset=6)
-            ax._chartlab_grid = gp
+            ax.setPen(pg.mkPen(S.get("bg", "#000000")))      # TradingView draws no line between chart and scales
+            ax.setTextPen(pg.mkPen(S.get("text_color", AXIS_TEXT)))
+            ax.setStyle(tickFont=f, tickLength=0,
+                        tickTextOffset=TIME_TEXT_TOP if name == "bottom" else PRICE_TEXT_LEFT)
         p.getAxis('bottom').setHeight(28)
         p.getAxis('right').setTickDensity(2.2)
         p.getAxis('bottom').setTickDensity(1.2)
         p.showGrid(x=False, y=False)                 # the grid is drawn by the ViewBox (cheaper, see gestures.py)
         p.vb.plot_item = p
-        dash = pg.mkPen("#868993", width=1, style=QtCore.Qt.PenStyle.DashLine)
+        dash = self._xhair_pen()
         p.vline = pg.InfiniteLine(angle=90, movable=False, pen=dash)
         p.hline = pg.InfiniteLine(angle=0, movable=False, pen=dash)
-        p.addItem(p.vline, ignoreBounds=True)
-        p.addItem(p.hline, ignoreBounds=True)
+        for ln in (p.vline, p.hline):
+            ln.setZValue(50)                       # above candles and indicator lines, like TradingView
+            p.addItem(ln, ignoreBounds=True)
         p.hline.hide()
         p.vline.hide()                             # (shown when the mouse is over the chart)
+        p.ytag = AxisTag(self, p, "y", XHAIR_FILL, height=XHAIR_TAG_H)
+        p.dtag = AxisTag(self, p, "x", XHAIR_FILL)
         return p
+
+    def _xhair_pen(self) -> QtGui.QPen:
+        """TradingView's crosshair: 1 screen point wide (2 pixels on a Retina Mac), #9c9c9c, dashed 5 on / 6 off
+        (measured on TradingView itself). A plain 1-pixel cosmetic pen is half a point on Retina: a faint hairline."""
+        S = settings.get()
+        dpr = max(1.0, float(self.glw.devicePixelRatioF())) if hasattr(self, "glw") else 1.0
+        pen = QtGui.QPen(QtGui.QColor(S.get("crosshair", XHAIR_COLOR)))
+        pen.setCosmetic(True)
+        pen.setWidthF(dpr)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.FlatCap)
+        style = S.get("crosshair_style", "dashed")
+        if style == "solid":
+            pen.setStyle(QtCore.Qt.PenStyle.SolidLine)
+        elif style == "dotted":
+            pen.setDashPattern([1.0, 2.0])
+        else:
+            pen.setDashPattern([5.0, 6.0])         # in line widths (= points): 5 on, 6 off
+        self._xh_dpr = dpr
+        return pen
+
+    def _apply_xhair_pen(self):
+        pen = self._xhair_pen()
+        for pl in self._plots():
+            pl.vline.setPen(pen)
+            pl.hline.setPen(pen)
+
+    def _plots(self) -> list:
+        return [self.price, self.vol] + [pn.plot for pn in self.panes]
+
+    @property
+    def rsi(self):
+        """(older callers) the plot of the RSI pane, or None."""
+        pn = self._pane_of("rsi")
+        return pn.plot if pn is not None else None
+
+    # ------------------------------------------------------------------ indicator panes
+    def _pane_of(self, key: str):
+        return next((pn for pn in self.panes if key in pn.keys), None)
+
+    def _pane_for_plot(self, plot):
+        return next((pn for pn in self.panes if pn.plot is plot), None)
+
+    def _add_pane(self, key: str) -> "Pane":
+        pn = Pane(self)
+        pn.keys.append(key)
+        pl = pn.plot
+        pl.setXLink(self.price)
+        if self.df is not None:
+            pl.getAxis("bottom").share_index(self.axes[0])
+            pl.getAxis("right").setStyle(showValues=True)
+            xmax = len(self._lows) + 80 if self._limit is None else self._n() + 60
+            pl.vb.setLimits(xMin=-5, xMax=xmax, minXRange=8)
+        else:
+            pl.getAxis("right").setStyle(showValues=False)
+        pl.geometryChanged.connect(self._schedule_relayout)
+        self.panes.append(pn)
+        self._layout_panes()
+        self.apply_settings_to_plot(pl)
+        return pn
+
+    def _drop_pane(self, pn):
+        if pn not in self.panes:
+            return
+        self.panes.remove(pn)
+        pl = pn.plot
+        try:
+            pl.geometryChanged.disconnect(self._schedule_relayout)
+        except (RuntimeError, TypeError):
+            pass
+        pl.setXLink(None)
+        ax = pl.getAxis("bottom")
+        if ax in self.axes:
+            self.axes.remove(ax)
+        if pl in self.glw.ci.items:
+            self.glw.ci.removeItem(pl)
+        pn.dispose()
+        self._layout_panes()
+
+    def _layout_panes(self):
+        """Panes in rows 2, 3, ... of the layout with no gaps (a pane removed from the middle closes up)."""
+        ci = self.glw.ci
+        for k, pn in enumerate(self.panes):
+            where = ci.items.get(pn.plot)
+            if where and where[0][0] != 2 + k:
+                ci.removeItem(pn.plot)
+        for k, pn in enumerate(self.panes):
+            if pn.plot not in ci.items:
+                ci.addItem(pn.plot, row=2 + k, col=0)
+        self._apply_row_heights()
+        self._refresh_axes()
+        self._fit_axis_width()
+        self._schedule_relayout()
+
+    def _apply_row_heights(self):
+        grid = self.glw.ci.layout
+        for r in range(2, 2 + len(self.panes) + 8):
+            grid.setRowStretchFactor(r, 0)
+            grid.setRowMinimumHeight(r, 0)
+            grid.setRowMaximumHeight(r, _QWIDGETSIZE_MAX)
+        for k, pn in enumerate(self.panes):
+            r = 2 + k
+            if pn.px:
+                for setter in (grid.setRowMinimumHeight, grid.setRowPreferredHeight, grid.setRowMaximumHeight):
+                    setter(r, pn.px)
+            else:
+                grid.setRowStretchFactor(r, 4)              # a new pane gets about a fifth of the chart
+        grid.invalidate()
+
+    def set_pane_height(self, pane, h: float):
+        """Drag the line on top of a pane: that pane gets h pixels, the price chart (or the pane above) the rest."""
+        if pane not in self.panes:
+            return
+        k = self.panes.index(pane)
+        above = self.panes[k - 1] if k > 0 else None
+        cur = pane.plot.height()
+        room = cur + (above.plot.height() if above is not None else self.price.height())
+        h = max(50.0, min(float(h), room - (50.0 if above is not None else 140.0)))
+        if above is not None and above.px:
+            above.px = max(50.0, above.px - (h - cur))
+        pane.px = h
+        self._apply_row_heights()
+        self._schedule_relayout()
+
+    def set_rsi_height(self, h: float):                     # (older callers)
+        pn = self._pane_of("rsi")
+        if pn is not None:
+            self.set_pane_height(pn, h)
 
     def eventFilter(self, obj, ev):
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.Resize:
@@ -864,7 +1294,7 @@ class ChartWidget(QtWidgets.QWidget):
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.Leave:
             QtCore.QTimer.singleShot(0, self._crosshair_off)
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.Enter:
-            for p in (self.price, self.vol, self.rsi):
+            for p in self._plots():
                 p.vline.show()
             # mouse came back (e.g. a dialog / menu closed over the chart): put the whole crosshair under it now,
             # not where it was before
@@ -895,8 +1325,7 @@ class ChartWidget(QtWidgets.QWidget):
         if pd_.isNull():
             return False
         pt = self.glw.mapToScene(ev.position().toPoint())
-        plot = next((p for p in (self.price, self.vol, self.rsi)
-                     if p.isVisible() and p.vb.sceneBoundingRect().contains(pt)), None)
+        plot = next((p for p in self._plots() if p.isVisible() and p.vb.sceneBoundingRect().contains(pt)), None)
         if plot is None:
             return False                                   # over a scale: the normal handler scales that axis
         vb = self.price.vb
@@ -932,23 +1361,32 @@ class ChartWidget(QtWidgets.QWidget):
             c = self.ty(self.df["Close"].to_numpy(float))
             self.line_item.setData(np.arange(n), c[:n])
         for items in self._ind_items.values():
-            for _, it, _n in items:
-                f = getattr(it, "_full", None)
-                if f is not None:
-                    it.setData(f[0][:n], f[1][:n])
-                elif hasattr(it, "limit"):               # the Bollinger fill follows the replay position too
-                    it.limit = self._limit
-                    it.update()
+            for _pl, it in items:
+                self._limit_item(it, n)
         for it, _name in self._strategy_items:
             f = getattr(it, "_full", None)
             if f is not None:
                 it.setData(f[0][:n], f[1][:n])
         lim = len(self._lows) + 80 if self._limit is None else n + 60
-        for p in (self.price, self.vol, self.rsi):
+        for p in self._plots():
             p.vb.setLimits(xMin=-5, xMax=lim, minXRange=8)
         self._update_last_tag()
         self._update_header(max(n - 1, 0))
         self._autoscale()
+
+    def _limit_item(self, it, n: int):
+        """Replay: an indicator item shows only what the first n bars produce."""
+        f = getattr(it, "_full", None)
+        if f is not None:
+            x, y = f
+            if getattr(it, "_step", False):                  # pivot segments: cut at the replay position
+                it.setData(np.where(np.isnan(x), np.nan, np.minimum(x, n - 0.5)), y)
+            else:
+                off = int(getattr(it, "_offset", 0))
+                it.setData(x[:n], y[:n]) if off == 0 else it.setData(x[:max(n, 0)], y[:max(n, 0)])
+        elif hasattr(it, "limit"):                           # fills / histograms / dots follow the replay too
+            it.limit = self._limit
+            it.update()
 
     def replay_begin(self):
         """Step 1: the user picks the start bar by clicking on the chart."""
@@ -1060,7 +1498,6 @@ class ChartWidget(QtWidgets.QWidget):
         self.corners.setGeometry(self.glw.rect())
         self.corners.raise_()
         self._sync_latest_btn()
-        self.pane_grip.place()
         if not self.draw_bar.isHidden():
             self.draw_bar.place()
             self.draw_bar.raise_()
@@ -1070,20 +1507,21 @@ class ChartWidget(QtWidgets.QWidget):
         if hasattr(self, "replay_bar") and not self.replay_bar.isHidden():
             self.replay_bar.place()
         if self.df is not None:                                  # volume legend sits under the OHLC header
-            col = not self.collapse_btn.isChecked() and bool(settings.get()['sl_trade'])
+            col = not self.collapse_btn.isChecked() and bool(settings.get()['sl_trade'])   # shown like TradingView
             self.sell_btn.setVisible(col)
             self.buy_btn.setVisible(col)
             self.spread_lbl.setVisible(col)
             self.collapse_btn.show()
             self._apply_watermark_vis()
             y = self.header.y() + self.header.height() + 4
-            if col:
+            if col:                                       # TradingView: 39 px between the buttons, spread centred
                 self.sell_btn.move(10, y)
-                self.spread_lbl.move(96, y + 10)
-                self.buy_btn.move(96 + self.spread_lbl.width() + 6, y)
-                y += 46
+                gx = 10 + self.sell_btn.width()
+                self.spread_lbl.move(gx + (39 - self.spread_lbl.width()) // 2, y + (34 - self.spread_lbl.height()) // 2)
+                self.buy_btn.move(gx + 39, y)
+                y += 34 + 8
             folded = self.collapse_btn.isChecked()
-            show_vol = not folded and bool(settings.get()['sl_volume'])
+            show_vol = self._show_vol_legend()
             self.vol_label.setVisible(show_vol)
             if show_vol:                                  # (isVisible() is False while the pane is hidden)
                 self.vol_label.move(10, y)
@@ -1100,14 +1538,30 @@ class ChartWidget(QtWidgets.QWidget):
             self.watermark.move(14, max(gh - 100, 0))
             for w in (self.sell_btn, self.buy_btn, self.spread_lbl, self.vol_label, self.collapse_btn):
                 w.raise_()
-        for plot, lab in ((self.rsi, self.rsi_label),):
-            vis = plot.isVisible() and self.df is not None
+        folded = self.collapse_btn.isChecked()
+        for pn in self.panes:                                    # each pane's legend sits in its top-left corner
+            pl, lab = pn.plot, pn.label
+            vis = (self.df is not None and pl.scene() is not None and bool(lab.text()) and not folded
+                   and settings.get().get("sl_ind_titles", True))
             lab.setVisible(vis)
             if vis:
-                tl = self.glw.mapFromScene(plot.sceneBoundingRect().topLeft())
-                lab.move(int(tl.x()) + 10, int(tl.y()) + 3)
+                tl = self.glw.mapFromScene(pl.vb.sceneBoundingRect().topLeft())
+                lab.move(int(tl.x()) + 10, int(tl.y()) + 4)
                 lab.raise_()
+            pn.grip.place()
         self.header.raise_()
+
+    def _show_vol_legend(self) -> bool:
+        """'Vol' in the legend only when the symbol trades volume - an index (NIFTY, SENSEX) has none, and
+        TradingView shows nothing there rather than 'Vol 0'."""
+        if self.df is None or self.collapse_btn.isChecked() or not settings.get()['sl_volume']:
+            return False
+        key = (id(self.df), len(self._vols))
+        if getattr(self, "_has_vol_key", None) != key:
+            self._has_vol_key = key
+            v = self._vols
+            self._has_vol = bool(len(v)) and bool(np.nanmax(np.abs(v[-min(len(v), 2000):])) > 0)
+        return self._has_vol
 
     def set_range_preset(self, key: str):
         """TradingView's bottom range buttons: show the last 1D / 5D / 1M ... / All."""
@@ -1179,19 +1633,6 @@ class ChartWidget(QtWidgets.QWidget):
             return False
         return True
 
-    def _set_rsi_visible(self, on: bool):
-        grid = self.glw.ci.layout
-        self.rsi.setVisible(on)
-        if on and getattr(self, "_rsi_px", None):           # the height the pane was dragged to
-            for setter in (grid.setRowMinimumHeight, grid.setRowPreferredHeight, grid.setRowMaximumHeight):
-                setter(2, self._rsi_px)
-        elif on:
-            grid.setRowMinimumHeight(2, 0)
-            grid.setRowMaximumHeight(2, _QWIDGETSIZE_MAX)
-        else:
-            grid.setRowFixedHeight(2, 0)
-        self._refresh_axes()
-
     # ------------------------------------------------------------------ settings
     def ty(self, y):
         """price -> view coordinate for the current scale mode (works on scalars and arrays)."""
@@ -1261,25 +1702,29 @@ class ChartWidget(QtWidgets.QWidget):
             return f"{x:,.{int(p.split()[0])}f}"
         return f"{x:,.2f}"
 
+    def apply_settings_to_plot(self, pl):
+        S = settings.get()
+        pl.vb._gp_key = None
+        pl.vb.update()
+        f = _scale_font(S)
+        for name in ("bottom", "right"):
+            ax = pl.getAxis(name)
+            ax.setPen(pg.mkPen(S["bg"]))
+            ax.setTextPen(pg.mkPen(S["text_color"]))
+            ax.setStyle(tickFont=f)
+            ax.picture = None
+            ax.update()
+            if name == "bottom":
+                ax.dow, ax.h24, ax.datefmt = bool(S["dow"]), bool(S["h24"]), S["date_format"]
+        pen = self._xhair_pen()
+        pl.vline.setPen(pen)
+        pl.hline.setPen(pen)
+
     def apply_settings(self):
         S = settings.get()
         self.glw.setBackground(S["bg"])
-        for pl in (self.price, self.vol, self.rsi):
-            pl.vb._gp_key = None
-            pl.vb.update()
-            f = QtGui.QFont()
-            f.setPixelSize(int(S["text_size"]))
-            f.setWeight(QtGui.QFont.Weight.DemiBold)
-            for name in ("bottom", "right"):
-                ax = pl.getAxis(name)
-                ax.setPen(pg.mkPen(S["grid_color"]))
-                ax.setTextPen(pg.mkPen(S["text_color"]))
-                ax.setStyle(tickFont=f)
-                ax.picture = None
-                ax.update()
-            dash = pg.mkPen(S["crosshair"], width=1, style=QtCore.Qt.PenStyle.DashLine)
-            pl.vline.setPen(dash)
-            pl.hline.setPen(dash)
+        for pl in self._plots():
+            self.apply_settings_to_plot(pl)
         for ax in self.axes:
             ax.dow = bool(S["dow"])
             ax.h24 = bool(S["h24"])
@@ -1339,25 +1784,26 @@ class ChartWidget(QtWidgets.QWidget):
         df = self.df if df is None else df
         if df is None or not len(df):
             return
-        S = settings.get()
-        f = QtGui.QFont()
-        f.setPixelSize(int(S.get("text_size", 12)))
-        f.setWeight(QtGui.QFont.Weight.DemiBold)
-        fm = QtGui.QFontMetrics(f)
+        fm = QtGui.QFontMetrics(_scale_font())
         widest = max(fm.horizontalAdvance(self.axis_price(float(np.nanmax(df["High"])) * 1.2)),
                      fm.horizontalAdvance("-100.00%"))
-        w = int(max(64, widest + 22))
-        for pl in (self.price, self.vol, self.rsi):
+        w = int(max(64, widest + PRICE_TEXT_LEFT + 12))      # TradingView: 10 px before the text, ~12 after
+        for pl in self._plots():
             if pl.getAxis("right").width() != w:
                 pl.getAxis("right").setWidth(w)
 
     def _refresh_axes(self):
+        """Only the lowest pane carries the time scale; the others end flush against the pane below (TradingView)."""
         owner = self._bottom_plot()
-        for pl in (self.price, self.vol, self.rsi):
-            pl.getAxis("bottom").setStyle(showValues=pl is owner)
+        for pl in self._plots():
+            if pl is owner:
+                pl.showAxis("bottom")
+                pl.getAxis("bottom").setStyle(showValues=True)
+            elif pl.getAxis("bottom").isVisible():
+                pl.hideAxis("bottom")
 
     def _bottom_plot(self):
-        return self.rsi if self.rsi.isVisible() else self.price
+        return self.panes[-1].plot if self.panes else self.price
 
     # ------------------------------------------------------------------ coordinate helpers (used by drawings)
     def _n(self) -> int:
@@ -1423,14 +1869,15 @@ class ChartWidget(QtWidgets.QWidget):
         self._wipe()
         self.df, self.label = df, label
         n = len(df)
-        self.axes[0].set_index(df.index)
+        self._fut = None
+        self.axes[0].set_index(df.index, _project_times(df.index, 160))
         for a in self.axes[1:]:                              # same bars on every pane: work the labels out once
             a.share_index(self.axes[0])
         self._times = df.index.to_numpy().astype("datetime64[s]").astype("int64").astype(float)
 
         self._base = float(df["Close"].iloc[0])
         self._fit_axis_width(df)
-        for pl in (self.price, self.vol, self.rsi):
+        for pl in self._plots():
             pl.getAxis("right").setStyle(showValues=True)
         self.candles = CandleItem(df, self.style, self.ty)
         self.price.addItem(self.candles)
@@ -1453,11 +1900,11 @@ class ChartWidget(QtWidgets.QWidget):
         self._itag = None                              # interval tag is recomputed for the new data
         self._apply_style()
 
-        for key in list(self._enabled):
+        for key in self._ordered_enabled():
             self._build_indicator(key)
         self._rebuild_legend()
 
-        for p in (self.price, self.vol, self.rsi):
+        for p in self._plots():
             p.vb.setLimits(xMin=-5, xMax=n + 80, minXRange=8)
         self.layer.rebuild()
         self.go_latest()
@@ -1534,13 +1981,16 @@ class ChartWidget(QtWidgets.QWidget):
             self._autoscale()
         return True
 
+    def _ordered_enabled(self) -> list:
+        return [k for k in self._ind_order if k in self._enabled] + sorted(k for k in self._enabled if k not in self._ind_order)
+
     def _refresh_indicators(self):
         if self.df is None or self._limit is not None:
             return
         import time as _time
         t0 = _time.perf_counter()
-        for key in list(self._ind_items):
-            if key in self._enabled:
+        for key in self._ordered_enabled():
+            if key in self._ind_items:
                 self._remove_indicator(key)
                 self._build_indicator(key)
         self._rebuild_legend()
@@ -1588,16 +2038,6 @@ class ChartWidget(QtWidgets.QWidget):
         right = n + int(settings.get()['scale_right_bars'])
         vb._goal = (right - (x1 - x0), right)
         vb._animate_x(right - (x1 - x0), right, ms=260)
-
-    def set_rsi_height(self, h: float):
-        """Drag the line between the price pane and the RSI pane."""
-        grid = self.glw.ci.layout
-        total = self.price.height() + self.rsi.height()
-        h = max(60.0, min(float(h), total - 140.0))
-        self._rsi_px = h
-        for setter in (grid.setRowMinimumHeight, grid.setRowPreferredHeight, grid.setRowMaximumHeight):
-            setter(2, h)
-        self._schedule_relayout()
 
     def go_latest(self):
         n = self._n()
@@ -1656,41 +2096,59 @@ class ChartWidget(QtWidgets.QWidget):
             self.line_item.setFillLevel(None)
 
     # ------------------------------------------------------------------ indicators
+    def _P(self, key: str) -> dict:
+        """An indicator's inputs and colours: defaults with what the user changed on top."""
+        return STD.params(key, self.ind_params.get(key))
+
     def set_indicator(self, key: str, on: bool):
+        if key not in STD.STUDIES:
+            return
         if on:
             self._enabled.add(key)
+            if key not in self._ind_order:
+                self._ind_order.append(key)
             if self.df is not None:
                 self._build_indicator(key)
         else:
             self._enabled.discard(key)
             self._remove_indicator(key)
-        if key == "rsi":
-            self._set_rsi_visible(on)
+            pn = self._pane_of(key)
+            if pn is not None:
+                pn.keys.remove(key)
+                if not pn.keys:
+                    self._drop_pane(pn)
         self._rebuild_legend()
+        if self.df is not None:
+            self._autoscale()
 
     def set_indicator_params(self, key: str, **params):
-        """Change an indicator's inputs (len, mult, color). The line is rebuilt at once."""
-        if key not in self.ind_params:
+        """Change an indicator's inputs / colours. The lines are rebuilt at once."""
+        if key not in STD.STUDIES:
             return
+        cur = self.ind_params.setdefault(key, STD.defaults(key))
         for k, v in params.items():
             if v is None:
-                self.ind_params[key].pop(k, None)
+                cur.pop(k, None)
             else:
-                self.ind_params[key][k] = v
+                cur[k] = v
         if key in self._ind_items:
             self._remove_indicator(key)
             self._build_indicator(key)
             self._rebuild_legend()
             if self.df is not None and self._n():
                 self._update_header(min(getattr(self, "_hdr_i", self._n() - 1), self._n() - 1))
+                self._autoscale()
         self.indicatorsChanged.emit()
 
     def set_indicator_hidden(self, key: str, hidden: bool):
         (self._ind_hidden.add if hidden else self._ind_hidden.discard)(key)
         self._rebuild_legend()
+        self.indicatorsChanged.emit()                        # (the window remembers hidden ones too)
+        if self.df is not None:
+            self._autoscale()
 
     def edit_indicator(self, key: str):
-        if key in self.ind_params:
+        if key in STD.STUDIES:
             _IndicatorSettings(self, key).exec()
 
     def _legend_hover(self, vp_pos):
@@ -1699,8 +2157,8 @@ class ChartWidget(QtWidgets.QWidget):
         if vp_pos is None or self.df is None:
             b.leave()
             return
-        for label, keys in ((self.ind_label, [k for k in self._legend_keys]),
-                            (self.rsi_label, ["rsi"] if "rsi" in self._ind_items else [])):
+        targets = [(self.ind_label, list(self._legend_keys))] + [(pn.label, [r[0] for r in pn.rows]) for pn in self.panes]
+        for label, keys in targets:
             if label.isHidden() or not keys:
                 continue
             g = label.geometry()
@@ -1716,122 +2174,192 @@ class ChartWidget(QtWidgets.QWidget):
         b.leave()
 
     def _build_indicator(self, key: str):
-        if self.df is None or key in self._ind_items:
+        st = STD.STUDIES.get(key)
+        if st is None or self.df is None or key in self._ind_items:
             return
-        c = self.df["Close"]
-        lines = []
-        P = self.ind_params.get(key, {})
-        L = max(1, int(P.get("len", 1)))
-        col = P.get("color") or IND_DEFAULTS.get(key, {}).get("color", "#2962ff")
-        if key in ("sma20", "sma50", "sma200"):
-            lines = [(self.price, ta.sma(c, L), col, f"SMA {L}")]
-        elif key in ("ema20", "ema50"):
-            lines = [(self.price, ta.ema(c, L), col, f"EMA {L}")]
-        elif key == "bb":
-            m = float(P.get("mult", 2.0))
-            bb = ta.bollinger(c, L, m)
-            lines = [(self.price, bb["mid"], "#ff6d00", f"BB {L} {m:g}"),
-                     (self.price, bb["upper"], col, None),
-                     (self.price, bb["lower"], col, None)]
-        elif key == "vwap":
-            lines = [(self.price, ta.vwap(self.df), col, "VWAP")]
-        elif key == "supertrend":
-            m = float(P.get("mult", 3.0))
-            st = ta.supertrend(self.df, L, m)
-            upl = st["st"].where(st["dir"] > 0)
-            dnl = st["st"].where(st["dir"] < 0)
-            lines = [(self.price, upl, theme.UP, f"Supertrend {L} {m:g}"), (self.price, dnl, theme.DOWN, None)]
-        elif key == "rsi":
-            r14 = ta.rsi(c, L)
-            self._rsi_arr = r14.to_numpy(float)
-            lines = [(self.rsi, r14, col, None)]
-
+        P = self._P(key)
+        try:
+            outs, fills = st.calc(self.df, P)
+        except Exception as e:  # noqa: BLE001 - a bad input value must not break the chart
+            import logging
+            logging.getLogger("chartlab").warning("indicator %s failed: %s", key, e)
+            return
+        if st.pane:
+            pn = self._pane_of(key)
+            if pn is None:
+                pn = self._add_pane(key)
+            plot = pn.plot
+        else:
+            plot = self.price
+        n = len(self.df)
+        lim = self._limit
         items = []
-        x = np.arange(len(c))
-        for plot, y, color, name in lines:
-            yy = y.to_numpy(float)
-            if plot is self.price:
-                yy = self.ty(yy)
-            item = pg.PlotDataItem(x=x, y=yy, pen=pg.mkPen(color, width=1.5 if key == "supertrend" else 1.3),
-                                   connect="finite")
-            item._full = (x, yy)
-            item._legend_color = color
-            plot.addItem(item)
-            item.setClipToView(True)                         # only the part on screen is turned into a path:
-            item.setDownsampling(auto=True, method="peak")   # 100,000 bars pan as smoothly as 500
-            if self._limit is not None:
-                item.setData(x[:self._limit], item._full[1][:self._limit])
-            items.append((plot, item, name))
-        if key == "bb" and len(items) == 3:              # TradingView fills between the bands
-            fc = QtGui.QColor(col)
-            fc.setAlpha(22)
-            fill = BandFill(items[1][1]._full[1], items[2][1]._full[1], pg.mkBrush(fc))
-            fill.limit = self._limit
+        for o in outs:
+            raw = np.asarray(o.y, float)
+            y = raw if st.pane else np.asarray(self.ty(raw), float)
+            if o.kind == "hist":
+                it = HistItem(y, o.idx, o.palette)
+                it.limit = lim
+            elif o.kind == "dots":
+                it = DotsItem(y, o.color)
+                it.limit = lim
+            else:
+                x = np.asarray(o.x, float) if o.kind == "step" else np.arange(n, dtype=float) + o.offset
+                pen = pg.mkPen(o.color, width=o.width, style=_PEN_STYLES.get(o.style, QtCore.Qt.PenStyle.SolidLine))
+                it = pg.PlotDataItem(x=x, y=y, pen=pen, connect="finite")
+                it._full = (x, y)
+                it._step = o.kind == "step"
+            it._raw = raw if o.vals is None else np.asarray(o.vals, float)
+            it._offset = int(o.offset)
+            it._legend = bool(o.legend)
+            it._legend_color = o.color
+            plot.addItem(it)
+            if isinstance(it, pg.PlotDataItem):
+                it.setClipToView(True)                       # only the part on screen is turned into a path:
+                it.setDownsampling(auto=True, method="peak")  # 100,000 bars pan as smoothly as 500
+                if lim is not None:
+                    self._limit_item(it, self._n())
+            items.append((plot, it))
+        for f in fills:
+            ia, ib = items[f.a][1], items[f.b][1]
+            if not (hasattr(ia, "_full") and hasattr(ib, "_full")):
+                continue
+            c = QtGui.QColor(f.color)
+            c.setAlpha(f.alpha)
+            dn = None
+            if f.color_dn:
+                dn = QtGui.QColor(f.color_dn)
+                dn.setAlpha(f.alpha)
+                dn = pg.mkBrush(dn)
+            fill = BandFill(ia._full[1], ib._full[1], pg.mkBrush(c), offset=outs[f.a].offset, brush_dn=dn)
+            fill.limit = lim
             fill.setZValue(-8)
-            self.price.addItem(fill, ignoreBounds=True)
-            items.append((self.price, fill, None))
-        if key == "rsi":
-            band = pg.LinearRegionItem(values=(30, 70), orientation="horizontal", movable=False,
-                                       brush=pg.mkBrush(126, 87, 194, 22), pen=pg.mkPen(None))
-            band.setZValue(-10)
-            self.rsi.addItem(band, ignoreBounds=True)
-            items.append((self.rsi, band, None))
-            for lvl in (30, 70):
+            plot.addItem(fill, ignoreBounds=True)
+            items.append((plot, fill))
+        if st.pane:
+            if st.band:
+                bc = QtGui.QColor(st.band_color)
+                bc.setAlpha(24)
+                band = pg.LinearRegionItem(values=st.band, orientation="horizontal", movable=False,
+                                           brush=pg.mkBrush(bc), pen=pg.mkPen(None))
+                band.setZValue(-10)
+                plot.addItem(band, ignoreBounds=True)
+                items.append((plot, band))
+            for lvl, style in st.levels:
                 g = pg.InfiniteLine(pos=lvl, angle=0, movable=False,
-                                    pen=pg.mkPen(theme.MUTED, style=QtCore.Qt.PenStyle.DashLine))
-                self.rsi.addItem(g, ignoreBounds=True)
-                items.append((self.rsi, g, None))
+                                    pen=pg.mkPen(STD.GREY, width=1, style=_PEN_STYLES.get(style)))
+                g.setZValue(-9)
+                plot.addItem(g, ignoreBounds=True)
+                items.append((plot, g))
         self._ind_items[key] = items
 
     def _remove_indicator(self, key: str):
-        for plot, item, _ in self._ind_items.pop(key, []):
+        for plot, item in self._ind_items.pop(key, []):
             plot.removeItem(item)
 
+    @staticmethod
+    def _legend_vals(items) -> list:
+        return [(it._raw, it._offset, it._legend_color) for _pl, it in items
+                if getattr(it, "_legend", False) and getattr(it, "_raw", None) is not None]
+
     def _rebuild_legend(self):
-        """Indicator / strategy lines listed under 'Vol', TradingView style: name then value(s) at the bar."""
-        rows, keys = [], []
-        for key, items in self._ind_items.items():
+        """Price-chart indicators and strategy lines are listed under 'Vol'; each pane lists its own in its corner.
+        TradingView style: the name, then the value(s) at the bar under the crosshair in the line colours."""
+        rows = []
+        for key in self._ordered_enabled():
+            items = self._ind_items.get(key)
+            if not items:
+                continue
+            st = STD.STUDIES[key]
             hidden = key in self._ind_hidden
-            for _pl, it, _n in items:
+            for _pl, it in items:
                 it.setVisible(not hidden)
-            name = next((n for _, _, n in items if n), None)
-            vals = [(it, getattr(it, "_legend_color", "#d1d4dc")) for pl, it, _ in items
-                    if pl is self.price and isinstance(it, pg.PlotDataItem)]
-            if name and vals:
-                rows.append((name, vals))
-                keys.append(key)
+            if not st.pane:
+                rows.append((key, st.legend(self._P(key)), self._legend_vals(items), st))
         for item, name in self._strategy_items:
-            col = item.opts["pen"].color().name() if hasattr(item.opts.get("pen"), "color") else "#d1d4dc"
-            rows.append((name, [(item, col)]))
-            keys.append(None)
-        self._legend_rows, self._legend_keys = rows, keys
+            col = item.opts["pen"].color().name() if hasattr(item.opts.get("pen"), "color") else "#dbdbdb"
+            raw = getattr(item, "_raw", None)
+            rows.append((None, name, [(raw, 0, col)] if raw is not None else [], None))
+        self._legend_rows = rows
+        self._legend_keys = [r[0] for r in rows]
+        for pn in self.panes:
+            pn.rows = [(k, STD.STUDIES[k].legend(self._P(k)), self._legend_vals(self._ind_items.get(k, [])),
+                        STD.STUDIES[k]) for k in pn.keys if k in self._ind_items]
         self._update_ind_legend(getattr(self, "_hdr_i", None))
         self._hdr_shape = None
         self._place_overlays()
 
+    def _fmt_study(self, st, v: float) -> str:
+        return self.fp(float(v)) if st is None else STD.fmt_value(st, float(v), self.fp)
+
+    def _legend_html(self, rows, i: int) -> str:
+        S = settings.get()
+        show_vals = S.get("sl_ind_values", True)
+        out = []
+        for key, title, vals, st in rows:
+            off = key in self._ind_hidden
+            parts = [f"<span style='color:{'#636363' if off else LEGEND_TEXT}'>{title}</span>"]
+            if show_vals and not off:
+                for arr, offs, col in vals:
+                    j = i - offs
+                    v = arr[j] if arr is not None and 0 <= j < len(arr) else np.nan
+                    if np.isfinite(v):
+                        parts.append(f"<span style='color:{col}'>{self._fmt_study(st, v)}</span>")
+            out.append("&nbsp;&nbsp;".join(parts))
+        return "<br>".join(out)
+
     def _update_ind_legend(self, i):
         S = settings.get()
-        if not self._legend_rows or not S.get("sl_ind_titles", True) or self.df is None:
+        if self.df is None:
             self.ind_label.hide()
             return
         if i is None:
             i = self._n() - 1
-        out = []
-        for r_, (name, vals) in enumerate(self._legend_rows):
-            col0 = vals[0][1]
-            off = self._legend_keys[r_] in self._ind_hidden if r_ < len(self._legend_keys) else False
-            parts = [f"<span style='color:{'#5d606b' if off else '#d1d4dc'}'>{name}</span>"]
-            if off:
-                col0 = "#5d606b"
-            if S.get("sl_ind_values", True) and not off:
-                for it, col in vals:
-                    f = getattr(it, "_full", None)
-                    y = f[1][i] if f is not None and 0 <= i < len(f[1]) else np.nan
-                    if np.isfinite(y):
-                        parts.append(f"<span style='color:{col}'>{self.fp(float(self.iy(y)))}</span>")
-            out.append(f"<span style='color:{col0}'>\u25cf</span>&nbsp;" + "&nbsp;&nbsp;".join(parts))
-        self.ind_label.setText("<br>".join(out))
-        self.ind_label.setVisible(not self.collapse_btn.isChecked())
+        folded = self.collapse_btn.isChecked()
+        titles = S.get("sl_ind_titles", True)
+        if self._legend_rows and titles:
+            self.ind_label.setText(self._legend_html(self._legend_rows, i))
+            self.ind_label.setVisible(not folded)
+        else:
+            self.ind_label.hide()
+        for pn in self.panes:
+            pn.label.setText(self._legend_html(pn.rows, i) if pn.rows else "")
+            if pn.label.isHidden() == (bool(pn.rows) and titles and not folded):
+                self._hdr_shape = None                       # a pane legend appeared / vanished: re-place
+
+    def _autoscale_panes(self):
+        """Each pane fits what is on screen, levels (30 / 70 ...) included, like TradingView."""
+        if not self.panes or self.df is None:
+            return
+        x0, x1 = self.price.vb.viewRange()[0]
+        n = self._n()
+        for pn in self.panes:
+            lo, hi = np.inf, -np.inf
+            for key in pn.keys:
+                if key in self._ind_hidden:
+                    continue
+                st = STD.STUDIES[key]
+                for _pl, it in self._ind_items.get(key, []):
+                    raw = getattr(it, "_raw", None)
+                    if raw is None:
+                        continue
+                    offs = int(getattr(it, "_offset", 0))
+                    a = max(0, int(np.floor(x0)) - offs)
+                    b = min(n, len(raw), int(np.ceil(x1)) + 1 - offs)
+                    if b <= a:
+                        continue
+                    seg = raw[a:b]
+                    seg = seg[np.isfinite(seg)]
+                    if len(seg):
+                        lo, hi = min(lo, float(seg.min())), max(hi, float(seg.max()))
+                    if isinstance(it, HistItem):
+                        lo, hi = min(lo, 0.0), max(hi, 0.0)
+                for lvl, _style in st.levels:
+                    lo, hi = min(lo, float(lvl)), max(hi, float(lvl))
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                continue
+            pad = (hi - lo) * 0.1 if hi > lo else (abs(hi) * 0.05 or 1.0)
+            pn.plot.vb.setYRange(lo - pad, hi + pad, padding=0)
 
     # ------------------------------------------------------------------ strategy output
     def clear_strategy(self):
@@ -1855,6 +2383,7 @@ class ChartWidget(QtWidgets.QWidget):
             sy = self.ty(series.to_numpy(float))
             item = pg.PlotDataItem(x=x, y=sy, pen=pg.mkPen(color, width=1.4), connect="finite")
             item._full = (x, sy)
+            item._raw = series.to_numpy(float)
             self.price.addItem(item)
             if self._limit is not None:
                 item.setData(x[:self._limit], item._full[1][:self._limit])
@@ -1912,12 +2441,12 @@ class ChartWidget(QtWidgets.QWidget):
         if self.df is None:
             return
         n = self._n()
+        self._autoscale_panes()
         if not self.auto_y:
             x0, x1 = self.price.vb.viewRange()[0]
             lo, hi = max(0, int(x0)), min(n, int(x1) + 1)
             if hi > lo:
                 self.vol.vb.setYRange(0, max(float(np.nanmax(self._vols[lo:hi])) * 1.15, 1.0), padding=0)
-            self.rsi.vb.setYRange(0, 100, padding=0)
             self._place_last_tag()
             return
         x0, x1 = self.price.vb.viewRange()[0]
@@ -1932,7 +2461,6 @@ class ChartWidget(QtWidgets.QWidget):
             self.volbars.update()
         vmax = float(np.nanmax(self._vols[lo:hi]))
         self.vol.vb.setYRange(0, max(vmax * 1.15, 1.0), padding=0)
-        self.rsi.vb.setYRange(0, 100, padding=0)
         self._place_last_tag()
 
     def _update_last_tag(self):
@@ -1941,6 +2469,7 @@ class ChartWidget(QtWidgets.QWidget):
         last, prev = float(self._closes[self._n() - 1]), float(self._opens[self._n() - 1])
         color = theme.UP if last >= prev else theme.DOWN
         self.last_tag.fill = pg.mkBrush(color)
+        self.cd_tag.fill = color                            # the countdown is the lower half of the same label
         self.last_tag.setText(f" {self.axis_label(float(self.ty(last)))} ")
         self.last_line.setPen(pg.mkPen(color, style=QtCore.Qt.PenStyle.DotLine))
         self.last_line.setPos(float(self.ty(last)))
@@ -1951,12 +2480,35 @@ class ChartWidget(QtWidgets.QWidget):
         if (name, color) != getattr(self, "_nt_key", None):   # live ticks come many times a second: restyle only on change
             self._nt_key = (name, color)
             nt.setText(name)
-            nt.setStyleSheet(f"QLabel {{ background: {color}; color: #ffffff; font-size: 12px; font-weight: 500;"
-                             f" padding: 2px 5px; border-radius: 2px; }}")
+            nt.setStyleSheet(f"QLabel {{ background: {color}; color: #ffffff; font-size: 12px; font-weight: 400;"
+                             f" padding: 0px 6px 1px 6px; border-radius: 2px; }}")
             nt.adjustSize()
         self._place_last_tag()
 
+    def _place_vol_tag(self):
+        """The newest bar's volume as a label on the price scale, level with the top of its bar (TradingView)."""
+        vt = self.vol_tag
+        info = None
+        if (self.df is not None and self.volbars is not None and bool(settings.get().get("last_label", True))
+                and getattr(self.volbars, "overlay", None) is not None and self.volbars.isVisible()):
+            try:
+                info = self.volbars.last_value()
+            except Exception:  # noqa: BLE001
+                info = None
+        if info is None:
+            vt.hide()
+            return
+        y, v, up = info
+        vt.fill = vol_color(up).name()
+        vt.setText(theme.fmt_vol(v))
+        vt.setPos(self.price.vb.viewRange()[0][1], y)
+        vt.show()
+        for tg in (self.last_tag, self.cd_tag, self.name_tag):     # the price's own labels stay on top
+            if not tg.isHidden():
+                tg.raise_()
+
     def _place_last_tag(self):
+        self._place_vol_tag()
         if self.df is None or self.last_tag.isHidden():
             return
         xr = self.price.vb.viewRange()[0][1]
@@ -1964,7 +2516,7 @@ class ChartWidget(QtWidgets.QWidget):
         self.last_tag.setPos(xr, y)
         self.cd_tag.setPos(xr, y)
         nt = self.name_tag
-        show = not self.last_tag.isHidden() and bool(settings.get().get("sym_label", True)) and bool(nt.text())
+        show = not self.last_tag.isHidden() and bool(settings.get().get("sym_label", False)) and bool(nt.text())
         nt.setVisible(show)
         if show:
             g = self.last_tag.geometry()
@@ -1981,11 +2533,11 @@ class ChartWidget(QtWidgets.QWidget):
     def _update_countdown(self):
         """TradingView's 'time left in this bar' under the last-price label (only while the bar is live)."""
         if self.df is None or self._limit is not None or not self.isVisible() or not settings.get()['countdown']:
-            self.cd_tag.hide()
+            self._cd_hide()
             return
         step = self.bar_seconds()
         if step <= 0 or step > 86400 * 2:
-            self.cd_tag.hide()
+            self._cd_hide()
             return
         import datetime as _dt
         last = self.df.index[-1]
@@ -1993,71 +2545,140 @@ class ChartWidget(QtWidgets.QWidget):
         now = _dt.datetime.now(tz=end.tzinfo) if getattr(end, "tzinfo", None) else _dt.datetime.now()
         left = (end - now).total_seconds()
         if not 0 <= left <= step:
-            self.cd_tag.hide()
+            self._cd_hide()
             return
         h, rem = divmod(int(left), 3600)
         m, sec = divmod(rem, 60)
         self.cd_tag.setText(f" {h:d}:{m:02d}:{sec:02d} " if h else f" {m:02d}:{sec:02d} ")
-        self.cd_tag.show()
+        self.last_tag.set_joined(not self.last_tag.isHidden())
+        self.cd_tag.setVisible(not self.last_tag.isHidden())
         self._place_last_tag()
+
+    def _cd_hide(self):
+        self.cd_tag.hide()
+        self.last_tag.set_joined(False)
 
     def _mouse_moved(self, pos, refresh: bool = False):
         if self.df is None:
             return
+        # the horizontal line sits exactly on one pixel row (crisp, 1 point), and its label / '+' are centred on it
+        pos = QtCore.QPointF(pos.x(), math.floor(pos.y()) + 0.5)
         self._cross_vp = self.glw.mapFromScene(pos)
+        if abs(float(self.glw.devicePixelRatioF()) - getattr(self, "_xh_dpr", 1.0)) > 0.01:
+            self._apply_xhair_pen()                         # window moved to a screen with another pixel ratio
         if not refresh:
             self._legend_hover(self._cross_vp)
-        plots = (self.price, self.vol, self.rsi)
+        plots = self._plots()
         hovered = next((p for p in plots if p.isVisible() and p.sceneBoundingRect().contains(pos)), None)
         if hovered is None:
             for p in plots:
                 p.ytag.hide()
-            for o in plots:
-                o.dtag.hide()
-            if not self.plus_btn.underMouse():
-                self.plus_btn.hide()
+                p.dtag.hide()
+                p.hline.hide()
+            self._set_plus_hot(False)
+            self.plus_btn.hide()
             return
         mp = hovered.vb.mapSceneToView(pos)
+        over_plus = self._over_plus(self._cross_vp)
+        self._set_plus_hot(over_plus)
         if hovered is self.price and not self.layer.tool and not self._panning():
-            cur = (QtCore.Qt.CursorShape.PointingHandCursor if self.layer.drawings and self.layer.hover_hit(mp.x(), mp.y())
-                   else QtCore.Qt.CursorShape.CrossCursor)
+            if over_plus:
+                cur = QtCore.Qt.CursorShape.PointingHandCursor
+            else:
+                cur = (QtCore.Qt.CursorShape.PointingHandCursor if self.layer.drawings and self.layer.hover_hit(mp.x(), mp.y())
+                       else QtCore.Qt.CursorShape.CrossCursor)
             if cur != getattr(self, "_cursor_shape", None):
                 self._cursor_shape = cur
                 self.glw.viewport().setCursor(cur)
         i = int(round(mp.x()))
-        ix = float(min(max(i, 0), max(self._n() - 1, 0))) if 0 <= i < self._n() else mp.x()
+        n = self._n()
+        ix = float(i)                                    # TradingView: the vertical line snaps to the bar
         new_bar = i != getattr(self, "_hover_i", None)
         self._hover_i = i
         for p in plots:
             if new_bar:
-                p.vline.setPos(ix)                      # TradingView: the vertical line snaps to the bar
-                p.vline.show()
+                p.vline.setPos(ix)
+            p.vline.show()
             p.hline.setVisible(p is hovered)
             p.ytag.setVisible(p is hovered)
-        hovered.hline.setPos(mp.y())
-        self._place_plus(hovered, pos, mp.y())
+        yv = self._plus_y if over_plus else mp.y()       # on the "+" the line stays where the "+" is
+        hovered.hline.setPos(yv)
         xr = hovered.vb.viewRange()[0][1]
-        hovered.ytag.setText(f" {self.axis_label(mp.y()) if hovered is self.price else self.axis_price(mp.y())} ")
-        hovered.ytag.setPos(xr, mp.y())
-        if 0 <= i < self._n():
-            bp = self._bottom_plot()
-            if new_bar or not bp.dtag.isVisible():       # header / date tag only change when the bar changes
-                self._update_header(i)
-                fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
+        hovered.ytag.setText(f" {self._scale_text(hovered, yv)} ")
+        hovered.ytag.setPos(xr, yv)
+        if not over_plus:
+            self._place_plus(hovered, yv)
+        bp = self._bottom_plot()
+        t = self._time_at(i) if i >= 0 else None
+        if t is not None:
+            if new_bar or bp.dtag.isHidden() or refresh:  # header / date tag only change when the bar changes
+                if 0 <= i < n:
+                    self._update_header(i)
+                elif new_bar:
+                    self._update_header(n - 1)          # right of the newest bar: the legend shows the last bar
                 for o in plots:
                     if o is not bp:
                         o.dtag.hide()
-                bp.dtag.setText(f" {self.df.index[i].strftime(fmt)} ")
+                bp.dtag.setText(f" {self._crosshair_time(t)} ")
                 bp.dtag.setPos(ix, bp.vb.viewRange()[1][0])
                 bp.dtag.show()
-            elif refresh:                                  # same bar, but the chart moved under the mouse
-                bp.dtag.setPos(ix, bp.vb.viewRange()[1][0])
         else:
             for o in plots:
                 o.dtag.hide()
-        if hovered is self.price:
+        if hovered is self.price and not over_plus:
             x, y = (self.snap(mp.x(), mp.y()) if self.layer.tool else (mp.x(), mp.y()))
             self.layer.handle_move(x, y)
+
+    def _scale_text(self, plot, v: float) -> str:
+        if plot is self.price:
+            return self.axis_label(v)
+        pn = self._pane_for_plot(plot)
+        st = STD.STUDIES.get(pn.keys[0]) if pn is not None and pn.keys else None
+        return self._fmt_study(st, v) if st is not None else self.axis_price(v)
+
+    def _crosshair_time(self, t) -> str:
+        """TradingView's time label: 'Tue 17 Nov '26   14:29' (the date the way Settings says, 24 / 12 h)."""
+        ax = self.axes[0]
+        datefmt = getattr(ax, "datefmt", "%d %b '%y")
+        d = t.strftime(("%a " if getattr(ax, "dow", True) else "") + datefmt)
+        if ax.intraday:
+            return d + "   " + t.strftime("%H:%M" if getattr(ax, "h24", True) else "%I:%M %p")
+        return d
+
+    def _time_at(self, i: int):
+        """Time of bar i - also to the right of the newest bar, where TradingView keeps the time scale going."""
+        if self.df is None or i < 0:
+            return None
+        n = self._n()
+        if i < n:
+            return self.df.index[i]
+        if self._limit is not None:                      # replay: the future is the real next bars
+            return self.df.index[i] if i < len(self.df) else None
+        fut = getattr(self.axes[0], "_future", None)
+        k = i - len(self.df)
+        return fut[k] if fut is not None and 0 <= k < len(fut) else None
+
+    # ------------------------------------------------------------------ the "+" next to the price scale
+    def _over_plus(self, vp_pos) -> bool:
+        b = self.plus_btn
+        return vp_pos is not None and not b.isHidden() and b.geometry().adjusted(-2, -2, 2, 2).contains(vp_pos)
+
+    def _set_plus_hot(self, on: bool):
+        if on != self.plus_btn_hot:
+            self.plus_btn_hot = on
+            self.plus_btn.setPixmap(_plus_pixmap(on))
+
+    def _plus_menu(self, price: float):
+        """TradingView's '+': alert / horizontal line at this price."""
+        menu = QtWidgets.QMenu(self)
+        fp = self.fp(price)
+        menu.addAction(icons.get("bell"), f"Add alert on {self.ticker() or 'symbol'} at {fp}",
+                       lambda: self.alertRequested.emit(float(price)))
+        menu.addAction(icons.get("hline"), f"Draw horizontal line at {fp}",
+                       lambda: self.layer.add("hline", [[self.x_to_time(self._n() - 1), float(price)]]))
+        menu.addSeparator()
+        menu.addAction(f"Copy price {fp}", lambda: QtWidgets.QApplication.clipboard().setText(f"{price:.2f}"))
+        menu.exec(QtGui.QCursor.pos())
 
     def set_alert_lines(self, items):
         """items: [(price, text)] drawn as dashed orange lines with a bell label."""
@@ -2167,9 +2788,10 @@ class ChartWidget(QtWidgets.QWidget):
 
     def _crosshair_off(self):
         """Mouse left the chart: hide the crosshair and its tags, legend shows the last bar again (TradingView)."""
-        if self.plus_btn.underMouse() or self.glw.viewport().underMouse():
+        if self.glw.viewport().underMouse():
             return
-        for p in (self.price, self.vol, self.rsi):
+        self._set_plus_hot(False)
+        for p in self._plots():
             p.vline.hide()
             p.hline.hide()
             p.ytag.hide()
@@ -2180,16 +2802,19 @@ class ChartWidget(QtWidgets.QWidget):
         if self.df is not None and self._n():
             self._update_header(self._n() - 1)
 
-    def _place_plus(self, hovered, pos, y):
-        if hovered is not self.price or not settings.get().get("plus_button", True):
+    def _place_plus(self, hovered, y):
+        """The '+' box sits against the price scale, on the same row as the crosshair's price label (1 px apart),
+        both centred on the line - TradingView draws them as one unit."""
+        if hovered is not self.price or not settings.get().get("plus_button", True) or self.layer.tool:
             self.plus_btn.hide()
             return
-        r = self.price.vb.sceneBoundingRect()
+        tag = self.price.ytag
         ax = axis_rect(self.price.getAxis("right"))
-        pt = self.glw.mapFromScene(QtCore.QPointF(ax.left(), pos.y()))
+        axl = int(round(self.glw.viewportTransform().map(QtCore.QPointF(ax.left(), 0)).x()))
         self._plus_y = y
-        self.plus_btn.move(int(pt.x()) - 24, int(pt.y()) - 10)
-        self.plus_btn.show()
+        b = self.plus_btn
+        b.move(axl - b.width(), tag.y() + (tag.height() - b.height()) // 2)
+        b.show()
         self.plus_btn.raise_()
         self.corners.raise_()
 
@@ -2225,6 +2850,11 @@ class ChartWidget(QtWidgets.QWidget):
         menu.exec(QtGui.QCursor.pos())
 
     def _mouse_clicked(self, ev):
+        if self.df is not None and ev.button() == QtCore.Qt.MouseButton.LeftButton and \
+                self._over_plus(self.glw.mapFromScene(ev.scenePos())):
+            price = float(self.iy(self._plus_y))
+            QtCore.QTimer.singleShot(0, lambda: self._plus_menu(price))
+            return
         if self.df is not None and ev.button() == QtCore.Qt.MouseButton.RightButton and \
                 axis_rect(self.price.getAxis("right")).contains(ev.scenePos()):
             self._axis_menu()
@@ -2372,25 +3002,25 @@ class ChartWidget(QtWidgets.QWidget):
         vol = float(self._vols[i])
         vs = theme.fmt_vol(vol)
         fmt = "%a %d %b '%y %H:%M" if self.axes[0].intraday else "%a %d %b '%y"
-        rows = [("Date", df.index[i].strftime(fmt), "#d1d4dc"),
+        rows = [("Date", df.index[i].strftime(fmt), "#dbdbdb"),
                 ("Open", self.fp(o), ccol), ("High", self.fp(h), ccol), ("Low", self.fp(lo), ccol),
                 ("Close", self.fp(c), ccol),
                 ("Change", f"{d:+,.2f} ({(c / prev - 1) * 100 if prev else 0:+.2f}%)", dcol),
-                ("Volume", vs, "#d1d4dc")]
+                ("Volume", vs, "#dbdbdb")]
         title = f"{self.ticker()} \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}"
         sections = [(title, rows)]
         ind = []
-        for name, vals in getattr(self, "_legend_rows", []):
+        rows = list(getattr(self, "_legend_rows", []))
+        for pn in self.panes:
+            rows += pn.rows
+        for _key, name, vals, st in rows:
             parts = []
-            for it, col in vals:
-                f = getattr(it, "_full", None)
-                y = f[1][i] if f is not None and 0 <= i < len(f[1]) else np.nan
-                if np.isfinite(y):
-                    parts.append(f"<span style='color:{col}'>{self.fp(float(self.iy(y)))}</span>")
+            for arr, offs, col in vals:
+                j = i - offs
+                v = arr[j] if arr is not None and 0 <= j < len(arr) else np.nan
+                if np.isfinite(v):
+                    parts.append(f"<span style='color:{col}'>{self._fmt_study(st, v)}</span>")
             ind.append((name, "&nbsp;&nbsp;".join(parts) or "<span style='color:#5d606b'>\u2014</span>", None))
-        rs = getattr(self, "_rsi_arr", None)
-        if "rsi" in self._enabled and rs is not None and i < len(rs):
-            ind.append((f"RSI {int(self.ind_params['rsi'].get('len', 14))}", f"{rs[i]:.2f}" if np.isfinite(rs[i]) else "\u2014", "#b388ff"))
         if ind:
             sections.append(("Indicators", ind))
         out = ["<table width='100%' cellspacing=0 cellpadding=3>"]
@@ -2402,6 +3032,20 @@ class ChartWidget(QtWidgets.QWidget):
                 out.append(f"<tr><td style='color:#787b86'>{lab}</td><td align=right>{v}</td></tr>")
         out.append("</table>")
         return "".join(out)
+
+    def market_status(self) -> str:
+        """'open' / 'pre' / 'closed' for the charted market ('' when unknown)."""
+        ex = self.exchange_tag()
+        probe = {"NSE": "X", "BSE": "BSE:X", "CRYPTO": "X-USD"}.get(ex)
+        if probe is None:
+            return ""
+        from .watchlist import market_state
+        return market_state(probe)[0]
+
+    def _market_dot(self) -> str:
+        """TradingView's market-status pill after the title ('Closed' / 'Pre-market'; nothing while open)."""
+        pill = status_pill_html(self.market_status(), settings.get().get("bg", "#000000"))
+        return f"&nbsp;&nbsp;{pill}" if pill else ""
 
     def _refresh_header(self):
         if self.df is not None and self._n():
@@ -2420,10 +3064,11 @@ class ChartWidget(QtWidgets.QWidget):
         S = settings.get()
         fp = self.fp
         m = theme.MUTED
-        v = lambda k, x: (f"<span style='color:#ffffff'>{k}</span><span style='color:{col}'>{fp(x)}</span>")  # noqa: E731
-        title = (f"<span style='font-size:16px;color:#ffffff;font-weight:500'>{self.display_name()}</span>"
-                 f"<span style='font-size:16px;color:#ffffff'> \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}</span>"
-                 f"&nbsp;&nbsp;&nbsp;") if S["sl_title"] else ""
+        v = lambda k, x: (f"<span style='color:{LEGEND_TEXT}'>{k}</span><span style='color:{col}'>{fp(x)}</span>")  # noqa: E731
+        title = (f"{legend_logo_html(self.ticker())}&nbsp;"
+                 f"<span style='font-size:16px;color:{LEGEND_TEXT}'>{self.display_name()}</span>"
+                 f"<span style='font-size:16px;color:{LEGEND_TEXT}'> \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}</span>"
+                 f"{self._market_dot()}&nbsp;&nbsp;&nbsp;") if S["sl_title"] else ""
         vals = (f"{v('O', r['Open'])}&nbsp;&nbsp;{v('H', r['High'])}&nbsp;&nbsp;{v('L', r['Low'])}&nbsp;&nbsp;{v('C', r['Close'])}"
                 if S["sl_values"] else "")
         chgt = f"&nbsp;&nbsp;<span style='color:{col}'>{d:+,.2f} ({chg:+.2f}%)</span>" if S["sl_change"] else ""
@@ -2438,15 +3083,12 @@ class ChartWidget(QtWidgets.QWidget):
         self.header.setVisible(bool(title or vals or chgt))
         vol = float(r["Volume"])
         vs = theme.fmt_vol(vol)
-        self.vol_label.setText(f"<span style='color:#ffffff'>Vol</span> <span style='color:{col}'>{vs}</span>")
-        self.vol_label.setVisible(bool(S["sl_volume"]) and not self.collapse_btn.isChecked())
-        rs = getattr(self, "_rsi_arr", None)
-        if rs is not None and i < len(rs) and np.isfinite(rs[i]):
-            self.rsi_label.setText(f"<span style='color:#ffffff'>RSI {int(self.ind_params['rsi'].get('len', 14))}</span> "
-                                   f"<span style='color:#b388ff'>{rs[i]:.2f}</span>")
+        vcol = vol_color(c >= o).name()                       # TradingView: the volume's own colour
+        self.vol_label.setText(f"<span style='color:{LEGEND_TEXT}'>Vol</span> <span style='color:{vcol}'>{vs}</span>")
+        self.vol_label.setVisible(self._show_vol_legend())
         self._update_ind_legend(i)
         hs = (self.header.height(), self.header.isHidden(), self.vol_label.isHidden(), self.ind_label.height(),
-              self.ind_label.isHidden())
+              self.ind_label.isHidden(), tuple(pn.label.height() for pn in self.panes))
         if hs != getattr(self, "_hdr_shape", None):        # only re-layout overlays when the legend's shape changed
             self._hdr_shape = hs
             self._place_overlays()

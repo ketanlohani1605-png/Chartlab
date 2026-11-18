@@ -30,15 +30,20 @@ class TVViewBox(pg.ViewBox):
     plot_item = None          # the PlotItem this ViewBox belongs to (set by the chart)
 
     def _grid_pen(self):
+        """TradingView's grid (measured on its dark theme): #303030 dots, 1 point wide, 1 point on / 3 off."""
         from . import settings
         S = settings.get()
-        key = (S.get("grid_color", "#262626"), S.get("bg", "#000000"))
+        try:
+            dpr = max(1.0, float(self.chart.glw.devicePixelRatioF()))
+        except Exception:  # noqa: BLE001
+            dpr = 1.0
+        key = (S.get("grid_color", "#303030"), dpr)
         if getattr(self, "_gp_key", None) != key:
-            c, b, a = QtGui.QColor(key[0]), QtGui.QColor(key[1]), 0.35
-            col = QtGui.QColor(int(c.red() * a + b.red() * (1 - a)), int(c.green() * a + b.green() * (1 - a)),
-                               int(c.blue() * a + b.blue() * (1 - a)))
-            pen = QtGui.QPen(col, 0)
+            pen = QtGui.QPen(QtGui.QColor(key[0]))
             pen.setCosmetic(True)
+            pen.setWidthF(dpr)                       # cosmetic widths are device pixels: 2 on Retina = 1 point
+            pen.setCapStyle(QtCore.Qt.PenCapStyle.FlatCap)
+            pen.setDashPattern([1.0, 3.0])
             self._gp, self._gp_key = pen, key
         return self._gp, S
 

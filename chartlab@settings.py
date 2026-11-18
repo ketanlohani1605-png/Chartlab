@@ -19,12 +19,12 @@ DEFAULTS = {
     "sl_title": True, "sl_values": True, "sl_change": True, "sl_volume": True, "sl_trade": True,
     "sl_ind_titles": True, "sl_ind_values": True,
     # Scales and lines
-    "countdown": True, "last_label": True, "sym_label": True, "last_line": True, "plus_button": True, "scale_right_bars": 12,
+    "settings_rev": 30, "countdown": True, "last_label": True, "sym_label": False, "last_line": True, "plus_button": True, "scale_right_bars": 12,
     "date_format": "%d %b '%y", "h24": True, "dow": True,
     # Canvas
-    "bg": "#000000", "grid_v": True, "grid_h": True, "grid_color": "#262626",
-    "crosshair": "#868993", "watermark": "Hidden", "wm_color": "#787b86",
-    "text_color": "#d1d4dc", "text_size": 12, "margin_top": 10, "margin_bottom": 8,
+    "bg": "#000000", "grid_v": True, "grid_h": True, "grid_color": "#303030",
+    "crosshair": "#9c9c9c", "crosshair_style": "dashed", "watermark": "Hidden", "wm_color": "#787b86",
+    "text_color": "#b8b8b8", "text_size": 12, "margin_top": 10, "margin_bottom": 8,
 }
 
 _cur: dict = copy.deepcopy(DEFAULTS)
@@ -36,12 +36,29 @@ def get() -> dict:
 
 
 def load(qs: QtCore.QSettings):
+    d = {}
     try:
         d = json.loads(qs.value(KEY, "{}") or "{}")
         _cur.update({k: v for k, v in d.items() if k in DEFAULTS})
     except Exception:  # noqa: BLE001
         pass
+    if int(d.get("settings_rev", 0) or 0) < SETTINGS_REV:   # once per new version: an old default that was never
+        for key, (olds, new) in _MOVED_DEFAULTS.items():    # changed by hand becomes the new default
+            if str(_cur.get(key, "")).lower() in olds:
+                _cur[key] = new
+    _cur["settings_rev"] = SETTINGS_REV                     # (a choice made after this is never touched again)
     sync_theme()
+
+
+SETTINGS_REV = 30
+
+
+# defaults that changed between versions: key -> (earlier defaults, new default). v0.30 matches TradingView's
+# measured colours: crosshair #9c9c9c, grid #303030 (dotted), scale text #b8b8b8.
+_MOVED_DEFAULTS = {"crosshair": (("#868993", "#9598a1"), "#9c9c9c"),
+                   "grid_color": (("#262626", "#2a2e39", "#1e222d", "#1a1a1a"), "#303030"),
+                   "text_color": (("#d1d4dc", "#b2b5be"), "#b8b8b8"),
+                   "sym_label": (("true",), False)}      # TradingView shows no symbol name next to the price
 
 
 def save(qs: QtCore.QSettings):
@@ -262,7 +279,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self._row(lay, "Background", [self._color("bg")])
         self._row(lay, self._cb("grid_v", "Vertical grid lines"), [self._color("grid_color")])
         self._row(lay, self._cb("grid_h", "Horizontal grid lines"), [])
-        self._row(lay, "Crosshair", [self._color("crosshair")])
+        self._row(lay, "Crosshair", [self._color("crosshair"),
+                                     self._combo("crosshair_style", [("Dashed", "dashed"), ("Dotted", "dotted"),
+                                                                     ("Solid", "solid")])])
         self._row(lay, "Watermark", [self._combo("watermark", WATERMARKS), self._color("wm_color")])
         self._head(lay, "Scales")
         self._row(lay, "Text", [self._color("text_color"), self._spin("text_size", 9, 20)])

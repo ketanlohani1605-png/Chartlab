@@ -34,7 +34,7 @@ TOOLS = [
            "source": {"type": "string"}, "path": {"type": "string", "description": "file path when source='file'"}})),
     ("get_ohlcv", "Read the most recent candles (time, open, high, low, close, volume) of a chart.",
      _obj({"panel": PANEL, "last_n": {"type": "integer", "description": "1-1000, default 100"}})),
-    ("set_indicator", "Turn a chart indicator on/off. Keys: sma20 sma50 sma200 ema20 ema50 bb rsi.",
+    ("set_indicator", "Turn a chart indicator on/off. Keys: " + " ".join(__import__("chartlab.studies", fromlist=["KEYS"]).KEYS) + ".",
      _obj({"panel": PANEL, "key": {"type": "string"}, "on": {"type": "boolean"}}, ["key"])),
     ("set_chart_style", "Chart style: candles, hollow, line or area.",
      _obj({"panel": PANEL, "style": {"type": "string"}}, ["style"])),

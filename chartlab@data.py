@@ -227,12 +227,17 @@ _PERIOD_DAYS = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365,
 _INTRADAY_LIMIT = {"1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60, "60m": 730, "90m": 60, "1h": 730}
 
 
+RENAMED = {"TATAMOTORS": "TMPV"}       # NSE symbols that changed (Tata Motors demerger, Oct 2025)
+
+
 def normalize_symbol(text: str) -> str:
     """RELIANCE -> RELIANCE.NS, BSE:TCS -> TCS.BO, NIFTY -> ^NSEI, US:AAPL -> AAPL, BTC-USD -> BTC-USD."""
     s = text.strip().upper().replace(" ", "")
     ex = None
     if ":" in s:
         ex, s = s.split(":", 1)
+    if ex in (None, "NSE", "BSE"):
+        s = RENAMED.get(s, s)
     if s in _INDEX:
         return _INDEX[s]
     if ex == "BSE":
@@ -255,6 +260,22 @@ def clamp_period(interval: str, period: str) -> str:
     return max(ok, key=lambda p: _PERIOD_DAYS[p])
 
 
+def drop_frozen(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove bars that are not trades but a stuck feed: open = high = low = close, no volume, and the same price
+    as the bar before or after. Yahoo sends NIFTY's last 15 minutes like that (one price repeated each minute) and
+    holidays as a copy of the previous close. TradingView simply has no bar there - now neither do we."""
+    if df is None or len(df) < 3:
+        return df
+    o, h, l, c = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
+    v = df["Volume"].to_numpy(float) if "Volume" in df else np.zeros(len(df))
+    flat = (o == h) & (h == l) & (l == c) & ~(v > 0)
+    prev_c = np.r_[np.nan, c[:-1]]
+    next_c = np.r_[c[1:], np.nan]
+    next_flat = np.r_[flat[1:], False]
+    frozen = flat & ((c == prev_c) | (next_flat & (c == next_c)))
+    return df[~frozen] if frozen.any() else df
+
+
 def load_yahoo(symbol: str, interval: str = "1d", period: str = "2y") -> tuple[pd.DataFrame, str]:
     try:
         import yfinance as yf
@@ -267,10 +288,10 @@ def load_yahoo(symbol: str, interval: str = "1d", period: str = "2y") -> tuple[p
         raw = yf.Ticker(sym).history(period=period, interval=interval, auto_adjust=True)
         if raw is None or raw.empty:
             raise ValueError(f"No data returned for '{sym}' ({interval}, {period}). Check the symbol / internet.")
-        df = standardise(raw)
+        df = drop_frozen(standardise(raw))
     except Exception:  # noqa: BLE001 - fall back to the last good download
         if cache.exists():
-            return pd.read_parquet(cache), f"{sym} · {interval} (offline copy)"
+            return drop_frozen(pd.read_parquet(cache)), f"{sym} · {interval} (offline copy)"
         raise
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -286,7 +307,7 @@ def peek_cache(symbol: str, interval: str = "1d", period: str = "2y"):
     f = _cache_file(sym, interval, clamp_period(interval, period))
     if not f.exists():
         return None
-    df = pd.read_parquet(f)
+    df = drop_frozen(pd.read_parquet(f))
     return (df, f"{sym} \u00b7 {interval}") if len(df) else None
 
 

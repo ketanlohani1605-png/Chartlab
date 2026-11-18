@@ -10,7 +10,7 @@ GRID = "#1a1a1a"
 GUTTER = "#1a1a1a"
 BORDER = "#2b2b2b"
 HOVER = "#262626"
-TEXT = "#d1d4dc"
+TEXT = "#dbdbdb"
 MUTED = "#787b86"
 UP = "#089981"
 DOWN = "#f23645"
@@ -21,15 +21,16 @@ LINE_COLORS = ["#f5a623", "#2196f3", "#e91e63", "#9c27b0", "#00bcd4", "#8bc34a",
 
 
 def fmt_vol(v: float) -> str:
-    """Volume the way TradingView writes it: 342.5K, 3.42M, 30.03B."""
+    """Volume the way TradingView writes it: 342.55\u202fK, 3.42\u202fM, 30.03\u202fB (a narrow no-break space before
+    the unit - copied from TradingView's own legend text)."""
     v = float(v)
     a = abs(v)
     if a >= 1e9:
-        return f"{v / 1e9:.2f}B"
+        return f"{v / 1e9:.2f}\u202fB"
     if a >= 1e6:
-        return f"{v / 1e6:.2f}M"
+        return f"{v / 1e6:.2f}\u202fM"
     if a >= 1e3:
-        return f"{v / 1e3:.2f}K"
+        return f"{v / 1e3:.2f}\u202fK"
     return f"{v:,.0f}"
 
 

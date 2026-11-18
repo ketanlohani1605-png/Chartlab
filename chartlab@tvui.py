@@ -29,7 +29,8 @@ CHIPS = ["All", "Stocks", "Indices", "Options", "Crypto", "US"]
 NAMES = {"NIFTY": "Nifty 50 Index", "BANKNIFTY": "Nifty Bank Index", "SENSEX": "S&P BSE Sensex", "FINNIFTY":
          "Nifty Financial Services", "RELIANCE": "Reliance Industries Ltd", "TCS": "Tata Consultancy Services Ltd",
          "HDFCBANK": "HDFC Bank Ltd", "INFY": "Infosys Ltd", "ICICIBANK": "ICICI Bank Ltd", "SBIN": "State Bank of India",
-         "ITC": "ITC Ltd", "LT": "Larsen & Toubro Ltd", "BHARTIARTL": "Bharti Airtel Ltd", "TATAMOTORS": "Tata Motors Ltd",
+         "ITC": "ITC Ltd", "LT": "Larsen & Toubro Ltd", "BHARTIARTL": "Bharti Airtel Ltd", "TATAMOTORS": "Tata Motors Ltd", "TMPV": "Tata Motors Passenger Vehicles Ltd",
+         "TMCV": "Tata Motors Ltd (Commercial Vehicles)",
          "TATASTEEL": "Tata Steel Ltd", "AXISBANK": "Axis Bank Ltd", "KOTAKBANK": "Kotak Mahindra Bank Ltd",
          "HINDUNILVR": "Hindustan Unilever Ltd", "BAJFINANCE": "Bajaj Finance Ltd", "MARUTI": "Maruti Suzuki India Ltd",
          "SUNPHARMA": "Sun Pharmaceutical Industries", "WIPRO": "Wipro Ltd", "HCLTECH": "HCL Technologies Ltd",

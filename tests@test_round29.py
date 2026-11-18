@@ -261,7 +261,7 @@ def _():
 @check("pane divider can be dragged to resize the RSI pane")
 def _():
     win.ind_actions["rsi"].setChecked(True); pump(80); h0 = ch.rsi.height()
-    g = ch.pane_grip; assert g.isVisible(), "no grip"; c = QtCore.QPoint(g.width() // 2, 3)
+    g = ch.panes[0].grip; assert g.isVisible(), "no grip"; c = QtCore.QPoint(g.width() // 2, 3)
     QtTest.QTest.mousePress(g, B.LeftButton, M.NoModifier, c); pump(20)
     for dy in (-20, -40, -60):
         q = QtCore.QPoint(c.x(), c.y() + dy)

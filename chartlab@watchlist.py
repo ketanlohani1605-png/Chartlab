@@ -3,6 +3,8 @@ Chg%, and a detail card for the selected symbol. Click a row to open it in the a
 from __future__ import annotations
 
 import json
+
+import pandas as pd
 import time
 import zlib
 
@@ -13,7 +15,7 @@ from . import icons
 from . import theme
 
 DEFAULT_WATCHLIST = ["NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
-                     "SBIN", "ITC", "LT", "BHARTIARTL", "TATAMOTORS"]
+                     "SBIN", "ITC", "LT", "BHARTIARTL", "TMPV"]
 INDICES = {"NIFTY", "NIFTY50", "BANKNIFTY", "NIFTYBANK", "SENSEX", "FINNIFTY", "MIDCPNIFTY", "NIFTYIT", "INDIAVIX"}
 LOGO_COLORS = ["#2962ff", "#089981", "#f23645", "#ff9800", "#9c27b0", "#00bcd4", "#e91e63", "#4caf50", "#795548",
                "#607d8b"]
@@ -179,12 +181,137 @@ class QuoteDelegate(QtWidgets.QStyledItemDelegate):
         p.restore()
 
 
-class RangeBar(QtWidgets.QWidget):
-    """Day's range: low ———●——— high."""
+def market_state(sym: str, now=None) -> tuple[str, str]:
+    """('open' | 'pre' | 'closed', text) for TradingView's market-status line. NSE / BSE 09:15-15:30 IST Mon-Fri
+    (pre-open from 09:00), US 09:30-16:00 New York, crypto always. Exchange holidays are not known here."""
+    import datetime as _dt
+    ex = exchange_of(sym)
+    if ex == "CRYPTO":
+        return "open", "Market open \u00b7 24/7"
+    utc = _dt.datetime.now(_dt.timezone.utc) if now is None else now
+    if ex == "NASDAQ":
+        try:
+            from zoneinfo import ZoneInfo
+            t = utc.astimezone(ZoneInfo("America/New_York"))
+        except Exception:  # noqa: BLE001 - no tz database: rough EST
+            t = utc - _dt.timedelta(hours=5)
+        if t.weekday() < 5 and _dt.time(9, 30) <= t.time() < _dt.time(16, 0):
+            return "open", "Market open"
+        return "closed", "Market closed"
+    t = utc + _dt.timedelta(hours=5, minutes=30)
+    if t.weekday() < 5:
+        if _dt.time(9, 15) <= t.time() < _dt.time(15, 30):
+            return "open", "Market open"
+        if _dt.time(9, 0) <= t.time() < _dt.time(9, 15):
+            return "pre", "Pre-open session"
+    return "closed", "Market closed"
+
+
+STATE_COLOR = {"open": "#089981", "pre": "#ff9800", "closed": "#787b86"}
+
+
+class PerfWorker(QtCore.QObject):
+    """One year of daily bars for the selected symbol: 52-week range and the 1W ... 1Y performance tiles.
+    Runs on a plain daemon thread (quitting while it downloads must never abort the app)."""
+    done = QtCore.Signal(str, dict)
+
+    def __init__(self, sym, parent=None):
+        super().__init__(parent)
+        self.sym = sym
+        self._t = None
+
+    def start(self):
+        import threading
+        self._t = threading.Thread(target=self.run, daemon=True)
+        self._t.start()
+
+    def isRunning(self) -> bool:
+        return self._t is not None and self._t.is_alive()
+
+    def run(self):
+        try:
+            import yfinance as yf
+            h = yf.Ticker(datamod.normalize_symbol(self.sym)).history(period="1y", interval="1d", auto_adjust=False)
+            h = h.dropna(subset=["Close"])
+            if h.empty:
+                return
+            c = h["Close"]
+            last, t_last = float(c.iloc[-1]), c.index[-1]
+
+            def ago(days=None, ytd=False):
+                cut = (t_last.normalize().replace(month=1, day=1) if ytd else t_last - pd.Timedelta(days=days))
+                before = c[c.index <= cut]
+                base = float(before.iloc[-1]) if len(before) else float(c.iloc[0])
+                return (last / base - 1) * 100 if base else None
+            perf = {"1W": ago(7), "1M": ago(30), "3M": ago(91), "6M": ago(182), "YTD": ago(ytd=True), "1Y": ago(365)}
+            self.done.emit(self.sym, {"perf": perf, "hi52": float(h["High"].max()), "lo52": float(h["Low"].min()),
+                                      "avgvol": float(h["Volume"].tail(30).mean()), "t": time.time()})
+        except Exception:  # noqa: BLE001 - extra details are optional
+            return
+
+
+class PerfTiles(QtWidgets.QWidget):
+    """TradingView's 'Performance' squares: 1W 1M 3M / 6M YTD 1Y, green or red by how much it moved."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.perf = None
+        self.setFixedHeight(118)
+
+    def set_perf(self, perf):
+        self.perf = perf
+        self.setVisible(bool(perf))
+        self.update()
+
+    def paintEvent(self, _ev):
+        if not self.perf:
+            return
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        f = self.font()
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(QtGui.QColor(theme.MUTED))
+        p.drawText(QtCore.QRect(0, 0, self.width(), 16), QtCore.Qt.AlignmentFlag.AlignLeft, "Performance")
+        keys = ["1W", "1M", "3M", "6M", "YTD", "1Y"]
+        gap, top = 6, 22
+        w = (self.width() - 2 * gap) / 3
+        h = (self.height() - top - gap) / 2
+        for k, key in enumerate(keys):
+            v = self.perf.get(key)
+            r = QtCore.QRectF((k % 3) * (w + gap), top + (k // 3) * (h + gap), w, h)
+            if v is None:
+                col, txtc = QtGui.QColor("#1e222d"), QtGui.QColor("#787b86")
+            else:
+                base = QtGui.QColor(theme.UP if v >= 0 else theme.DOWN)
+                a = min(0.18 + abs(v) / 25.0, 0.55)
+                bg = QtGui.QColor("#000000")
+                col = QtGui.QColor(int(base.red() * a + bg.red() * (1 - a)), int(base.green() * a + bg.green() * (1 - a)),
+                                   int(base.blue() * a + bg.blue() * (1 - a)))
+                txtc = QtGui.QColor(theme.UP if v >= 0 else theme.DOWN).lighter(130)
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(r, 6, 6)
+            f.setPixelSize(14)
+            f.setWeight(QtGui.QFont.Weight.DemiBold)
+            p.setFont(f)
+            p.setPen(txtc)
+            p.drawText(r.adjusted(0, 6, 0, -h / 2 + 4), QtCore.Qt.AlignmentFlag.AlignCenter,
+                       "\u2014" if v is None else f"{v:+.2f}%")
+            f.setPixelSize(11)
+            f.setWeight(QtGui.QFont.Weight.Normal)
+            p.setFont(f)
+            p.setPen(QtGui.QColor("#9598a1"))
+            p.drawText(r.adjusted(0, h / 2, 0, -4), QtCore.Qt.AlignmentFlag.AlignCenter, key)
+
+
+class RangeBar(QtWidgets.QWidget):
+    """Day's range: low ———●——— high."""
+
+    def __init__(self, parent=None, title: str = "Day's range"):
+        super().__init__(parent)
         self.setFixedHeight(42)
+        self.title = title
         self.lo = self.hi = self.cur = None
 
     def set_range(self, lo, hi, cur):
@@ -201,7 +328,7 @@ class RangeBar(QtWidgets.QWidget):
         f.setPixelSize(12)
         p.setFont(f)
         p.setPen(QtGui.QColor(theme.MUTED))
-        p.drawText(QtCore.QRect(0, 0, w, 14), QtCore.Qt.AlignmentFlag.AlignLeft, "Day's range")
+        p.drawText(QtCore.QRect(0, 0, w, 14), QtCore.Qt.AlignmentFlag.AlignLeft, self.title)
         p.setPen(QtGui.QColor("#dbdbdb"))
         p.drawText(QtCore.QRect(0, 26, w, 16), QtCore.Qt.AlignmentFlag.AlignLeft, f"{self.lo:,.2f}")
         p.drawText(QtCore.QRect(0, 26, w, 16), QtCore.Qt.AlignmentFlag.AlignRight, f"{self.hi:,.2f}")
@@ -247,11 +374,23 @@ class SymbolCard(QtWidgets.QFrame):
         self.when.setStyleSheet(f"color:{theme.MUTED}; font-size:12px;")
         v.addWidget(self.when)
         v.addSpacing(6)
+        self.state = QtWidgets.QLabel("")
+        self.state.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        v.addWidget(self.state)
+        v.addSpacing(6)
         self.range = RangeBar()
         v.addWidget(self.range)
+        self.range52 = RangeBar(title="52 week range")
+        v.addWidget(self.range52)
         self.vol = QtWidgets.QLabel("")
         self.vol.setTextFormat(QtCore.Qt.TextFormat.RichText)
         v.addWidget(self.vol)
+        v.addSpacing(6)
+        self.tiles = PerfTiles()
+        self.tiles.hide()
+        v.addWidget(self.tiles)
+        self.details: dict = {}                            # sym -> {perf, hi52, lo52, avgvol, t}
+        self._perf_job = None
 
     def show_symbol(self, sym: str | None, q, ex: dict | None):
         if not sym:
@@ -269,6 +408,10 @@ class SymbolCard(QtWidgets.QFrame):
         self.title.setText(sym.split(":")[-1])
         cur = "USD" if exchange_of(sym) in ("NASDAQ", "CRYPTO") else "INR"
         self.sub.setText(f"{group_of(sym).title()}  •  {exchange_of(sym)}")
+        st, text = market_state(sym)
+        self.state.setText(f"<span style='color:{STATE_COLOR[st]};font-size:13px'>\u25cf</span>"
+                           f"<span style='color:#d1d4dc;font-size:12px'>&nbsp;{text}</span>")
+        self._show_details(sym, q)
         if not q:
             self.price.setText(f"<span style='color:{theme.MUTED};font-size:13px'>Prices not loaded yet - "
                                "press ↻ above</span>")
@@ -292,6 +435,40 @@ class SymbolCard(QtWidgets.QFrame):
         else:
             self.range.set_range(None, None, None)
             self.vol.setText("")
+
+    def _show_details(self, sym, q):
+        d = self.details.get(sym)
+        if d is None or time.time() - d.get("t", 0) > 1800:
+            self._fetch_details(sym)
+        if d is None:
+            self.range52.set_range(None, None, None)
+            self.range52.setVisible(False)
+            self.tiles.set_perf(None)
+            return
+        last = q[0] if q else None
+        lo, hi = d["lo52"], d["hi52"]
+        if last:
+            lo, hi = min(lo, last), max(hi, last)
+        self.range52.setVisible(True)
+        self.range52.set_range(lo, hi, last if last else hi)
+        self.tiles.set_perf(d["perf"])
+
+    def _fetch_details(self, sym):
+        if self._perf_job is not None and self._perf_job.isRunning():
+            return
+        job = PerfWorker(sym, self)
+        self._perf_job = job
+        job.done.connect(self._details_in)
+        job.start()
+
+    def _details_in(self, sym, d):
+        self.details[sym] = d
+        if self.title.text() == sym.split(":")[-1]:
+            par = self.parent()
+            while par is not None and not hasattr(par, "_update_card"):
+                par = par.parent()
+            if par is not None:
+                par._update_card()
 
 
 class WatchlistWidget(QtWidgets.QWidget):
@@ -534,6 +711,24 @@ class WatchlistWidget(QtWidgets.QWidget):
         if cur is not None and cur.data(ROLE_SYM) == sym:
             self._update_card()
 
+    def chart_price(self, sym: str, last: float, prev: float | None):
+        """The chart of this symbol just got new bars: its row shows the same price as the chart (no stale quote)."""
+        if sym not in self.symbols() or not last:
+            return
+        ex = self.extra.setdefault(sym, {})
+        if prev:
+            ex["prev"] = float(prev)
+        pv = ex.get("prev")
+        self.quotes[sym] = (float(last), (last / pv - 1) if pv else 0.0)
+        ex["time"] = time.strftime("%H:%M")
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if not it.data(ROLE_SECTION) and it.data(ROLE_SYM) == sym:
+                it.setData(ROLE_QUOTE, self.quotes[sym])
+        cur = self.list.currentItem()
+        if cur is not None and cur.data(ROLE_SYM) == sym:
+            self._update_card()
+
     def _quotes_failed(self, msg):
         self.refresh_btn.setEnabled(True)
         self.status.setText("Could not fetch prices: " + msg)
@@ -547,6 +742,14 @@ class WatchlistWidget(QtWidgets.QWidget):
     def loads(text) -> list[str]:
         try:
             v = json.loads(text)
-            return [str(x).upper() for x in v] if isinstance(v, list) and v else list(DEFAULT_WATCHLIST)
+            out = [str(x).upper() for x in v] if isinstance(v, list) and v else list(DEFAULT_WATCHLIST)
         except Exception:  # noqa: BLE001
-            return list(DEFAULT_WATCHLIST)
+            out = list(DEFAULT_WATCHLIST)
+        ren = datamod.RENAMED                           # symbols the exchange renamed (TATAMOTORS -> TMPV)
+        seen, fixed = set(), []
+        for x in out:
+            y = ren.get(x, x)
+            if y not in seen:
+                seen.add(y)
+                fixed.append(y)
+        return fixed
