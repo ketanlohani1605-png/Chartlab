@@ -63,8 +63,13 @@ jobs:
           name: ChartLab-mac-m1
           path: ChartLab-*.zip
 
-  build-intel:
-    runs-on: macos-15-intel
+  # Windows: allowed to fail without holding back the Mac release (the release publishes what was built)
+  build-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: Restore folders (files were uploaded flat, @ means folder)
@@ -75,47 +80,35 @@ jobs:
             mkdir -p "$(dirname "$t")"
             mv "$f" "$t"
           done
-          ls -R . | head -60
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller pillow
       - name: Test core
         run: python tests/test_core.py
-      - name: Build ChartLab.app
+      - name: Build ChartLab.exe
         run: |
           pyinstaller --noconfirm --windowed --name ChartLab \
-            --osx-bundle-identifier com.chartlab.app \
             --add-data "strategies:strategies" \
             --add-data "providers:providers" \
             --add-data "assets:assets" \
-            --icon assets/icon.icns \
+            --icon assets/logo.png \
             --collect-submodules chartlab \
             --collect-submodules yfinance \
             --collect-submodules pyqtgraph --collect-data pyqtgraph \
             main.py
-      - name: Stamp the version into the app and sign it again
+      - name: Open the real window (no screen), load bars, run a strategy
         run: |
           V=$(python -c "import chartlab; print(chartlab.__version__)")
           echo "VERSION=$V" >> "$GITHUB_ENV"
-          P=dist/ChartLab.app/Contents/Info.plist
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $V" "$P" || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $V" "$P"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $V" "$P" || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $V" "$P"
-          codesign --force --deep --sign - dist/ChartLab.app
-          codesign --verify --deep dist/ChartLab.app
-      - name: Check the built app starts in MCP mode
-        run: |
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}' | dist/ChartLab.app/Contents/MacOS/ChartLab --mcp | head -c 300
-      - name: Open the real window (no screen), load bars, run a strategy
-        run: |
-          dist/ChartLab.app/Contents/MacOS/ChartLab --version
-          dist/ChartLab.app/Contents/MacOS/ChartLab --selftest
+          dist/ChartLab/ChartLab.exe --selftest
       - name: Zip app
-        run: ditto -c -k --keepParent dist/ChartLab.app "ChartLab-${VERSION}-mac-intel.zip"
+        shell: pwsh
+        run: Compress-Archive -Path dist/ChartLab -DestinationPath "ChartLab-$env:VERSION-windows.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: ChartLab-mac-intel
+          name: ChartLab-windows
           path: ChartLab-*.zip

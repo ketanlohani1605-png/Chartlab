@@ -1,6 +1,6 @@
 name: Publish update
 
-# After every Mac build: the zip becomes a GitHub release. ChartLab looks at the newest release by itself and
+# After every build: the Mac (Apple silicon) and Windows zips become a GitHub release. ChartLab looks at the newest release by itself and
 # offers 'Restart to update' (like TradingView) - no more downloading from the Actions page.
 on:
   workflow_run:
@@ -16,13 +16,13 @@ jobs:
     if: github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
     steps:
-      - name: Get the Mac apps that build made
+      - name: Get the apps that build made
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
-          pattern: ChartLab-mac-*
+          pattern: ChartLab-*
           merge-multiple: true
           path: dl
       - name: Publish them as a release
