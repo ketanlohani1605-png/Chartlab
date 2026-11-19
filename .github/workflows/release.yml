@@ -1,0 +1,39 @@
+name: Publish update
+
+# After every Mac build: the zip becomes a GitHub release. ChartLab looks at the newest release by itself and
+# offers 'Restart to update' (like TradingView) - no more downloading from the Actions page.
+on:
+  workflow_run:
+    workflows: ["Build Mac app"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    if: github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the Mac apps that build made
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          pattern: ChartLab-mac-*
+          merge-multiple: true
+          path: dl
+      - name: Publish them as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ls -la dl || true
+          ZIP=$(ls dl/ChartLab-*-mac-m1.zip 2>/dev/null | head -1)
+          if [ -z "$ZIP" ]; then echo "No Apple Silicon app in this build - nothing to publish."; exit 0; fi
+          V=$(basename "$ZIP" | sed -E 's/^ChartLab-(.+)-mac-m1\.zip$/\1/')
+          gh release view "v$V" >/dev/null 2>&1 || gh release create "v$V" --title "ChartLab $V" --notes "ChartLab $V" --target "$SHA"
+          gh release upload "v$V" dl/ChartLab-*.zip --clobber
