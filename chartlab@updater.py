@@ -46,6 +46,9 @@ def why_not() -> str:
     """'' when this copy can replace itself, else the reason in plain words."""
     b = app_bundle()
     if b is None:
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            return (f"On Windows: download ChartLab-<version>-windows.zip from github.com/{REPO}/releases, unzip it "
+                    "and run ChartLab.exe (your charts and settings stay).")
         return "Updates work in the Mac app (this copy runs from source code)."
     if "/AppTranslocation/" in str(b):
         return ("macOS is running ChartLab from a temporary place. Move ChartLab into the Applications folder, "
@@ -64,7 +67,12 @@ def check(current: str = __version__, timeout: float = 12.0) -> dict | None:
     ver = str(rel.get("tag_name", "")).lstrip("vV")
     if not ver or parse(ver) <= parse(current):
         return None
-    want = "mac-m1" if platform.machine().lower() in ("arm64", "aarch64") else "mac-intel"
+    if sys.platform == "win32":
+        want = "windows"
+    elif platform.machine().lower() in ("arm64", "aarch64"):
+        want = "mac-m1"
+    else:                                 # Intel Macs: there has been no Intel build since 0.34.2
+        want = "mac-intel"
     for a in rel.get("assets", []):
         if want in a.get("name", "") and a.get("name", "").endswith(".zip"):
             return {"version": ver, "url": a["browser_download_url"], "size": int(a.get("size", 0)), "name": a["name"],

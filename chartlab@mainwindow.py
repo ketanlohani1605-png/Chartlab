@@ -1863,6 +1863,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ready = getattr(self, "_upd_ready", None)
         if ready and ready[0] == info["version"]:              # already fetched: the pill is waiting
             return
+        from . import updater as _u
+        if sys.platform == "win32":                            # the Windows app cannot replace itself: say where to get it
+            self._upd_last = f"ChartLab {info['version']} is available. " + _u.why_not()
+            if manual:
+                self.statusBar().showMessage(self._upd_last, 15000)
+            return
         self._upd_info, self._upd_ready = info, None
         # TradingView: the new version is fetched quietly in the background; the button appears once it is ready
         self._fetch_update(info, quiet=not manual)
