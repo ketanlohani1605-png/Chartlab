@@ -142,13 +142,15 @@ ov.reject()
 # ---------------------------------------------------------------- 6) automatic renewal (only when switched on)
 from chartlab.mainwindow import MainWindow, quit_cleanly
 HOURS["1100000001"] = 3.0                                                # Papa's token is now close to its end
-w = MainWindow(QtCore.QSettings(str(tmp / "s.ini"), QtCore.QSettings.Format.IniFormat))
+_qs = QtCore.QSettings(str(tmp / "s.ini"), QtCore.QSettings.Format.IniFormat)
+_qs.setValue("auto_renew", "false")                                      # (on by default since 0.34)
+w = MainWindow(_qs)
 w.show()
 n0 = len(renewed)
 w.acct_poller.refresh()
 assert wait(lambda: A.STATUS.get("Papa", {}).get("state") == "expiring")
 pump(300)
-assert len(renewed) == n0 and A.load_accounts()[0]["access_token"] == tok("c1")       # off by default: nothing happens
+assert len(renewed) == n0 and A.load_accounts()[0]["access_token"] == tok("c1")       # switched off: nothing happens
 w.settings.setValue("auto_renew", "true")
 w.acct_poller.refresh()
 assert wait(lambda: "new" in A.load_accounts()[0]["access_token"]), renewed

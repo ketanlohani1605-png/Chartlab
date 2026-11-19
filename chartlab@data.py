@@ -282,6 +282,11 @@ def load_yahoo(symbol: str, interval: str = "1d", period: str = "2y") -> tuple[p
     except ImportError as e:  # pragma: no cover
         raise ImportError("yfinance is not installed. Run: pip install yfinance") from e
     sym = normalize_symbol(symbol)
+    from . import timeframes as TF
+    if interval not in TF.YAHOO and TF.valid(interval):       # 3m, 45m, 4h, 3D ... built from what Yahoo has
+        base = TF.base_for(interval, TF.YAHOO)
+        df, _label = load_yahoo(symbol, base, period)
+        return TF.resample(df, interval), f"{sym} \u00b7 {interval}"
     period = clamp_period(interval, period)
     cache = _cache_file(sym, interval, period)
     try:

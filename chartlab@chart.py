@@ -3451,6 +3451,12 @@ class ChartWidget(QtWidgets.QWidget):
         return tag
 
     def _interval_tag(self) -> str:
+        from . import timeframes as TF
+        for part in str(getattr(self, "label", "")).replace("[", "\u00b7 ").replace("]", "").split("\u00b7")[1:3]:
+            code = part.strip().lower()
+            if TF.valid(code):                               # the interval that was asked for (45m, 4h, 3D, 2W, 3M)
+                n, u = TF.split(code)
+                return f"{n}" if u == "m" else TF.legend(code)
         sec = float(np.median(np.diff(self.df.index.values[-50:]).astype("timedelta64[s]").astype(float)))
         if sec < 3600:
             return f"{max(int(round(sec / 60)), 1)}"          # TradingView's legend: 'Reliance … · 5 · NSE'

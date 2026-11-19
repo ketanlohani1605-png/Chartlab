@@ -1177,6 +1177,52 @@ def _save_fields(name: str, fields: dict, path: Path | None = None):
     save_accounts(accts, path)
 
 
+def auto_login_way(a: dict) -> str:
+    """How this saved account can get a fresh login by itself: 'renew', 'totp', or '' (the broker wants a login in
+    the browser every day: Zerodha, Upstox, or missing PIN / TOTP key)."""
+    bid = a.get("broker")
+    if bid in (None, "paper"):
+        return ""
+    try:
+        caps = _brokers.cls_of(bid).caps
+    except Exception:  # noqa: BLE001
+        return ""
+    if "login_totp" in caps and a.get("pin") and a.get("totp_secret") and (a.get("client_id") or a.get("client_code")):
+        return "totp"
+    if "renew" in caps and a.get("access_token"):
+        if bid == "fyers" and not (a.get("refresh_token") and a.get("pin")):
+            return ""
+        if bid == "angel" and not a.get("refresh_token"):
+            return ""
+        return "renew"
+    return ""
+
+
+def auto_login(name: str, path: Path | None = None, expired: bool = False) -> str:
+    """A fresh login for one saved account without anyone typing: the broker's own renewal while the login still
+    works, else PIN + the saved TOTP key (Dhan, Angel One). Saves the new token. -> message for the user."""
+    a = next((x for x in load_accounts(path) if x["name"] == name), None)
+    if a is None:
+        raise KeyError(name)
+    way = auto_login_way(a)
+    if not way:
+        raise RuntimeError(f"{BROKERS.get(a.get('broker'), a.get('broker'))} needs a login in the browser: Accounts \u2192 Log in")
+    errors = []
+    if not expired and "renew" in _brokers.cls_of(a["broker"]).caps and a.get("access_token"):
+        try:
+            if a["broker"] == "dhan":
+                return renew_saved(name, path)
+            _save_fields(name, _brokers.cls_of(a["broker"])(dict(a)).renew(), path)
+            return f"{name}: login renewed"
+        except Exception as e:  # noqa: BLE001 - the renewal was refused: the TOTP way is next
+            errors.append(str(e)[:120])
+    if way == "totp":
+        b = _brokers.cls_of(a["broker"])(dict(a))
+        _save_fields(name, b.login_totp(a.get("pin", ""), ""), path)
+        return f"{name}: logged in again with the saved TOTP key"
+    raise RuntimeError(errors[0] if errors else "this login cannot be renewed")
+
+
 class _Job(QtCore.QThread):
     done = QtCore.Signal(object)
     failed = QtCore.Signal(str)

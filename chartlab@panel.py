@@ -128,21 +128,20 @@ class ChartPanel(QtWidgets.QFrame):
     def load(self, source: str, symbol: str, interval: str, rng: str, path: str = "", quiet: bool = False):
         self._prev_params = dict(self.params)
         self.params = {"source": source, "symbol": symbol, "interval": interval, "range": rng, "path": path}
+        from . import timeframes as TF
         if source == "file":
             fn = lambda: self._load_local(path, interval)  # noqa: E731
-        elif source == "auto":
-            fn = lambda: self._load_auto(symbol, interval, rng)  # noqa: E731
-        elif source == "yahoo" and self._is_option(symbol):
-            fn = lambda: self._load_auto(symbol, interval, rng)  # noqa: E731 - Yahoo has no NSE options
+        elif source == "auto" or (source == "yahoo" and self._is_option(symbol)):   # (Yahoo has no NSE options)
+            fn = lambda: TF.load(self._load_auto, symbol, interval, rng)  # noqa: E731
         elif source == "yahoo":
             fn = lambda: datamod.load_yahoo(symbol, interval, rng)  # noqa: E731
         elif source.startswith("provider:"):
             name = source.split(":", 1)[1]
-            fn = lambda: datamod.load_provider(name, symbol, interval, rng)  # noqa: E731
+            fn = lambda: TF.load(lambda s, i, r: datamod.load_provider(name, s, i, r), symbol, interval, rng)  # noqa: E731
         elif source.startswith("api:"):
             from . import accounts
             acct = source.split(":", 1)[1]
-            fn = lambda: accounts.load_api(acct, symbol, interval, rng)  # noqa: E731
+            fn = lambda: TF.load(lambda s, i, r: accounts.load_api(acct, s, i, r), symbol, interval, rng)  # noqa: E731
         else:
             self._fail(f"Unknown data source '{source}'")
             return
@@ -233,13 +232,24 @@ class ChartPanel(QtWidgets.QFrame):
         self.df, self.label, self.result, self.signals = df, label, None, None
         self._canon(label)
         self._tick, self._day_vol, self._live_bars = None, None, set()
+        self._tf_state(df)
         self.chart.set_data(df, label)
         self.last_error = ""
         self.load_event.set()
         self.loadFinished.emit(self)
 
+    def _tf_state(self, df):
+        """How many trading days the newest bar of an N-day chart already holds (so a tick knows when to open a bar)."""
+        at = getattr(df, "attrs", {}) or {}
+        if "tf_days" in at:
+            self._tf_days, self._tf_last_day = int(at["tf_days"]), at.get("tf_last_day")
+        elif not getattr(self, "_live_bars", None):
+            self._tf_days, self._tf_last_day = 1, (df.index[-1].normalize() if df is not None and len(df) else None)
+
     def _apply_refresh(self, df, label):
         old, ch = self.df, self.chart
+        if not (getattr(self, "_live_bars", None) and "tf_days" not in (getattr(df, "attrs", {}) or {})):
+            self._tf_state(df)
         try:
             same = (len(df) == len(old) and df.index[-1] == old.index[-1]
                     and bool((df.iloc[-1] == old.iloc[-1]).all()))
@@ -299,7 +309,7 @@ class ChartPanel(QtWidgets.QFrame):
         m = re.fullmatch(r"(\d+)(m|h)", iv)
         if m:
             return int(m[1]) * (60.0 if m[2] == "m" else 3600.0)
-        if iv in ("1d", "1wk", "1mo"):
+        if re.fullmatch(r"\d+(d|wk|mo)", iv):
             return 0.0
         s = self.chart.bar_seconds()
         return s if 0 < s < 80000 else 0.0
@@ -307,6 +317,7 @@ class ChartPanel(QtWidgets.QFrame):
     def on_tick(self, ltp: float, t: float | None, day_volume: float | None = None) -> str:
         """One live price. t = trade time as seconds on the chart's own (exchange wall-clock) time axis, or None.
         -> 'same' (newest bar changed), 'new' (a bar was added), '' (ignored)."""
+        from . import timeframes as TF
         ch = self.chart
         df = self.df
         if (df is None or not len(df) or self.loading or ch.replay["active"] or ch.candles is None
@@ -322,21 +333,30 @@ class ChartPanel(QtWidgets.QFrame):
         new_t = None
         if t is not None:
             if step > 0:
-                k = int((t - last_t) // step)
-                if k >= 1:
-                    new_t = last_t + k * step
+                anc = getattr(self, "_anchor", None)
+                if anc is None or anc[0] is not df.index:
+                    anc = self._anchor = (df.index, TF.anchor(df.index))
+                start = TF.bar_start(t, step, anc[1])
+                if start > last_t + 1e-6:
+                    new_t = start                            # bars are counted from the session's start (09:15)
                 elif t < last_t - step:
                     return ""                                # an old trade: not this bar
             else:
                 a, b = pd.Timestamp(t, unit="s"), df.index[-1]
-                if iv == "1wk":
-                    newer = a.normalize() > b.normalize() and a.isocalendar()[:2] != b.isocalendar()[:2]
-                elif iv == "1mo":
-                    newer = (a.year, a.month) > (b.year, b.month)
+                code = iv if TF.valid(iv) else "1d"
+                seen = getattr(self, "_tf_last_day", None)
+                if seen is not None and a.normalize() <= seen:
+                    newer = False
+                elif TF.same_period(b, a, code, int(getattr(self, "_tf_days", 1) or 1)):
+                    newer = False
+                    if a.normalize() > (seen if seen is not None else b.normalize()):
+                        self._tf_days = int(getattr(self, "_tf_days", 1) or 1) + 1      # one more day in this bar
+                        self._tf_last_day = a.normalize()
                 else:
-                    newer = a.normalize() > b.normalize()
+                    newer = True
                 if newer:
                     new_t = float(a.normalize().value // 10 ** 9)
+                    self._tf_days, self._tf_last_day = 1, a.normalize()
         self._tick = (time.time(), float(ltp))
         if new_t is None:
             vol = float(ch._vols[-1]) + add if add else None

@@ -69,6 +69,11 @@ def sync_theme():
     theme.UP, theme.DOWN = _cur["up"], _cur["down"]
 
 
+def datamod_dir() -> str:
+    from . import data as datamod
+    return str(datamod.DATA_DIR / "downloads")
+
+
 class ColorBtn(QtWidgets.QPushButton):
     changed = QtCore.Signal(str)
 
@@ -130,7 +135,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.stack = QtWidgets.QStackedWidget()
         from . import icons
         for name, ico, builder in (("Symbol", "candles_icon", self._symbol), ("Status line", "menu", self._status),
-                                   ("Scales and lines", "measure", self._scales), ("Canvas", "rect", self._canvas)):
+                                   ("Scales and lines", "measure", self._scales), ("Canvas", "rect", self._canvas),
+                                   ("Updates", "gear", self._updates), ("Data", "candles_icon", self._data)):
             self.tabs.addItem(QtWidgets.QListWidgetItem(icons.get(ico, "#dbdbdb"), "  " + name))
             page = QtWidgets.QWidget()
             lay = QtWidgets.QVBoxLayout(page)
@@ -291,6 +297,159 @@ class SettingsDialog(QtWidgets.QDialog):
             u = QtWidgets.QLabel(unit)
             u.setStyleSheet("color:#9598a1;")
             self._row(lay, lab, [self._spin(key, lo, hi), u])
+
+    UPDATES_TAB = 4
+
+    def _updates(self, lay):
+        """The app's version and its updates, in Settings (TradingView Desktop keeps them with the app's settings)."""
+        from . import __version__
+        win = self.parent()
+        self._head(lay, "ChartLab")
+        ver = QtWidgets.QLabel(f"Version {getattr(win, 'version', __version__)}")
+        ver.setStyleSheet("font-size:20px;font-weight:600;color:#ffffff;")
+        lay.addWidget(ver)
+        self.upd_state = QtWidgets.QLabel("")
+        self.upd_state.setWordWrap(True)
+        self.upd_state.setStyleSheet("color:#9598a1;")
+        lay.addWidget(self.upd_state)
+        row = QtWidgets.QHBoxLayout()
+        self.upd_check = QtWidgets.QPushButton("Check for updates")
+        self.upd_go = QtWidgets.QPushButton("Restart to update")
+        self.upd_go.setObjectName("ok")
+        self.upd_go.hide()
+        row.addWidget(self.upd_check)
+        row.addWidget(self.upd_go)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._head(lay, "Automatic updates")
+        auto = QtWidgets.QCheckBox("Check for a new version when ChartLab starts, and every few hours")
+        qs = getattr(win, "settings", None)
+        auto.setChecked(qs is None or qs.value("auto_update", "true") != "false")
+        if qs is not None:
+            auto.toggled.connect(lambda on: qs.setValue("auto_update", "true" if on else "false"))
+        lay.addWidget(auto)
+        self.upd_auto = auto
+        note = QtWidgets.QLabel("A new version is downloaded in the background and checked; nothing changes until you "
+                                "click Restart to update. Your charts, drawings and settings stay.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#787b86;font-size:12px;")
+        lay.addWidget(note)
+        if hasattr(win, "check_updates"):
+            self.upd_check.clicked.connect(lambda: win.check_updates(True))
+            self.upd_go.clicked.connect(lambda: (self.reject(), win.start_update()))
+            self._upd_timer = QtCore.QTimer(self)
+            self._upd_timer.timeout.connect(self._upd_tick)
+            self._upd_timer.start(250)
+            self._upd_tick()
+        else:
+            self.upd_check.setEnabled(False)
+
+    DATA_TAB = 5
+
+    def _data(self, lay):
+        """What ChartLab does by itself once a broker account is connected: fresh logins, daily data, the option
+        archive. (App settings: saved at once, not part of the chart template.)"""
+        win = self.parent()
+        qs = getattr(win, "settings", None)
+        if qs is None or not hasattr(win, "option_archive_settings"):
+            lay.addWidget(QtWidgets.QLabel("Open Settings from the main window to change these."))
+            return
+        from . import optstore
+
+        def flag(key, default, text, after=None):
+            c = QtWidgets.QCheckBox(text)
+            c.setChecked(qs.value(key, default) == "true")
+
+            def put(on):
+                qs.setValue(key, "true" if on else "false")
+                if after:
+                    after(on)
+            c.toggled.connect(put)
+            lay.addWidget(c)
+            return c
+
+        def small(text):
+            n = QtWidgets.QLabel(text)
+            n.setWordWrap(True)
+            n.setStyleSheet("color:#787b86;font-size:12px;")
+            lay.addWidget(n)
+
+        self._head(lay, "Broker login")
+        self.d_renew = flag("auto_renew", "true", "Keep broker logins fresh automatically", win.set_auto_renew)
+        small("Dhan: the token is renewed before its 24 hours end; with PIN + TOTP key saved in the account, ChartLab "
+              "also logs in again by itself after it has ended. Angel One and Fyers the same way. Zerodha and Upstox "
+              "want a login in the browser every morning (their rule).")
+        self._head(lay, "Daily data")
+        self.d_daily = flag("daily_download", "true", "Save daily candles of the whole watchlist every day",
+                            lambda on: win._daily_download() if on else None)
+        small(f"Kept in {datamod_dir()} and used first by source Auto.")
+        self._head(lay, "Option archive")
+        self.d_opt = flag("opt_archive", "true", "Save every day the 1-minute history of the options around the money")
+        cfg = win.option_archive_settings()
+        self.d_unds = QtWidgets.QLineEdit(", ".join(cfg["underlyings"]))
+        self.d_unds.setStyleSheet("QLineEdit{background:#1e1e1e;border:1px solid #4a4a4a;border-radius:6px;"
+                                  "padding:5px 10px;color:#dbdbdb;font-size:14px;}")
+        self.d_unds.setMinimumWidth(260)
+        self.d_unds.editingFinished.connect(lambda: qs.setValue("opt_underlyings", self.d_unds.text().upper()))
+        self._row(lay, "Names", [self.d_unds])
+        self.d_width = QtWidgets.QSpinBox()
+        self.d_width.setRange(1, 60)
+        self.d_width.setValue(cfg["width"])
+        self.d_width.valueChanged.connect(lambda v: qs.setValue("opt_width", int(v)))
+        self._row(lay, "Strikes each side", [self.d_width])
+        self.d_exp = QtWidgets.QSpinBox()
+        self.d_exp.setRange(1, 6)
+        self.d_exp.setValue(cfg["expiries"])
+        self.d_exp.valueChanged.connect(lambda v: qs.setValue("opt_expiries", int(v)))
+        self._row(lay, "Nearest expiries", [self.d_exp])
+        self.d_folder = QtWidgets.QLabel(cfg["folder"])
+        self.d_folder.setWordWrap(True)
+        self.d_folder.setStyleSheet("color:#9598a1;font-size:12px;")
+        choose = QtWidgets.QPushButton("Choose folder\u2026")
+        cloud = QtWidgets.QPushButton("Use iCloud Drive")
+        cloud.setVisible(optstore.icloud_dir() is not None)
+        now = QtWidgets.QPushButton("Save now")
+        r = QtWidgets.QHBoxLayout()
+        for b in (choose, cloud, now):
+            r.addWidget(b)
+        r.addStretch(1)
+        lay.addLayout(r)
+        lay.addWidget(self.d_folder)
+        self.d_last = QtWidgets.QLabel("")
+        self.d_last.setWordWrap(True)
+        self.d_last.setStyleSheet("color:#9598a1;font-size:12px;")
+        lay.addWidget(self.d_last)
+        small("One file per contract, from its listing day to its expiry, with open interest; files of expired "
+              "contracts stay. A folder inside iCloud Drive, Google Drive or Dropbox is copied to the cloud by that "
+              "service. Needs a connected Dhan account; in a script: chartlab.option_data('NIFTY261124C25000').")
+
+        def set_folder(path):
+            if not path:
+                return
+            qs.setValue("opt_folder", str(path))
+            self.d_folder.setText(win.option_archive_settings()["folder"])
+
+        choose.clicked.connect(lambda: set_folder(QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Folder for the option archive", self.d_folder.text())))
+        cloud.clicked.connect(lambda: set_folder(optstore.icloud_dir() / "ChartLab" / "options"))
+        now.clicked.connect(lambda: win._options_archive(force=True))
+        self._data_timer = QtCore.QTimer(self)
+        self._data_timer.timeout.connect(self._data_tick)
+        self._data_timer.start(500)
+        self._data_tick()
+
+    def _data_tick(self):
+        win = self.parent()
+        busy = getattr(win, "_opt_busy", False)
+        last = str(win.settings.value("opt_last", "") or "")
+        self.d_last.setText("Saving now\u2026" if busy else ("Last run: " + last if last else "Not run yet."))
+
+    def _upd_tick(self):
+        win = self.parent()
+        text, ready = win.update_state()
+        self.upd_state.setText(text)
+        self.upd_go.setVisible(ready)
+        self.upd_check.setEnabled(not getattr(win, "_upd_busy", False))
 
     def _reset(self):
         self.v = copy.deepcopy(DEFAULTS)

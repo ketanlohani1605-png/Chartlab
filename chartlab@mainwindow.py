@@ -284,6 +284,106 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- favourite intervals (TradingView: a star in the interval list puts it on the toolbar)
     DEFAULT_FAV_INTERVALS: list = []                     # TradingView's default: none, only the current interval
 
+    # ---- any interval (TradingView's "Add custom interval"): 45m, 2h, 4h, 3D, 2W, 3M ...
+    def _load_custom_intervals(self) -> list:
+        import json as _json
+        from . import timeframes as TF
+        try:
+            raw = _json.loads(self.settings.value("custom_intervals", "") or "[]")
+        except Exception:  # noqa: BLE001
+            raw = []
+        base = [v for v, _ in INTERVALS]
+        return sorted({str(v) for v in raw if TF.valid(str(v)) and str(v) not in base}, key=TF.sort_key)
+
+    def _all_intervals(self) -> list:
+        from . import timeframes as TF
+        return sorted([v for v, _ in INTERVALS] + list(getattr(self, "custom_intervals", [])), key=TF.sort_key)
+
+    def _make_interval_button(self, val: str):
+        from . import timeframes as TF
+        if val in self.interval_btns:
+            return self.interval_btns[val]
+        b = QtWidgets.QToolButton(self)
+        b.setText(TF.short(val))                              # favourites row: 1m 5m 45m 2h D W 3M
+        b.setCheckable(True)
+        self.interval_group.addButton(b)
+        self.interval_btns[val] = b
+        b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
+        b.setObjectName("ivbtn")
+        f = b.font()
+        f.setPixelSize(14)
+        f.setWeight(QtGui.QFont.Weight.DemiBold)
+        b.setMinimumWidth(QtGui.QFontMetrics(f).horizontalAdvance(b.text()) + 13)    # never elide to "..."
+        b.setToolTip(TF.name(val))
+        if self._iv_anchor is None:
+            self.interval_btn_actions[val] = self._top_tb.addWidget(b)
+        else:                                                 # added later: next to the other intervals
+            self.interval_btn_actions[val] = self._top_tb.insertWidget(self._iv_anchor, b)
+            self.interval_btn_actions[val].setVisible(False)
+        return b
+
+    def _build_interval_menu(self):
+        from . import timeframes as TF
+        im = self.interval_menu
+        im.clear()
+        self.interval_menu_actions = {}
+        self.interval_stars = {}
+        add = im.addAction(icons.get("plus") if "plus" in getattr(icons, "_DRAWERS", {}) else QtGui.QIcon(),
+                           "Add custom interval\u2026")
+        add.triggered.connect(self.add_custom_interval)
+        codes = self._all_intervals()
+        for title in ("MINUTES", "HOURS", "DAYS"):
+            items = [c for c in codes if TF.group(c) == title]
+            if not items:
+                continue
+            im.addSeparator()
+            theme.menu_section(im, title)
+            for val in items:
+                self.interval_menu_actions[val] = self._interval_row(im, val, TF.name(val),
+                                                                     removable=val in self.custom_intervals)
+
+    def ensure_interval(self, code: str, save: bool = True) -> bool:
+        """Make `code` (any valid interval) pickable: a custom one is added to the list, like TradingView."""
+        import json as _json
+        from . import timeframes as TF
+        if code in self.interval_btns:
+            return True
+        if not TF.valid(code):
+            return False
+        self.custom_intervals = sorted(set(self.custom_intervals) | {code}, key=TF.sort_key)
+        if save:
+            self.settings.setValue("custom_intervals", _json.dumps(self.custom_intervals))
+        self._make_interval_button(code)
+        if hasattr(self, "interval_menu"):
+            self._build_interval_menu()
+        return True
+
+    def remove_custom_interval(self, code: str):
+        import json as _json
+        if code not in self.custom_intervals:
+            return
+        if self.interval_btns[code].isChecked():
+            self.interval_btns["1d"].click()
+        self.custom_intervals = [c for c in self.custom_intervals if c != code]
+        self.settings.setValue("custom_intervals", _json.dumps(self.custom_intervals))
+        if code in self.fav_intervals:
+            self.toggle_fav_interval(code, False)
+        b = self.interval_btns.pop(code)
+        act = self.interval_btn_actions.pop(code)
+        self.interval_group.removeButton(b)
+        self._top_tb.removeAction(act)
+        b.deleteLater()
+        self._build_interval_menu()
+        self._apply_fav_intervals()
+
+    def add_custom_interval(self):
+        from .tvui import CustomInterval
+        d = CustomInterval(self)
+        if d.exec() and d.code and self.ensure_interval(d.code):
+            self.interval_btns[d.code].click()
+            self._sync_interval_label()
+        self.focus_chart()
+
     def _load_fav_intervals(self) -> list:
         import json as _json
         try:
@@ -291,8 +391,7 @@ class MainWindow(QtWidgets.QMainWindow):
             favs = _json.loads(raw) if raw else list(self.DEFAULT_FAV_INTERVALS)
         except Exception:  # noqa: BLE001
             favs = list(self.DEFAULT_FAV_INTERVALS)
-        known = [v for v, _ in INTERVALS]
-        return [v for v in known if v in favs]
+        return [v for v in self._all_intervals() if v in favs]
 
     def _apply_fav_intervals(self):
         """Show the favourite intervals and, like TradingView, the current one even when it is not a favourite."""
@@ -310,12 +409,12 @@ class MainWindow(QtWidgets.QMainWindow):
         on = (val not in self.fav_intervals) if on is None else bool(on)
         favs = set(self.fav_intervals)
         favs.add(val) if on else favs.discard(val)
-        self.fav_intervals = [v for v, _ in INTERVALS if v in favs]
+        self.fav_intervals = [v for v in self._all_intervals() if v in favs]
         self.settings.setValue("fav_intervals", _json.dumps(self.fav_intervals))
         self._apply_fav_intervals()
         self._sync_interval_menu()
 
-    def _interval_row(self, menu, val: str, text: str):
+    def _interval_row(self, menu, val: str, text: str, removable: bool = False):
         """One line of the interval list: the name picks the interval, the star on the right adds it to / removes
         it from the toolbar (TradingView's favourites)."""
         row = QtWidgets.QWidget()
@@ -340,6 +439,13 @@ class MainWindow(QtWidgets.QMainWindow):
         star.setToolTip("Add to favourites (shown on the toolbar)")
         star.setText("\u2605")
         h.addWidget(name, 1)
+        if removable:                                         # a custom interval can be taken off the list again
+            rm = QtWidgets.QToolButton()
+            rm.setText("\u2715")
+            rm.setToolTip("Remove this custom interval")
+            rm.setStyleSheet("font-size: 12px; padding: 0 4px;")
+            rm.clicked.connect(lambda _=False, v=val: (menu.close(), self.remove_custom_interval(v)))
+            h.addWidget(rm)
         h.addWidget(star)
         act = QtWidgets.QWidgetAction(menu)
         act.setDefaultWidget(row)
@@ -539,7 +645,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_interval_popup(self, first: str):
         from .tvui import IntervalPopup
         d = IntervalPopup(self, first)
-        if d.exec() and d.code in self.interval_btns:
+        if d.exec() and d.code and self.ensure_interval(d.code):
             self.interval_btns[d.code].click()
             self._sync_interval_label()
         self.focus_chart()
@@ -649,44 +755,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.interval_btns = {}
         self.interval_btn_actions = {}                        # TradingView: favourite intervals + the current one
         self.fav_intervals = self._load_fav_intervals()
-        for val, text in INTERVALS:
-            b = QtWidgets.QToolButton(self)
-            b.setText(text)
-            b.setCheckable(True)
-            self.interval_group.addButton(b)
-            self.interval_btns[val] = b
-            b.clicked.connect(lambda _=False, v=val: self._interval_clicked(v))
-            b.setText({"1D": "D", "1W": "W", "1M": "M"}.get(text, text))   # favourites row: 1m 5m 15m 1h D W M
-            b.setObjectName("ivbtn")
-            f = b.font()
-            f.setPixelSize(14)
-            f.setWeight(QtGui.QFont.Weight.DemiBold)
-            b.setMinimumWidth(QtGui.QFontMetrics(f).horizontalAdvance(b.text()) + 13)    # never elide to "..."
-            b.setToolTip({"m": " minute", "h": " hour", "D": " day", "W": " week", "M": " month"}
-                         .get(text[-1], "").join([text[:-1], ""]).strip() + ("s" if text[:-1] not in ("1", "") else ""))
-            self.interval_btn_actions[val] = tb.addWidget(b)
+        self._top_tb, self._iv_anchor = tb, None
+        self.custom_intervals = self._load_custom_intervals()
+        for val in self._all_intervals():
+            self._make_interval_button(val)
         self.interval_btns["1d"].setChecked(True)
         self.interval_btn = QtWidgets.QToolButton()
         self.interval_btn.setToolTip("Time interval  (type a number on the chart)")
         self.interval_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         im = QtWidgets.QMenu(self)
-        groups = (("MINUTES", [("1m", "1 minute"), ("3m", "3 minutes"), ("5m", "5 minutes"), ("15m", "15 minutes"),
-                               ("30m", "30 minutes")]),
-                  ("HOURS", [("1h", "1 hour")]),
-                  ("DAYS", [("1d", "1 day"), ("1wk", "1 week"), ("1mo", "1 month")]))
-        self.interval_menu_actions = {}
-        self.interval_stars = {}
-        for title, items in groups:
-            if title != "MINUTES":
-                im.addSeparator()
-            theme.menu_section(im, title)
-            for val, text in items:
-                act = self._interval_row(im, val, text)
-                self.interval_menu_actions[val] = act
-        im.aboutToShow.connect(self._sync_interval_menu)
         self.interval_menu = im
+        self._build_interval_menu()
+        im.aboutToShow.connect(self._sync_interval_menu)
         self.interval_btn.setMenu(im)
-        tb.addWidget(self.interval_btn)
+        self._iv_anchor = tb.addWidget(self.interval_btn)
         self.interval_group.buttonToggled.connect(lambda *_: (self._sync_interval_label(), self._apply_fav_intervals()))
         self._sync_interval_label()
         self._apply_fav_intervals()
@@ -809,10 +891,12 @@ class MainWindow(QtWidgets.QMainWindow):
         m_.addSeparator()
         m_.addAction("Manage broker accounts…", self.manage_accounts)
         m_.addAction("All accounts: status, balance, P&&L…", self.accounts_overview)
-        ar = m_.addAction("Renew tokens automatically (Dhan: 24 h)")
+        ar = m_.addAction("Keep broker logins fresh automatically")
         ar.setCheckable(True)
-        ar.setChecked(self.settings.value("auto_renew", "false") == "true")
-        ar.setToolTip("When a connected account's token has under 4 hours left, swap it for a fresh 24-hour one")
+        ar.setChecked(self.settings.value("auto_renew", "true") == "true")
+        ar.setToolTip("Before a login runs out (and after it has), ChartLab gets a fresh one by itself: the broker's own "
+                      "renewal, or PIN + the saved TOTP key (Dhan, Angel One). Zerodha and Upstox want a browser login daily.")
+        self._auto_renew_action = ar
         ar.triggered.connect(self.set_auto_renew)
         m_.setToolTipsVisible(True)
         m_.addSeparator()
@@ -1244,6 +1328,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _live_status(self, mode: str, detail: str):
         lab = self.live_label
         text, col = {"live": ("\u25cf Live", theme.UP), "polling": ("\u25cf Live (1.5 s)", "#f7a600"),
+                     "yahoo": ("\u25cf Live (3 s)", "#f7a600"),
                      "connecting": ("\u25cb Connecting\u2026", theme.MUTED),
                      "error": ("\u25cf Live prices off", theme.DOWN)}.get(mode, ("", theme.MUTED))
         lab.setVisible(bool(text))
@@ -1252,6 +1337,8 @@ class MainWindow(QtWidgets.QMainWindow):
         bn = self.live.feed.broker_name if hasattr(self, "live") else "the broker"
         tip = {"live": f"Real-time prices from {bn}'s live market feed: every trade moves the chart.",
                "polling": f"Prices are fetched from {bn} every 1.5 seconds (the live socket is not connected).",
+               "yahoo": "The candle follows Yahoo's newest price, checked every 3 seconds. Yahoo can be delayed for "
+                        "some exchanges and is not tick by tick: log in a broker account (Accounts) for real-time prices.",
                "connecting": f"Connecting to {bn}'s live market feed\u2026",
                "error": "Live prices are not running: " + (detail or "")}.get(mode, "")
         lab.setToolTip(tip)
@@ -1488,7 +1575,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         f = mb.addMenu("File")
-        f.addAction("Check for updates\u2026", lambda: self.check_updates(True))
+        f.addAction("Check for updates\u2026", self.open_updates)
         f.addAction("Open data file…", self.open_data_file, QtGui.QKeySequence("Ctrl+O"))
         f.addAction("Open data folder…", self.open_data_folder)
         f.addAction("Open strategy…", self.open_strategy)
@@ -1557,6 +1644,12 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = cs.SettingsDialog(self, tab if isinstance(tab, int) else 0)
         dlg.applied.connect(lambda _s: (cs.save(self.settings), self.apply_chart_settings()))
         dlg.exec()
+
+    def open_updates(self):
+        """Settings -> Updates, checking right away."""
+        from . import settings as cs
+        QtCore.QTimer.singleShot(0, lambda: self.check_updates(True))
+        self.open_settings(cs.SettingsDialog.UPDATES_TAB)
 
     def apply_chart_settings(self):
         for p in self.panels:
@@ -1660,7 +1753,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for key in STYLES:
             add(STYLE_NAMES[key], "Chart type", lambda k=key: self._style_chosen(k), "", ch.style == key)
         cur = self._current_interval()
-        for val, text in INTERVALS:
+        from . import timeframes as _TF
+        for val, text in [(v, _TF.legend(v)) for v in self._all_intervals()]:
             add(f"Interval {text}", "Interval", lambda v=val: self.interval_btns[v].click(), "", val == cur)
         for key, text in INDICATORS.items():
             on = key in ch._enabled
@@ -1725,6 +1819,8 @@ class MainWindow(QtWidgets.QMainWindow):
         from . import updater
         if getattr(self, "_upd_busy", False):
             return
+        if not manual and self.settings.value("auto_update", "true") == "false":
+            return                                           # Settings -> Updates: automatic checks are off
         self._upd_busy, self._upd_manual = True, bool(manual)
         if manual:
             self.statusBar().showMessage("Checking for a newer ChartLab\u2026")
@@ -1732,9 +1828,28 @@ class MainWindow(QtWidgets.QMainWindow):
         w.done.connect(self._update_checked)
         w.start()
 
+    def update_state(self) -> tuple:
+        """(what the update is doing right now, is a new version ready to restart into) - shown in Settings."""
+        info = getattr(self, "_upd_info", None) or {}
+        ready = getattr(self, "_upd_ready", None)
+        if ready:
+            return f"ChartLab {ready[0]} is downloaded and checked. Restart to use it.", True
+        if getattr(self, "_upd_busy", False):
+            if info and getattr(self, "_upd_fetching", False):
+                pct = getattr(self, "_upd_pct", -1)
+                return f"Downloading ChartLab {info.get('version', '')}\u2026" + (f" {pct}%" if pct >= 0 else ""), False
+            return "Checking for a newer version\u2026", False
+        return getattr(self, "_upd_last", "") or "Not checked yet in this session.", False
+
     def _update_checked(self, info, err):
+        import datetime as _dt
         self._upd_busy = False
         manual = getattr(self, "_upd_manual", False)
+        when = _dt.datetime.now().strftime("%H:%M")
+        if err:
+            self._upd_last = f"Could not check for updates ({when}): {err}"
+        elif not info:
+            self._upd_last = f"ChartLab {self.version} is the newest version (checked {when})."
         if err:
             if manual:
                 self.statusBar().showMessage(f"Could not check for updates: {err}", 8000)
@@ -1758,7 +1873,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from . import updater
         if getattr(self, "_upd_busy", False):
             return
-        self._upd_busy, self._upd_quiet = True, quiet
+        self._upd_busy, self._upd_quiet, self._upd_fetching, self._upd_pct = True, quiet, True, -1
         if not quiet:
             self.upd_btn.setEnabled(False)
             self.upd_btn.setText("Downloading 0%")
@@ -1795,7 +1910,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fetch_update(info, quiet=False)
 
     def _update_progress(self, got: int, total: int):
+        if total > 0 and got >= 0:
+            self._upd_pct_any = int(got * 100 / total)
         if getattr(self, "_upd_quiet", False):
+            self._upd_pct = getattr(self, "_upd_pct_any", -1)
             return
         if got < 0:
             self.upd_btn.setText("Checking\u2026")
@@ -1806,7 +1924,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.upd_btn.setText(f"Downloading {pct}%")
 
     def _update_downloaded(self, new_app, err):
-        self._upd_busy = False
+        self._upd_busy = self._upd_fetching = False
+        if err or new_app is None:
+            self._upd_last = f"The update could not be downloaded, nothing was changed: {err}"
         info = getattr(self, "_upd_info", {}) or {}
         if err or new_app is None:
             self.upd_btn.setEnabled(True)
@@ -1933,7 +2053,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.symbol.setText(st.value("symbol", "RELIANCE"))
         self.range.setCurrentText(st.value("range", "2y"))
         iv = st.value("interval", "1d")
-        if iv in self.interval_btns:
+        if self.ensure_interval(str(iv)):
             self.interval_btns[iv].setChecked(True)
         src = st.value("source", "auto")
         if src == "yahoo" and st.value("auto_source_offered", "") != "1":
@@ -2008,6 +2128,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.api.stop()
         self.live.stop()
         self.chain.stop()
+        ow = getattr(self, "_opt_worker", None)
+        if ow is not None and ow.isRunning():                 # the option archive stops between two contracts
+            ow.requestInterruption()
+            ow.wait(4000)
         super().closeEvent(e)
 
     def _save_watchlist(self):
@@ -2121,7 +2245,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if i >= 0:
                 self.source.setCurrentIndex(i)
             self.range.setCurrentText(prm["range"])
-            if prm["interval"] in self.interval_btns:
+            if self.ensure_interval(str(prm["interval"])):
                 self.interval_btns[prm["interval"]].setChecked(True)
             for k, a in self.ind_actions.items():
                 a.setChecked(k in p.chart._enabled)
@@ -2208,42 +2332,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_sync()
 
     def set_auto_renew(self, on: bool):
-        if on and QtWidgets.QMessageBox.question(
-                self, "Renew tokens automatically",
-                "Dhan access tokens stop working after 24 hours.\n\nWith this on, ChartLab asks Dhan for a fresh "
-                "24-hour token whenever a connected account has under 4 hours left, and saves it. The old token "
-                "stops working at once, so anything else using it (another app, a token typed into a script) needs "
-                "the new one.\n\nIt only works while ChartLab is open, for tokens made on Dhan Web that have not "
-                "expired yet. Turn it on?") != QtWidgets.QMessageBox.StandardButton.Yes:
-            on = False
-            for a in self.acct_btn.menu().actions():
-                if a.isCheckable() and a.text().startswith("Renew tokens"):
-                    a.setChecked(False)
         self.settings.setValue("auto_renew", "true" if on else "false")
+        if hasattr(self, "_auto_renew_action"):
+            self._auto_renew_action.setChecked(bool(on))
         if on:
             self.acct_poller.refresh()
 
     def _auto_renew(self, name, st):
-        """Called after each status check: renew a token that is close to its end (only when the user switched it on)."""
-        if self.settings.value("auto_renew", "false") != "true" or not st or st.get("state") not in ("ok", "expiring"):
+        """Called after each status check: a login that is close to its end, or already over, is replaced by a fresh
+        one without the user (the broker's renewal, or PIN + saved TOTP key). Not more than once in 30 minutes."""
+        if self.settings.value("auto_renew", "true") != "true" or not st:
             return
+        state = st.get("state")
         d = st.get("days_left")
-        tried = getattr(self, "_renew_tried", {})
         import time as _t
-        if d is None or not 0 < d * 24 < acctmod.EXPIRING_HOURS or _t.time() - tried.get(name, 0) < 1800:
+        tried = getattr(self, "_renew_tried", {})
+        soon = state in ("ok", "expiring") and d is not None and 0 < d * 24 < acctmod.EXPIRING_HOURS
+        over = state in ("expired", "auth")
+        if not (soon or over) or _t.time() - tried.get(name, 0) < 1800:
             return
+        a = next((x for x in acctmod.load_accounts() if x["name"] == name), None)
+        way = acctmod.auto_login_way(a) if a else ""
+        if not way or (over and way != "totp"):
+            return                                           # this one needs the user: the status line says so
         tried[name] = _t.time()
         self._renew_tried = tried
-        job = acctmod._Job(lambda: acctmod.renew_saved(name), self)
+        job = acctmod._Job(lambda: acctmod.auto_login(name, expired=over), self)
+        self._renew_jobs = [j for j in getattr(self, "_renew_jobs", []) if j.isRunning()] + [job]
 
         def done(msg):
             self.statusBar().showMessage(msg, 8000)
+            self.add_log(f"[accounts] {msg}")
             self._warned = getattr(self, "_warned", set()) - {name}
             self.acct_poller.refresh([a for a in acctmod.load_accounts() if a["name"] == name], force=True)
             self.live_sync()
+            QtCore.QTimer.singleShot(4000, self._options_archive)
         job.done.connect(done)
         job.failed.connect(lambda e: self.statusBar().showMessage(
-            f"Account '{name}': the token could not be renewed ({e[:120]}). Paste a fresh one in Accounts.", 15000))
+            f"Account '{name}': a fresh login could not be made ({e[:120]}). Log in again in Accounts.", 15000))
         job.start()
 
     def _acct_status_changed(self, name):
@@ -2600,6 +2726,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._daily_timer.timeout.connect(self._daily_download)
         self._daily_timer.start(30 * 60 * 1000)
         QtCore.QTimer.singleShot(20000, self._daily_download)
+        self._daily_timer.timeout.connect(self._options_archive)
+        QtCore.QTimer.singleShot(45000, self._options_archive)
         # the watchlist keeps itself current like TradingView's: every minute in market hours, else every 10
         self._watch_timer = QtCore.QTimer(self)
         self._watch_timer.timeout.connect(self._watch_tick)
@@ -2709,6 +2837,71 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Daily data saved for {ok} of {total} watchlist symbols", 5000)
         w.done.connect(done)
         w.failed.connect(lambda *_: setattr(self, "_daily_busy", False))
+        w.start()
+
+    # ------------------------------------------------------------------ the option archive (Settings -> Data)
+    def option_archive_settings(self) -> dict:
+        from . import optstore
+        st = self.settings
+        unds = [u.strip().upper() for u in str(st.value("opt_underlyings", ",".join(optstore.DEFAULT_UNDERLYINGS))).split(",")
+                if u.strip()]
+        try:
+            width = max(1, min(60, int(st.value("opt_width", optstore.DEFAULT_WIDTH))))
+            n_exp = max(1, min(6, int(st.value("opt_expiries", optstore.DEFAULT_EXPIRIES))))
+        except (TypeError, ValueError):
+            width, n_exp = optstore.DEFAULT_WIDTH, optstore.DEFAULT_EXPIRIES
+        return {"on": st.value("opt_archive", "true") == "true", "underlyings": unds, "width": width, "expiries": n_exp,
+                "folder": str(optstore.root(str(st.value("opt_folder", "") or ""))),
+                "last": str(st.value("opt_last", "") or "")}
+
+    def _options_archive(self, force: bool = False):
+        """Once a day (and again after the close), while a Dhan account is connected: save the 1-minute history of
+        the option contracts around the money. Runs in the background; never places anything."""
+        import datetime as _dt
+        from . import optstore
+        cfg = self.option_archive_settings()
+        if getattr(self, "_opt_busy", False) or not (cfg["on"] or force):
+            return
+        now = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=5, minutes=30)))
+        after_close = now.weekday() < 5 and now.time() >= _dt.time(15, 35)
+        stamp = now.date().isoformat() + ("-close" if after_close else "")
+        done_stamp = str(self.settings.value("opt_done", "") or "")
+        if not force and (done_stamp == stamp or done_stamp == now.date().isoformat() + "-close"):
+            return
+        acct = next((a for a in acctmod.load_accounts() if a.get("broker") == "dhan" and a.get("access_token")
+                     and (acctmod.STATUS.get(a["name"]) or {}).get("state") in ("ok", "expiring")), None)
+        if acct is None:
+            if force:
+                self.statusBar().showMessage("The option archive needs a connected Dhan account (Accounts)", 8000)
+            return
+        self._opt_busy = True
+        base = Path(cfg["folder"])
+        from .panel import LoadWorker
+
+        def job():
+            th = QtCore.QThread.currentThread()
+            res = optstore.run(acct, base, cfg["underlyings"], cfg["width"], cfg["expiries"],
+                               stop=th.isInterruptionRequested)
+            return res, stamp
+        w = self._opt_worker = LoadWorker(job, self)
+
+        def done(res, st_):
+            self._opt_busy = False
+            when = _dt.datetime.now().strftime("%d %b %H:%M")
+            text = (f"{when}: {res['contracts']} contracts followed, {res['updated']} files grew by {res['rows']} rows"
+                    + (f", {len(res['errors'])} could not be read ({res['errors'][0]})" if res["errors"] else ""))
+            self.settings.setValue("opt_last", text)
+            if res["updated"] or not res["errors"]:
+                self.settings.setValue("opt_done", st_)
+            self.add_log(f"[option archive] {text}  ->  {res['folder']}")
+            self.statusBar().showMessage(f"Option archive: {res['updated']} contracts updated", 6000)
+
+        def failed(msg):
+            self._opt_busy = False
+            self.settings.setValue("opt_last", f"failed: {str(msg)[:160]}")
+            self.add_log(f"[option archive] failed: {msg}")
+        w.done.connect(done)
+        w.failed.connect(failed)
         w.start()
 
     def _load_status(self, panel):

@@ -31,13 +31,34 @@ def data():
         raise RuntimeError("No chart data is loaded in ChartLab")
     return pd.read_parquet(_DATA)
 
+def option_data(symbol):
+    """A contract's stored 1-minute history from ChartLab's option archive (Settings -> Data): Date index, Open, High,
+    Low, Close, Volume, OI. option_data("NIFTY261124C25000"); option_data("NIFTY") is the index itself."""
+    import pandas as pd
+    base = os.environ.get("CHARTLAB_OPTIONS", "")
+    idx = option_index()
+    hit = idx.get(str(symbol).strip().upper())
+    if not hit:
+        raise KeyError(f"{symbol} is not in the option archive ({base})")
+    df = pd.read_parquet(os.path.join(base, hit["file"]))
+    return df.set_index("Date") if "Date" in df.columns else df
+
+def option_index():
+    """Everything in the option archive: {contract: {'file', 'first', 'last', 'rows'}}."""
+    base = os.environ.get("CHARTLAB_OPTIONS", "")
+    try:
+        return json.load(open(os.path.join(base, "index.json")))
+    except Exception:
+        return {}
+
 def account():
     """Credentials of the broker account this copy of the script runs on (separate-copies mode), or {}."""
     if not os.environ.get("CHARTLAB_ACCOUNT"):
         return {}
     return {k[len("CHARTLAB_"):].lower(): v for k, v in os.environ.items()
             if k.startswith("CHARTLAB_") and k not in ("CHARTLAB_OUT", "CHARTLAB_DATA", "CHARTLAB_PYTHON",
-                                                     "CHARTLAB_ACCOUNTS_FILE")}
+                                                     "CHARTLAB_ACCOUNTS_FILE", "CHARTLAB_OPTIONS",
+                                                     "CHARTLAB_HOME")}
 
 def accounts():
     """All accounts this run trades on: every ticked account (one-script mode) or just this one."""
@@ -222,6 +243,12 @@ def environment(workdir: Path, df) -> dict:
     env["CHARTLAB_OUT"] = str(workdir)
     env["CHARTLAB_DATA"] = str(workdir / "data.parquet") if df is not None else ""
     env["PYTHONUNBUFFERED"] = "1"
+    try:
+        from PySide6 import QtCore as _qc
+        from . import optstore
+        env["CHARTLAB_OPTIONS"] = str(optstore.root(str(_qc.QSettings("ChartLab", "ChartLab").value("opt_folder", "") or "")))
+    except Exception:  # noqa: BLE001
+        env["CHARTLAB_OPTIONS"] = str(Path.home() / "ChartLab" / "options")
     return env
 
 

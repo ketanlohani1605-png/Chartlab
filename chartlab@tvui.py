@@ -392,30 +392,71 @@ UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"
 
 
 def parse_interval(text: str) -> tuple[str | None, str]:
-    """'5' -> 5 minutes ('5m'); '1h'; '1d'; 'D'; 'W'. Returns (code or None, caption)."""
-    t = text.strip().lower().replace(",", "")
+    """TradingView's typing: '5' -> 5 minutes, '45', '2h', 'D', '3D', 'W', '3M' (months). -> (code or None, caption)."""
+    from . import timeframes as TF
+    t = text.strip()
     if not t:
         return None, ""
-    m = re.fullmatch(r"(\d*)\s*([smhdwk]?)", t)
-    if not m:
-        return None, ""
-    n, u = m.group(1), m.group(2)
-    if u == "k":
-        u = "m"
-    if not u:
-        u = "m"
-    n = int(n or 1)
-    if u == "d" and n == 1:
-        return "1d", "1 day"
-    if u == "w" and n == 1:
-        return "1wk", "1 week"
-    if u == "m" and n == 60:
-        return "1h", "1 hour"
-    if u == "m" and n in (1, 3, 5, 15, 30):
-        return f"{n}m", f"{n} minute{'s' if n > 1 else ''}"
-    if u == "h" and n == 1:
-        return "1h", "1 hour"
-    return None, f"{n} {UNITS.get(u, '')} (not available)"
+    code = TF.parse(t)
+    return (code, TF.name(code)) if code else (None, "Not a time interval")
+
+
+class CustomInterval(QtWidgets.QDialog):
+    """TradingView's "Add custom interval": a type and a number."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Add custom interval")
+        self.setStyleSheet(DARK)
+        self.setFixedWidth(340)
+        self.code = None
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
+        form = QtWidgets.QFormLayout()
+        form.setHorizontalSpacing(24)
+        form.setVerticalSpacing(12)
+        self.kind = QtWidgets.QComboBox()
+        for text, unit in (("Minutes", "m"), ("Hours", "h"), ("Days", "d"), ("Weeks", "wk"), ("Months", "mo")):
+            self.kind.addItem(text, unit)
+        self.num = QtWidgets.QSpinBox()
+        self.num.setRange(1, 1440)
+        self.num.setValue(1)
+        form.addRow("Type", self.kind)
+        form.addRow("Interval", self.num)
+        lay.addLayout(form)
+        self.cap = QtWidgets.QLabel("")
+        self.cap.setStyleSheet("color:#787b86;")
+        lay.addWidget(self.cap)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        self.ok = QtWidgets.QPushButton("Add")
+        self.ok.setDefault(True)
+        self.ok.setStyleSheet("QPushButton { background:#f2f2f2; color:#0f0f0f; border:0; border-radius:8px;"
+                              " padding:7px 18px; font-weight:600; } QPushButton:disabled { background:#3a3a3a;"
+                              " color:#787b86; }")
+        row.addWidget(cancel)
+        row.addWidget(self.ok)
+        lay.addLayout(row)
+        cancel.clicked.connect(self.reject)
+        self.ok.clicked.connect(self._ok)
+        self.kind.currentIndexChanged.connect(self._upd)
+        self.num.valueChanged.connect(self._upd)
+        self._upd()
+
+    def _upd(self, *_):
+        from . import timeframes as TF
+        unit = self.kind.currentData()
+        self.num.setMaximum(TF.MAX[unit])
+        code = TF.canon(self.num.value(), unit)
+        self.code = code if TF.valid(code) else None
+        self.cap.setText(TF.name(code) if self.code else "")
+        self.ok.setEnabled(bool(self.code))
+
+    def _ok(self):
+        if self.code:
+            self.accept()
 
 
 class IntervalPopup(QtWidgets.QDialog):

@@ -364,6 +364,129 @@ class LiveFeed(QtCore.QObject):
             self._set("error", msg[:140])
 
 
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m&range=1d"
+YAHOO_EVERY = 3.0            # seconds between price checks per symbol (Yahoo allows roughly 2000 requests an hour)
+
+
+def yahoo_quote(sym: str, timeout: float = 8.0) -> dict:
+    """The newest price Yahoo has for one symbol: {'price', 'time' (Unix), 'offset' (exchange's seconds from UTC),
+    'volume' (today's), 'prev' (yesterday's close)}."""
+    import urllib.parse
+    import urllib.request
+    url = YAHOO_URL.format(sym=urllib.parse.quote(sym, safe=""))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh) ChartLab", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode("utf-8", "replace"))
+    res = (d.get("chart") or {}).get("result") or []
+    if not res:
+        err = ((d.get("chart") or {}).get("error") or {}).get("description") or "no data"
+        raise RuntimeError(f"Yahoo: {err}")
+    m = res[0].get("meta") or {}
+    price = m.get("regularMarketPrice")
+    if not price:
+        raise RuntimeError("Yahoo: no price")
+    return {"price": float(price), "time": float(m.get("regularMarketTime") or 0), "offset": float(m.get("gmtoffset") or 0),
+            "volume": float(m.get("regularMarketVolume") or -1),
+            "prev": float(m.get("chartPreviousClose") or m.get("previousClose") or 0)}
+
+
+class YahooLive(QtCore.QObject):
+    """Moving candles without a broker account: Yahoo's newest price, asked for every few seconds, for the symbols
+    on the charts. (Not tick by tick, and for some exchanges Yahoo's prices are delayed; a connected broker
+    account always wins.)"""
+    quote = QtCore.Signal(str, object)                   # yahoo symbol, quote dict
+    state = QtCore.Signal(str, str)
+
+    def __init__(self, parent=None, fetch=None):
+        super().__init__(parent)
+        self.fetch = fetch or yahoo_quote
+        self.symbols: tuple = ()
+        self._last: dict = {}            # symbol -> (price, time) seen last
+        self._quiet = 0                  # polls in a row in which nothing moved (market closed): slow down
+        self._fails = 0
+        self._job = None
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._poll)
+        self.active = False
+
+    def watch(self, symbols):
+        syms = tuple(sorted(set(symbols)))
+        if syms == self.symbols:
+            return
+        self.symbols = syms
+        self._last = {k: v for k, v in self._last.items() if k in syms}
+        self._quiet = 0
+        if syms and not self._timer.isActive() and self._job is None:
+            self._timer.start(50)
+        if not syms:
+            self._timer.stop()
+            if self.active:
+                self.active = False
+                self.state.emit("off", "")
+
+    def stop(self):
+        self.symbols = ()
+        self._timer.stop()
+        if self._job is not None:
+            self._job.wait(2000)
+
+    def _poll(self):
+        if not self.symbols or self._job is not None:
+            return
+        syms, fetch = self.symbols, self.fetch
+
+        def work():
+            out, err = {}, ""
+            for s in syms:
+                try:
+                    out[s] = fetch(s)
+                except Exception as e:  # noqa: BLE001
+                    err = str(e)
+            return out, err
+        job = _Call(work, self)
+        self._job = job
+        job.done.connect(self._done)
+        job.failed.connect(lambda msg: self._done(({}, msg)))
+        job.finished.connect(self._finished)
+        job.start()
+
+    def _finished(self):
+        self._job = None
+        if not self.symbols:
+            return
+        every = max(YAHOO_EVERY, YAHOO_EVERY * len(self.symbols))
+        if self._fails:
+            every = min(120.0, 15.0 * self._fails)           # refused / offline: ask less often
+        elif self._quiet > 20:
+            every = max(every, 20.0)                         # nothing has traded for a minute: the market is closed
+        self._timer.start(int(every * 1000))
+
+    def _done(self, res):
+        out, err = res
+        if not out:
+            self._fails += 1
+            if self._fails == 3:
+                self.active = False
+                self.state.emit("error", "Yahoo does not answer (" + (err or "no connection") + ")")
+            return
+        self._fails = 0
+        moved = False
+        now = time.time()
+        for sym, q in out.items():
+            sig = (q["price"], q["time"])
+            first = sym not in self._last
+            changed = (not first) and self._last[sym] != sig
+            self._last[sym] = sig
+            if changed or (first and now - q["time"] < 120):  # a stale price (closed market) never opens a bar
+                moved = True
+                self.quote.emit(sym, q)
+        self._quiet = 0 if moved else self._quiet + 1
+        if not self.active:
+            self.active = True
+            self.state.emit("yahoo", "")
+
+
 class Clock:
     """Dhan stamps trades with a number of seconds. Whether that number is counted in UTC or in India time is learnt
     from the first fresh trade (it must be 'now'), so bars never land five and a half hours away. The other brokers
@@ -424,9 +547,13 @@ class LiveController(QtCore.QObject):
         self._flush.setSingleShot(True)
         self._flush.setInterval(40)      # many ticks in one frame are drawn once
         self._flush.timeout.connect(self._deliver)
+        self.yahoo = YahooLive(self)
+        self._yroutes: dict = {}         # yahoo symbol -> [panels] followed through Yahoo (no broker feed for them)
+        self.yahoo.quote.connect(self._on_yahoo)
+        self.yahoo.state.connect(self._yahoo_state)
         self.feed.tick.connect(self._on_tick)
         self.feed.prev.connect(lambda seg, sid, px: self._prev.__setitem__((seg, sid), px))
-        self.feed.state.connect(self.status)
+        self.feed.state.connect(self._feed_state)
         self.enabled = True
 
     # ------------------------------------------------------------------ what to listen to
@@ -489,6 +616,7 @@ class LiveController(QtCore.QObject):
             self._acct_sig = sig
             self._ids, self._insts, self._later, self._queue = {}, {}, {}, []
             self.clock = Clock()
+        self._sync_yahoo(acct)
         if acct is None:
             self._routes, self._wl = {}, {}
             self.feed.set_account(None)
@@ -606,6 +734,53 @@ class LiveController(QtCore.QObject):
         self._queue = [x for x in self._queue if x not in self._ids]
         QtCore.QTimer.singleShot(0, self.sync)
 
+    # ------------------------------------------------------------------ no broker feed: Yahoo's newest price
+    def _sync_yahoo(self, acct):
+        from . import data as datamod
+        from .dhan_core import is_option
+        routes: dict = {}
+        if self.enabled:
+            for p in self.win.panels:
+                if not p.isVisible():
+                    continue
+                sym = self._wants(p)
+                src = str(p.params.get("source", ""))
+                if not sym or src not in ("yahoo", "auto") or is_option(p.params.get("symbol", "")):
+                    continue
+                if acct is not None and self._ids.get(sym, "?") is not None:
+                    continue                                 # the broker has it (or is still being asked)
+                try:
+                    routes.setdefault(datamod.normalize_symbol(p.params.get("symbol", "")), []).append(p)
+                except Exception:  # noqa: BLE001
+                    continue
+        self._yroutes = routes
+        self.yahoo.watch(routes.keys())
+
+    def _feed_state(self, mode, detail):
+        if mode in ("off", "") and self.yahoo.active:
+            mode, detail = "yahoo", ""
+        self.status.emit(mode, detail)
+
+    def _yahoo_state(self, mode, detail):
+        if self.feed.acct is None or mode == "yahoo":        # the broker's own state wins when there is one
+            if self.feed.acct is None or self.feed.mode in ("off", ""):
+                self.status.emit(mode, detail)
+
+    def _on_yahoo(self, ysym, q):
+        t = q["time"] + q["offset"] if q.get("time") else None
+        vol = q["volume"] if q.get("volume", -1) >= 0 else None
+        modal = QtWidgets.QApplication.activeModalWidget() is not None
+        for p in self._yroutes.get(ysym, ()):
+            try:
+                r = p.on_tick(q["price"], t, vol)
+                sym = self._wants(p)
+            except RuntimeError:
+                continue
+            if sym:
+                self.tickPrice.emit(sym, q["price"])
+            if r and not modal:
+                self.win.on_live_price(p, q["price"], r == "new")
+
     # ------------------------------------------------------------------ ticks
     def _on_tick(self, seg, sid, ltp, ltt, vol):
         self._pending[(seg, sid)] = (ltp, ltt, vol)
@@ -644,6 +819,7 @@ class LiveController(QtCore.QObject):
 
     def stop(self):
         self.enabled = False
+        self.yahoo.stop()
         self.feed.stop()
         if self._job is not None:
             self._job.wait(2000)
