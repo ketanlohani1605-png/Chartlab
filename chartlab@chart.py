@@ -144,8 +144,29 @@ class _BoldLabelsMixin:
     and on the time scale the most important boundaries in view (the day '17' among hours, 'Aug' among days).
     tickStrings() fills self._bold; the strings in it are painted with the bold font."""
     _bold: frozenset = frozenset()
+    sel_band = None        # (a, b) in view units: the light blue band between a selected drawing's anchors (TradingView)
+
+    def _paint_sel_band(self, p):
+        """TradingView marks the span of the selected drawing on the scales: #2962FF at 25 % behind the numbers."""
+        vb = self.linkedView()
+        if vb is None:
+            return
+        a, b = self.sel_band
+        if self.orientation in ("left", "right"):
+            ya = self.mapFromScene(vb.mapViewToScene(QtCore.QPointF(0.0, a))).y()
+            yb = self.mapFromScene(vb.mapViewToScene(QtCore.QPointF(0.0, b))).y()
+            r = QtCore.QRectF(0.0, min(ya, yb), float(self.width()), abs(yb - ya))
+        else:
+            xa = self.mapFromScene(vb.mapViewToScene(QtCore.QPointF(a, 0.0))).x()
+            xb = self.mapFromScene(vb.mapViewToScene(QtCore.QPointF(b, 0.0))).x()
+            r = QtCore.QRectF(min(xa, xb), 0.0, abs(xb - xa), float(self.height()))
+        r = r.intersected(QtCore.QRectF(0.0, 0.0, float(self.width()), float(self.height())))
+        if r.width() > 0 and r.height() > 0:
+            p.fillRect(r, QtGui.QColor(41, 98, 255, 64))
 
     def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
+        if self.sel_band is not None:
+            self._paint_sel_band(p)
         bold = self._bold
         heavy = [t for t in textSpecs if t[2] in bold] if bold else []
         if not heavy:
@@ -808,6 +829,100 @@ class AxisTag(QtWidgets.QLabel):
         self.raise_()
 
 
+class _TableModel(QtCore.QAbstractTableModel):
+    """Bars (and indicator values) for Table view, read straight from the arrays: fast for any length."""
+
+    def __init__(self, df, cols, extra, chart):
+        super().__init__()
+        self.idx = df.index
+        self.cols = cols
+        self.data_ = [df[c].to_numpy(float) for c in cols] + [y for _n, y in extra]
+        self.heads = ["Date"] + cols + [n for n, _y in extra]
+        self.chart = chart
+        self.intraday = len(df) > 1 and (df.index[0] - df.index[1]) < pd.Timedelta(days=1)
+
+    def rowCount(self, parent=QtCore.QModelIndex()):
+        return len(self.idx)
+
+    def columnCount(self, parent=QtCore.QModelIndex()):
+        return len(self.heads)
+
+    def headerData(self, sec, orient, role=QtCore.Qt.ItemDataRole.DisplayRole):
+        if role == QtCore.Qt.ItemDataRole.DisplayRole and orient == QtCore.Qt.Orientation.Horizontal:
+            return self.heads[sec]
+        return None
+
+    def data(self, ix, role=QtCore.Qt.ItemDataRole.DisplayRole):
+        r, c = ix.row(), ix.column()
+        if role == QtCore.Qt.ItemDataRole.TextAlignmentRole:
+            return int((QtCore.Qt.AlignmentFlag.AlignLeft if c == 0 else QtCore.Qt.AlignmentFlag.AlignRight)
+                       | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        if role != QtCore.Qt.ItemDataRole.DisplayRole:
+            return None
+        if c == 0:
+            t = self.idx[r]
+            return t.strftime("%d %b %Y %H:%M" if self.intraday else "%d %b %Y")
+        v = self.data_[c - 1][r]
+        if v != v:
+            return "\u2014"
+        if self.heads[c] == "Volume":
+            return theme.fmt_vol(v)
+        return self.chart.fp(float(v))
+
+
+class TradeLabel(QtWidgets.QFrame):
+    """The box on an order / position line: [qty] [what] [x], like TradingView's."""
+
+    def __init__(self, chart, it: dict, color: str):
+        super().__init__(chart.glw)
+        self.chart, self.it = chart, it
+        self.setObjectName("tradelabel")
+        order = it.get("kind") == "order"
+        qty = abs(int(it.get("qty") or 0))
+        if order:
+            word = {"LIMIT": "LIMIT", "SL": "STOP LIMIT", "SL-M": "STOP", "MARKET": "MARKET"}.get(it.get("type"), "")
+            text = f"{it.get('side', '').title()} {word}".strip()
+            tcol = "#dbdbdb"
+        else:
+            pnl = float(it.get("pnl") or 0)
+            text = ("+" if pnl >= 0 else "\u2212") + f"{abs(pnl):,.2f}"
+            tcol = theme.UP if pnl >= 0 else theme.DOWN
+        self.setStyleSheet(f"QFrame#tradelabel {{ background: #000; border: 1px solid {color}; border-radius: 2px; }}"
+                           f" QLabel {{ background: transparent; font-size: 11px; padding: 0 6px; }}"
+                           f" QLabel#q {{ background: {color}; color: white; font-weight: 600; }}"
+                           f" QToolButton {{ background: transparent; border: 0; border-left: 1px solid {color};"
+                           f" color: #dbdbdb; padding: 0 5px; font-size: 11px; }}"
+                           f" QToolButton:hover {{ background: {color}; color: white; }}")
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        q = QtWidgets.QLabel(f"{qty:,}")
+        q.setObjectName("q")
+        h.addWidget(q)
+        t = QtWidgets.QLabel(text)
+        t.setStyleSheet(f"color: {tcol};")
+        h.addWidget(t)
+        x = QtWidgets.QToolButton()
+        x.setText("\u2715")
+        x.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        x.setToolTip("Cancel this order" if order else "Close this position at market")
+        x.clicked.connect(self._x)
+        h.addWidget(x)
+        self.setFixedHeight(20)
+        self.adjustSize()
+        tip = (f"{it.get('side', '')} {qty:,} \u00b7 {it.get('type', '')} @ {float(it['price']):,.2f}"
+               + ("  (drag the line to change the price)" if it.get("movable") else "")) if order else \
+            f"Position {int(it.get('qty') or 0):+,} @ {float(it['price']):,.2f}"
+        self.setToolTip(tip)
+        self.hide()
+
+    def _x(self):
+        if self.it.get("kind") == "order":
+            self.chart.orderCancelRequested.emit(self.it.get("obj"))
+        else:
+            self.chart.positionCloseRequested.emit(self.it.get("obj"))
+
+
 def _watermark_pixmap(size: int = 64, opacity: float = 0.22) -> QtGui.QPixmap:
     """The SN logo, faded, drawn in the bottom-left of every chart (TradingView puts its own logo there)."""
     from .data import ROOT
@@ -1073,6 +1188,10 @@ class ChartWidget(QtWidgets.QWidget):
     toolChanged = QtCore.Signal(object)
     drawingsChanged = QtCore.Signal()
     tradeRequested = QtCore.Signal(str, float)
+    orderCancelRequested = QtCore.Signal(object)            # an order line's x
+    orderMoveRequested = QtCore.Signal(object, float)       # an order line dragged to a new price
+    positionCloseRequested = QtCore.Signal(object)          # a position line's x
+    orderAtPrice = QtCore.Signal(str, str, float, bool)    # side, order type, price, at once (else: order panel)
     settingsRequested = QtCore.Signal()
     gotoDateRequested = QtCore.Signal()
     indicatorsChanged = QtCore.Signal()                      # inputs changed (saved by the window)
@@ -1220,7 +1339,8 @@ class ChartWidget(QtWidgets.QWidget):
         self.price.vb.sigXRangeChanged.connect(self._autoscale)
         self.price.vb.sigXRangeChanged.connect(lambda *_: self._sync_latest_btn())
         self.price.vb.sigRangeChanged.connect(lambda *_: (self._place_last_tag(), self._place_alert_tags(),
-                                                          self.layer.place_tags(), self._refresh_crosshair()))
+                                                          self._place_trade_tags(), self.layer.place_tags(),
+                                                          self._refresh_crosshair()))
         # labels on the scales are QWidgets: re-place them once pyqtgraph has finished laying the plots out
         # (a resize / layout change moves the axes AFTER the viewport's resize event)
         self._relayout_pending = False
@@ -1621,6 +1741,7 @@ class ChartWidget(QtWidgets.QWidget):
         if self.df is not None:                       # scale labels: right away (cheap) ...
             self._place_last_tag()
             self._place_alert_tags()
+            self._place_trade_tags()
             self.layer.place_tags()
         if self._relayout_pending:                    # ... legend / crosshair once the layout pass is over
             return
@@ -1670,6 +1791,7 @@ class ChartWidget(QtWidgets.QWidget):
             self.draw_bar.raise_()
         self._place_last_tag()
         self._place_alert_tags()
+        self._place_trade_tags()
         self.layer.place_tags()
         if hasattr(self, "replay_bar") and not self.replay_bar.isHidden():
             self.replay_bar.place()
@@ -2703,7 +2825,9 @@ class ChartWidget(QtWidgets.QWidget):
         try:
             inv, ok = self.glw.viewportTransform().inverted()
             if ok:
-                for tg in (self.last_tag, self.cd_tag, self.vol_tag):
+                lay = getattr(self, "layer", None)                  # drawings' labels too (h line, selected anchors)
+                extra = (list(lay._tags.values()) + list(lay._sel_y)) if lay is not None else []
+                for tg in (self.last_tag, self.cd_tag, self.vol_tag, *extra):
                     if tg.isHidden() or tg.parent() is None:
                         continue
                     g = tg.geometry()
@@ -2816,6 +2940,8 @@ class ChartWidget(QtWidgets.QWidget):
                 self._cursor_shape = cur
                 self.glw.viewport().setCursor(cur)
         i = int(round(mp.x()))
+        if getattr(self, "_vlock", None) is not None:
+            i = int(self._vlock)                         # locked by time: the line stays on that bar
         n = self._n()
         ix = float(i)                                    # TradingView: the vertical line snaps to the bar
         new_bar = i != getattr(self, "_hover_i", None)
@@ -2945,6 +3071,81 @@ class ChartWidget(QtWidgets.QWidget):
                 tg.setPos(xr, y)
         self.last_tag.raise_()
 
+    # ------------------------------------------------------------------ orders and positions on the chart
+    def set_trade_lines(self, items):
+        """TradingView's order / position lines. items: dicts with kind ('order' | 'position'), price, qty, side,
+        type, pnl, obj (the broker's Order / Position), movable. An order line can be dragged to a new price and
+        cancelled with its x; a position line shows the open P&L and closes with its x."""
+        sig = [(it.get("kind"), it.get("id"), round(float(it["price"]), 6), it.get("qty"), it.get("type"),
+                round(float(it.get("pnl") or 0), 2), bool(it.get("movable"))) for it in items]
+        if sig == getattr(self, "_trade_sig", None):
+            return
+        if any(ln.moving for ln, _t, _l, _i in getattr(self, "_trade_objs", [])):
+            return                                           # never pull a line away from under the mouse
+        self._trade_sig = sig
+        for ln, tag, lab, _it in getattr(self, "_trade_objs", []):
+            self.price.removeItem(ln)
+            tag.deleteLater()
+            lab.deleteLater()
+        self._trade_objs = []
+        for it in items:
+            order = it.get("kind") == "order"
+            buy = (it.get("side") == "BUY") if order else (it.get("qty", 0) > 0)
+            col = "#2962ff" if buy else theme.DOWN
+            pen = pg.mkPen(col, width=1, style=QtCore.Qt.PenStyle.DashLine if order else QtCore.Qt.PenStyle.SolidLine)
+            ln = pg.InfiniteLine(pos=float(self.ty(float(it["price"]))), angle=0,
+                                 movable=bool(order and it.get("movable")), pen=pen, hoverPen=pg.mkPen(col, width=2))
+            ln.setZValue(25)
+            ln.sigPositionChanged.connect(lambda *_a, l=ln: self._trade_line_dragging(l))
+            ln.sigPositionChangeFinished.connect(lambda *_a, l=ln, i=it: self._trade_line_moved(l, i))
+            self.price.addItem(ln, ignoreBounds=True)
+            tag = AxisTag(self, self.price, "y", col)
+            tag._price = float(it["price"])
+            tag.setText(self.axis_price(float(it["price"])))
+            lab = TradeLabel(self, it, col)
+            self._trade_objs.append((ln, tag, lab, it))
+        self._place_trade_tags()
+
+    def _trade_line_dragging(self, ln):
+        for l2, tag, lab, _it in getattr(self, "_trade_objs", []):
+            if l2 is ln:
+                px = float(self.iy(ln.value()))
+                tag._price = px
+                tag.setText(self.axis_price(px))
+        self._place_trade_tags()
+
+    def _trade_line_moved(self, ln, it):
+        px = float(self.iy(ln.value()))
+        if abs(px - float(it["price"])) > 1e-9:
+            self.orderMoveRequested.emit(it.get("obj"), px)
+
+    def _place_trade_tags(self):
+        objs = getattr(self, "_trade_objs", [])
+        if not objs or self.df is None:
+            return
+        g = self.glw
+        vb = self.price.vb
+        vr = vb.sceneBoundingRect()
+        vt = g.viewportTransform()
+        xr = vb.viewRange()[0][1]
+        (y0, y1) = vb.viewRange()[1]
+        ax = axis_rect(self.price.getAxis("right"))
+        for ln, tag, lab, _it in objs:
+            y = float(ln.value())
+            inside = y0 <= y <= y1
+            tag.setVisible(inside)
+            lab.setVisible(inside)
+            if not inside:
+                continue
+            tag._price = float(self.iy(y))
+            tag.setPos(xr, y)
+            sy = vb.mapViewToScene(QtCore.QPointF(xr, y)).y()
+            sy = min(max(sy, vr.top() + lab.height() / 2), vr.bottom() - lab.height() / 2)
+            pt = vt.map(QtCore.QPointF(ax.left(), sy))
+            lab.move(int(pt.x()) - lab.width() - 56, int(math.floor(pt.y())) - (lab.height() - 1) // 2)
+            lab.raise_()
+        self.last_tag.raise_()
+
     def effective_df(self):
         """Data a strategy is allowed to see: everything, or only the bars revealed so far in replay."""
         return self.df if (self._limit is None or self.df is None) else self.df.iloc[: self._limit]
@@ -2992,25 +3193,139 @@ class ChartWidget(QtWidgets.QWidget):
             menu.addSeparator()
         price = float(self.iy(mp.y()))
         ptxt = self.fp(price)                                 # in the symbol's own precision (TradingView)
-        menu.addAction(f"Copy price {ptxt}", lambda: QtWidgets.QApplication.clipboard().setText(ptxt.replace(",", "")))
-        menu.addAction(f"Add alert at {ptxt}\t{theme.sc('Alt+A')}", lambda: self.alertRequested.emit(float(price)))
-        menu.addAction(f"Add horizontal line at {ptxt}",
-                       lambda: self.layer.add("hline", [[self.x_to_time(mp.x()), price]]))
-        menu.addSeparator()
-        a = menu.addAction("Auto-scale price")
-        a.setCheckable(True)
-        a.setChecked(self.auto_y)
-        a.toggled.connect(self.set_auto_y)
-        menu.addAction("Reset chart view\t" + theme.sc("Alt+R"), lambda: (self.set_auto_y(True), self.go_latest()))
-        from .drawings import _CLIP
-        if _CLIP:
-            menu.addAction("Paste drawing\t" + theme.sc("Ctrl+V"), self.layer.paste)
-        menu.addAction("Undo\t" + theme.sc("Ctrl+Z"), self.layer.undo)
-        menu.addAction("Redo\t" + theme.sc("Ctrl+Shift+Z"), self.layer.redo)
-        menu.addAction("Remove all drawings", self.layer.clear)
-        menu.addSeparator()
-        menu.addAction("Settings…", self.settingsRequested.emit)
+        self._menu_tv(menu, price, ptxt, mp)
         menu.exec(QtGui.QCursor.pos())
+
+    def _menu_tv(self, menu, price: float, ptxt: str, mp):
+        """TradingView's chart menu, item for item (measured on tradingview.com)."""
+        from .drawings import _CLIP
+        menu.addAction(f"Copy price {ptxt}", lambda: QtWidgets.QApplication.clipboard().setText(ptxt.replace(",", "")))
+        pa = menu.addAction("Paste\t" + theme.sc("Ctrl+V"), self.layer.paste)
+        pa.setEnabled(bool(_CLIP))
+        menu.addSeparator()
+        sym = self.ticker() or "symbol"
+        menu.addAction(icons.get("bell"), f"Add alert on {sym} at {ptxt}\u2026\t{theme.sc('Alt+A')}",
+                       lambda: self.alertRequested.emit(float(price)))
+        last = float(self.df["Close"].iloc[-1]) if self.df is not None and len(self.df) else price
+        below = price < last
+        buy_t, sell_t = ("LIMIT", "SL-M") if below else ("SL-M", "LIMIT")
+        word = {"LIMIT": "limit", "SL-M": "stop"}
+        menu.addAction(icons.get("buy_order"), f"Buy 1 {sym} @ {ptxt} {word[buy_t]}\t{theme.sc('Alt+Shift+B')}",
+                       lambda: self.orderAtPrice.emit("BUY", buy_t, float(price), True))
+        menu.addAction(icons.get("sell_order"), f"Sell 1 {sym} @ {ptxt} {word[sell_t]}\t{theme.sc('Alt+Shift+S')}",
+                       lambda: self.orderAtPrice.emit("SELL", sell_t, float(price), True))
+        menu.addAction(icons.get("order_add"), f"Add order on {sym} at {ptxt}\u2026\t{theme.sc('Shift+T')}",
+                       lambda: self.orderAtPrice.emit("BUY", buy_t, float(price), False))
+        menu.addSeparator()
+        locked = getattr(self, "_vlock", None) is not None
+        menu.addAction("Unlock vertical cursor line" if locked else "Lock vertical cursor line by time",
+                       lambda: self.lock_vline(None if locked else int(round(mp.x()))))
+        menu.addSeparator()
+        menu.addAction("Table view", self.table_view)
+        menu.addAction("Object tree", self.object_tree)
+        n_ind = len(getattr(self, "_enabled", ()))
+        n_draw = len(self.layer.drawings)
+        if n_ind or n_draw:
+            menu.addSeparator()
+        if n_ind:
+            menu.addAction(f"Remove {n_ind} indicator" + ("s" if n_ind > 1 else ""), self.remove_all_indicators)
+        if n_draw:
+            menu.addAction(f"Remove {n_draw} drawing" + ("s" if n_draw > 1 else ""), self.layer.clear)
+        menu.addSeparator()
+        menu.addAction(icons.get("gear"), "Settings\u2026", self.settingsRequested.emit)
+
+    def lock_vline(self, i):
+        """TradingView's 'Lock vertical cursor line by time': the vertical line stays on that bar."""
+        self._vlock = i
+        if i is not None:
+            for pl in self._plots():
+                pl.vline.setPos(float(i))
+                pl.vline.show()
+            self._hover_i = None
+
+    def remove_all_indicators(self):
+        for k in list(getattr(self, "_ind_order", [])):
+            if k in self._enabled:
+                self.set_indicator(k, False)
+                self.indicatorToggled.emit(k, False)
+
+    def table_view(self):
+        """TradingView's Table view: every bar of the chart in a table, newest first."""
+        if self.df is None or not len(self.df):
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Table view \u00b7 {self.ticker() or ''}")
+        dlg.resize(760, 560)
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.setContentsMargins(10, 10, 10, 10)
+        df = self.df.iloc[::-1]
+        cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
+        extra = []
+        for k in getattr(self, "_ind_order", []):
+            if k in getattr(self, "_enabled", ()):
+                for _name, item in getattr(self, "_ind_items", {}).get(k, []):
+                    y = getattr(item, "yData", None)
+                    if y is not None and len(y) == len(self.df):
+                        extra.append((STD.STUDIES[k].title if k in STD.STUDIES else k, np.asarray(y)[::-1]))
+        tbl = QtWidgets.QTableView()
+        model = _TableModel(df, cols, extra, self)
+        tbl.setModel(model)
+        tbl.verticalHeader().hide()
+        tbl.verticalHeader().setDefaultSectionSize(26)
+        tbl.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        tbl.setAlternatingRowColors(True)
+        tbl.setShowGrid(False)
+        v.addWidget(tbl)
+        dlg.exec()
+
+    def object_tree(self):
+        """TradingView's Object tree: the symbol, its indicators and drawings; each can be removed here."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Object tree")
+        dlg.resize(380, 460)
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.setContentsMargins(12, 12, 12, 12)
+        tree = QtWidgets.QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.setColumnCount(2)
+        tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        tree.header().setStretchLastSection(False)
+        v.addWidget(tree)
+
+        def fill():
+            tree.clear()
+            root = QtWidgets.QTreeWidgetItem([self.display_name() if self.df is not None else "Chart", ""])
+            tree.addTopLevelItem(root)
+            for k in list(getattr(self, "_ind_order", [])):
+                if k not in getattr(self, "_enabled", ()):
+                    continue
+                it = QtWidgets.QTreeWidgetItem([STD.STUDIES[k].title if k in STD.STUDIES else k, ""])
+                root.addChild(it)
+                b = QtWidgets.QToolButton()
+                b.setIcon(icons.get("trash"))
+                b.setToolTip("Remove")
+                b.setAutoRaise(True)
+                b.clicked.connect(lambda _c=False, key=k: (self.set_indicator(key, False),
+                                                           self.indicatorToggled.emit(key, False), fill()))
+                tree.setItemWidget(it, 1, b)
+            for d in list(self.layer.drawings):
+                it = QtWidgets.QTreeWidgetItem([str(d.get("type", "drawing")).replace("hline", "Horizontal line")
+                                                .replace("trend", "Trend line").title(), ""])
+                root.addChild(it)
+                b = QtWidgets.QToolButton()
+                b.setIcon(icons.get("trash"))
+                b.setToolTip("Remove")
+                b.setAutoRaise(True)
+
+                def rm(_c=False, did=d.get("id")):
+                    self.layer.selected = did
+                    self.layer.delete_selected()
+                    fill()
+                b.clicked.connect(rm)
+                tree.setItemWidget(it, 1, b)
+            root.setExpanded(True)
+        fill()
+        dlg.exec()
 
     def _crosshair_off(self):
         """Mouse left the chart: hide the crosshair and its tags, legend shows the last bar again (TradingView)."""

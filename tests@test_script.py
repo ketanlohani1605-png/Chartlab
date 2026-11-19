@@ -36,3 +36,14 @@ while time.time() - t0 < 30 and "kaboom" not in w.log_view.toPlainText():
     app.processEvents(); time.sleep(0.05)
 assert "kaboom" in w.log_view.toPlainText()
 print("SCRIPT MODE OK")
+
+# the built app reads the script helpers from assets/script: the copies must be the package's own files
+import filecmp as _fc
+from pathlib import Path as _P
+_root = _P(__file__).resolve().parent.parent
+_pairs = [(_root / "chartlab" / "dhan_core.py", _root / "assets" / "script" / "dhan_core.py")]
+_pairs += [(f, _root / "assets" / "script" / "brokers" / f.name) for f in (_root / "chartlab" / "brokers").glob("*.py")]
+for _a, _b in _pairs:
+    assert _b.exists() and _fc.cmp(_a, _b, shallow=False), f"assets/script copy differs: {_b.name} (copy it again)"
+assert len(list((_root / "assets" / "script" / "brokers").glob("*.py"))) == len(_pairs) - 1
+print("SCRIPT HELPER COPIES OK")

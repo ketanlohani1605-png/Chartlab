@@ -110,6 +110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_data_dock()
         self._build_chain_dock()
         self._build_results_dock()
+        self._build_trading()
         self._build_right_rail()
         self._build_menu()
         hm = QtWidgets.QMenu(self)
@@ -167,6 +168,10 @@ class MainWindow(QtWidgets.QMainWindow):
             p.chart.replayChanged.connect(lambda: self.replay_btn.setChecked(self.active.chart.replay['active']))
             p.chart.alertRequested.connect(lambda price, pp=p: self.create_alert(price, pp))
             p.chart.tradeRequested.connect(self._on_trade)
+            p.chart.orderCancelRequested.connect(lambda o: o is not None and self.trader.cancel(o, self))
+            p.chart.orderMoveRequested.connect(self._order_moved)
+            p.chart.orderAtPrice.connect(self._order_at_price)
+            p.chart.positionCloseRequested.connect(lambda x: x is not None and self.trader.close_position(x, self))
             p.chart.settingsRequested.connect(self.open_settings)
             p.chart.gotoDateRequested.connect(self._goto_date)
             p.chart.indicatorsChanged.connect(lambda pp=p: self._ind_params_changed(pp))
@@ -365,8 +370,139 @@ class MainWindow(QtWidgets.QMainWindow):
         vb.setXRange(c - (c - a) * f, c + (b - c) * f, padding=0)
 
     def _on_trade(self, side, price):
-        sym = self.active.chart.label or "?"
-        self.statusBar().showMessage(f"PAPER {side} {sym} @ {price:,.2f}  (paper trade, no broker order sent)", 6000)
+        """Buy / Sell on the chart: the order panel, ready for that side at the current price."""
+        self.open_order_ticket(side, price)
+
+    # ------------------------------------------------------------------ trading
+    def _build_trading(self):
+        from .trading import TradingManager, TradingPanel
+        self.trader = TradingManager(self)
+        self.trade_panel = TradingPanel(self.trader)
+        self.trade_dock = QtWidgets.QDockWidget("Trading Panel", self)
+        self.trade_dock.setObjectName("trade_dock")
+        self.trade_dock.setWidget(self.trade_panel)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.trade_dock)
+        self.tabifyDockWidget(self.results_dock, self.trade_dock)
+        self.trade_dock.hide()
+        self.trade_dock.visibilityChanged.connect(lambda on: on and self.trader.refresh())
+        self.live.tickPrice.connect(self.trader.on_price)
+        self.live.tickPrice.connect(self._ticket_price)
+        self.live.feed.order.connect(lambda _d: self.trader.refresh())
+        self.live.wanted_symbols = self._trade_symbols
+        self.trader.updated.connect(self._update_trade_lines)
+        self.trader.instrumentReady.connect(lambda _s: self._update_trade_lines())
+        self.trader.notify.connect(self._trade_note)
+        self.trader.accountChanged.connect(self.live_sync)
+
+    def show_trading_panel(self):
+        self.trade_dock.show()
+        self.trade_dock.raise_()
+        self.trader.refresh()
+
+    def open_order_ticket(self, side: str = "BUY", price: float | None = None, order_type: str = "MARKET",
+                          symbol: str | None = None, at_price: float | None = None):
+        from .trading import OrderTicket
+        p = self.active
+        sym = symbol or self.live._norm(p.params.get("symbol", "")) if p is not None else (symbol or "")
+        if not sym or (p.df is None and not symbol):
+            self.statusBar().showMessage("Open a chart first: the order is for the symbol on the chart", 5000)
+            return
+        last = float(price or 0) or (float(p.df["Close"].iloc[-1]) if p.df is not None and len(p.df) else 0.0)
+        if last:
+            self.trader.on_price(sym, last)
+        dlg = OrderTicket(self.trader, sym, side, last, order_type, self)
+        if at_price:
+            dlg.price.setValue(at_price)
+            dlg.trig.setValue(at_price)
+        self._ticket = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._ticket = None
+
+    def _ticket_price(self, sym, px):
+        t = getattr(self, "_ticket", None)
+        if t is not None and t.symbol == sym:
+            t.set_last(px)
+
+    def _trade_symbols(self):
+        """Symbols the live feed should follow for trading even without a chart (paper orders need prices)."""
+        s = self.trader.snap
+        out = set()
+        if self.trader.broker().id == "paper":
+            out |= {o.token for o in s["orders"] if o.is_open}
+            out |= {p.token for p in s["positions"] if p.qty}
+        return sorted(out)
+
+    def _update_trade_lines(self):
+        if not hasattr(self, "trader"):
+            return
+        s = self.trader.snap
+        b = self.trader.broker()
+        movable = "modify" in b.caps
+        show = self.settings.value("trade_lines", "true") == "true"
+        for p in getattr(self, "panels", []):
+            items = []
+            sym = self.live._norm(p.params.get("symbol", "")) if p.df is not None else ""
+            tok = self.trader.token_of(sym) if (sym and show) else ""
+            if tok:
+                for o in s["orders"]:
+                    if o.is_open and str(o.token) == tok:
+                        px = o.price if (o.order_type in ("LIMIT", "SL") and o.price) else o.trigger
+                        if px:
+                            items.append({"kind": "order", "id": o.id, "price": px, "qty": o.pending or o.qty,
+                                          "side": o.side, "type": o.order_type, "obj": o, "movable": movable})
+                for po in s["positions"]:
+                    if po.qty and str(po.token) == tok and po.avg:
+                        items.append({"kind": "position", "id": "pos:" + po.product, "price": po.avg, "qty": po.qty,
+                                      "pnl": po.unrealised, "obj": po})
+            p.chart.set_trade_lines(items)
+
+    def _order_at_cursor(self, side: str, direct: bool = True):
+        """Alt+Shift+B / Alt+Shift+S / Shift+T: an order at the price under the crosshair (TradingView)."""
+        ch = self.active.chart
+        if ch.df is None or not len(ch.df):
+            return
+        hl = ch.price.hline
+        px = float(ch.iy(hl.value())) if hl.isVisible() else float(ch.df["Close"].iloc[-1])
+        last = float(ch.df["Close"].iloc[-1])
+        below = px < last
+        typ = ("LIMIT" if below else "SL-M") if side == "BUY" else ("SL-M" if below else "LIMIT")
+        self._order_at_price(side, typ, px, direct)
+
+    def _order_at_price(self, side: str, order_type: str, price: float, direct: bool):
+        """The chart menu's Buy / Sell at a price: one share (one lot for F&O) at once, like TradingView; 'Add order'
+        opens the order panel at that price instead."""
+        from .brokers import OrderRequest
+        p = self.active
+        sym = self.live._norm(p.params.get("symbol", "")) if p is not None else ""
+        if not sym or p.df is None:
+            return
+        last = float(p.df["Close"].iloc[-1])
+        self.trader.on_price(sym, last)
+        if not direct:
+            self.open_order_ticket(side, last, order_type, at_price=price)
+            return
+        inst = self.trader.instrument(sym)
+        lots = 1 if inst is not None and inst.derivative and inst.lot > 1 else 0
+        req = OrderRequest(sym, side, qty=0 if lots else 1, lots=lots, order_type=order_type,
+                           price=round(price, 2) if order_type in ("LIMIT", "SL") else 0.0,
+                           trigger=round(price, 2) if order_type in ("SL", "SL-M") else 0.0, instrument=inst)
+        self.trader.place(req, self, inst)
+
+    def _order_moved(self, order, price):
+        if order is None:
+            return
+        if order.order_type in ("LIMIT", "SL") and order.price:
+            self.trader.modify(order, self, price=round(price, 2))
+        else:
+            self.trader.modify(order, self, trigger=round(price, 2))
+
+    def _trade_note(self, text, level):
+        if level in ("ok", "error", "warn"):
+            col = {"ok": theme.UP, "error": theme.DOWN, "warn": "#ff9800"}[level]
+            title = {"ok": "Order", "error": "Order problem", "warn": "Check your order book"}[level]
+            alertmod.Toast(self, title, text, col)
 
     def _goto_date(self):
         from .tvui import GoTo
@@ -666,6 +802,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acct_btn.setText("Accounts")
         self.acct_btn.setToolTip("Broker accounts: API data + run one script on many accounts")
         m_ = QtWidgets.QMenu(self.acct_btn)
+        m_.addAction("Trading Panel", lambda: self.show_trading_panel())
+        m_.addAction("New order\u2026", lambda: self.open_order_ticket("BUY"))
+        self.trade_with_menu = m_.addMenu("Trade with")
+        self.trade_with_menu.aboutToShow.connect(self._fill_trade_with)
+        m_.addSeparator()
         m_.addAction("Manage broker accounts…", self.manage_accounts)
         m_.addAction("All accounts: status, balance, P&&L…", self.accounts_overview)
         ar = m_.addAction("Renew tokens automatically (Dhan: 24 h)")
@@ -1068,7 +1209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from .optionchain import OptionChain
         self.live = LiveController(self)
         self.live.enabled = self.settings.value("live_prices", "true") == "true"
-        self.chain = OptionChain(account_fn=self.live.account)
+        self.chain = OptionChain(account_fn=self.live.dhan_account)
         self.chain_dock = QtWidgets.QDockWidget("Option chain", self)
         self.chain_dock.setObjectName("chain_dock")
         self.chain_dock.setWidget(self.chain)
@@ -1108,9 +1249,10 @@ class MainWindow(QtWidgets.QMainWindow):
         lab.setVisible(bool(text))
         lab.setText(text + "  ")
         lab.setStyleSheet(f"color:{col};")
-        tip = {"live": "Real-time prices from Dhan's live market feed: every trade moves the chart.",
-               "polling": "Prices are fetched from Dhan every 1.5 seconds (the live socket is not connected).",
-               "connecting": "Connecting to Dhan's live market feed\u2026",
+        bn = self.live.feed.broker_name if hasattr(self, "live") else "the broker"
+        tip = {"live": f"Real-time prices from {bn}'s live market feed: every trade moves the chart.",
+               "polling": f"Prices are fetched from {bn} every 1.5 seconds (the live socket is not connected).",
+               "connecting": f"Connecting to {bn}'s live market feed\u2026",
                "error": "Live prices are not running: " + (detail or "")}.get(mode, "")
         lab.setToolTip(tip)
         if mode == "error" and detail and getattr(self, "_live_err", "") != detail:
@@ -1388,6 +1530,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for k in ("Ctrl+Shift+Z", "Ctrl+Y"):
             QtGui.QShortcut(QtGui.QKeySequence(k), self, activated=lambda: self.active.chart.layer.redo())
         QtGui.QShortcut(QtGui.QKeySequence("Alt+A"), self, activated=lambda: self.create_alert())
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+Shift+B"), self, activated=lambda: self._order_at_cursor("BUY"))
+        QtGui.QShortcut(QtGui.QKeySequence("Alt+Shift+S"), self, activated=lambda: self._order_at_cursor("SELL"))
+        QtGui.QShortcut(QtGui.QKeySequence("Shift+T"), self, activated=lambda: self._order_at_cursor("BUY", False))
         QtGui.QShortcut(QtGui.QKeySequence("Alt+R"), self, activated=lambda: self.active.chart.go_latest())
         for key, tool in (("Alt+T", "trend"), ("Alt+H", "hline"), ("Alt+J", "hray"), ("Alt+V", "vline"),
                           ("Alt+C", "crossline"), ("Alt+F", "fib"), ("Shift+Alt+R", "rect")):
@@ -2023,6 +2168,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 pn.chart.trading_ready = ready
                 pn.chart._place_overlays()
 
+    def _fill_trade_with(self):
+        from .trading import OrderTicket
+        m = self.trade_with_menu
+        m.clear()
+        g = QtGui.QActionGroup(m)
+        for acc in self.trader.accounts():
+            act = m.addAction(OrderTicket._acct_text(acc))
+            act.setCheckable(True)
+            act.setChecked(acc["name"] == self.trader.name)
+            g.addAction(act)
+            act.triggered.connect(lambda _c=False, n=acc["name"]: self.trader.set_account(n))
+        m.addSeparator()
+        cl = m.addAction("Confirm every LIVE order")
+        cl.setCheckable(True)
+        cl.setChecked(self.settings.value("confirm_live", "true") == "true")
+        cl.triggered.connect(lambda on: self.settings.setValue("confirm_live", "true" if on else "false"))
+        tl = m.addAction("Show orders and positions on the chart")
+        tl.setCheckable(True)
+        tl.setChecked(self.settings.value("trade_lines", "true") == "true")
+        tl.triggered.connect(lambda on: (self.settings.setValue("trade_lines", "true" if on else "false"),
+                                         self._update_trade_lines()))
+        m.addAction("Reset paper account\u2026", self._reset_paper)
+
+    def _reset_paper(self):
+        b = self.trader.broker()
+        if b.id != "paper":
+            self.statusBar().showMessage("Choose a paper account first (Trade with)", 5000)
+            return
+        if QtWidgets.QMessageBox.question(self, "Reset paper account",
+                                          f"Clear every paper order and position of '{b.acct.get('name')}' and start "
+                                          "again with fresh cash?") == QtWidgets.QMessageBox.StandardButton.Yes:
+            b.reset()
+            self.trader.refresh()
+
     def accounts_overview(self):
         acctmod.OverviewDialog(self).exec()
         self._update_acct_dot()
@@ -2122,7 +2301,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not re.search(r"^def\s+strategy\s*\(", code, re.M):
             self.statusBar().showMessage("Auto-trade needs a strategy with  def strategy(df):  in the editor")
             return
-        accts = [a for a in acctmod.load_accounts() if a.get("broker") == "dhan"]
+        accts = [a for a in acctmod.load_accounts() if a.get("broker") in acctmod.BROKERS]
         if not accts:
             self.statusBar().showMessage("Connect at least one broker account first")
             self.manage_accounts()
@@ -2390,6 +2569,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_status(panel)
         self._sync_watch_price(panel)
         self.live_sync()
+        self._feed_trade_price(panel)
         if panel is self.active:
             self.chain.follow(str(panel.params.get("symbol", "")))
             self._sync_toolbar()
@@ -2546,9 +2726,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._quiet_status(                                     # (TradingView shows nothing when a chart loads)
             f"{panel.chart.ticker()}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} \u2192 {df.index[-1]:%d %b %Y}{took}")
 
+    def _feed_trade_price(self, panel):
+        if not hasattr(self, "trader") or panel.df is None or not len(panel.df):
+            return
+        sym = self.live._norm(panel.params.get("symbol", ""))
+        if sym:
+            self.trader.on_price(sym, float(panel.df["Close"].iloc[-1]))
+        self._update_trade_lines()
+
     def _on_refreshed(self, panel):
         """New bars arrived from a quiet auto refresh: keep alerts, strategy and labels in step."""
         df = panel.df
+        self._feed_trade_price(panel)
         self._sync_watch_price(panel)
         if panel is self.active and getattr(panel, "fresh_ms", None):
             self._load_status(panel)
@@ -3044,7 +3233,7 @@ def selftest() -> int:
     import pandas as pd
     theme.apply_pg_config()
     app = QtWidgets.QApplication(sys.argv[:1])
-    app.setStyle("Fusion")
+    app.setStyle(theme.make_style())
     theme.check_icon_path()
     app.setStyleSheet(theme.STYLESHEET)
     win = MainWindow(QtCore.QSettings(os.path.join(tempfile.mkdtemp(), "t.ini"), QtCore.QSettings.Format.IniFormat))
@@ -3088,7 +3277,7 @@ def main():
     _setup_logging()
     theme.apply_pg_config()
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyle("Fusion")
+    app.setStyle(theme.make_style())
     app.setApplicationName("ChartLab")
     _ic = datamod.ROOT / "assets" / "logo.png"
     if _ic.exists():

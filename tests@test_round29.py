@@ -309,7 +309,7 @@ def _():
     lay.selected = did; lay.rebuild(); pump(40); bar = ch.draw_bar; assert bar.isVisible()
     bar.width_btn.menu().actions()[3].trigger(); bar.style_btn.menu().actions()[1].trigger(); bar.color_btn.menu().actions()[1].trigger(); pump(30)
     d = lay.get(did); assert (d["w"], d["ls"], d["color"]) == (4.0, "dash", "#f23645"), d
-    pen = lay._items[did][0].opts["pen"]; assert pen.style() == QtCore.Qt.PenStyle.DashLine and pen.widthF() > 4
+    pen = lay._items[did][0].opts["pen"]; assert pen.style() == QtCore.Qt.PenStyle.DashLine and pen.widthF() == 4
     js = lay.to_json(); bar.lock_btn.click(); pump(30); assert lay.get(did).get("lock")
     xy = lay._xy(lay.get(did)); q = ch.glw.mapFromScene(vb.mapViewToScene(QtCore.QPointF((xy[0][0] + xy[1][0]) / 2, (xy[0][1] + xy[1][1]) / 2)))
     before = [list(p_) for p_ in lay.get(did)["pts"]]; drag(q, QtCore.QPoint(q.x() + 40, q.y() + 40)); vb._stop_anim()

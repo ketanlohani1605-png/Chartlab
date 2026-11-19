@@ -110,6 +110,118 @@ def apply_pg_config():
     pg.setConfigOptions(background=BG, foreground=TEXT, antialias=False)
 
 
+# TradingView's menus, measured on tradingview.com: 32 px rows; a 28 px icon box 8 px in from the edge; the label
+# 40 px in, 14 px #b8b8b8 (#dbdbdb under the mouse, row #222222); the shortcut 12 px #636363 ending 20 px from the
+# right edge; 13 px separators with a 1 px #303030 line (the separators stay in the style sheet).
+MENU_ROW, MENU_LEFT, MENU_RIGHT, MENU_GAP, MENU_ICON_X, MENU_ICON = 32, 40, 20, 24, 8, 28
+MENU_TEXT, MENU_HOT, MENU_OFF, MENU_SC, MENU_SEL = "#b8b8b8", "#dbdbdb", "#5d5d5d", "#636363", "#222222"
+
+
+def make_style():
+    """The app's style: Fusion, with TradingView's menu rows (Qt style sheets cannot give a shortcut its own colour
+    and size, or put the icon in TradingView's box)."""
+    from PySide6 import QtCore, QtGui, QtWidgets
+
+    S = QtWidgets.QStyle
+
+    class TVStyle(QtWidgets.QProxyStyle):
+        def _ours(self, opt, w) -> bool:
+            return (isinstance(w, QtWidgets.QMenu) and isinstance(opt, QtWidgets.QStyleOptionMenuItem)
+                    and opt.menuItemType in (QtWidgets.QStyleOptionMenuItem.MenuItemType.Normal,
+                                             QtWidgets.QStyleOptionMenuItem.MenuItemType.SubMenu,
+                                             QtWidgets.QStyleOptionMenuItem.MenuItemType.DefaultItem))
+
+        def sizeFromContents(self, ct, opt, size, w=None):
+            if ct == S.ContentsType.CT_MenuItem and self._ours(opt, w):
+                # size = the label's width in the menu font; QMenu adds the widest shortcut itself
+                has_sc = "\t" in (opt.text or "")
+                sub = opt.menuItemType == QtWidgets.QStyleOptionMenuItem.MenuItemType.SubMenu
+                return QtCore.QSize(MENU_LEFT + size.width() + (MENU_GAP if has_sc else 0) + MENU_RIGHT
+                                    + (14 if sub else 0), MENU_ROW)
+            return super().sizeFromContents(ct, opt, size, w)
+
+        def polish(self, w):
+            if isinstance(w, QtWidgets.QMenu):
+                w.installEventFilter(painter)
+                return
+            super().polish(w)
+
+    class MenuPaint(QtCore.QObject):
+        """Paints a whole menu the TradingView way. (With a style sheet on the app Qt draws menu rows itself and
+        never asks the style, so the menu's paint event is taken over; sizes still come from TVStyle.)"""
+
+        def eventFilter(self, m, ev):
+            if ev.type() != QtCore.QEvent.Type.Paint or not isinstance(m, QtWidgets.QMenu):
+                return False
+            p = QtGui.QPainter(m)
+            p.fillRect(m.rect(), QtGui.QColor("#161616"))
+            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            p.setPen(QtGui.QPen(QtGui.QColor("#262626"), 1))
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QtCore.QRectF(m.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
+            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            act = m.activeAction()
+            for a in m.actions():
+                r = m.actionGeometry(a)
+                if not a.isVisible() or r.isEmpty() or isinstance(a, QtWidgets.QWidgetAction):
+                    continue
+                if a.isSeparator():
+                    p.fillRect(QtCore.QRect(r.left(), r.center().y(), r.width(), 1), QtGui.QColor("#303030"))
+                    continue
+                self._row(m, a, r, p, a is act)
+            p.end()
+            return True
+
+        def _row(self, m, a, r, p, active):
+            on = a.isEnabled()
+            hot = on and active
+            p.save()
+            if hot:
+                p.fillRect(r, QtGui.QColor(MENU_SEL))
+            col = QtGui.QColor(MENU_HOT if hot else (MENU_TEXT if on else MENU_OFF))
+            box = QtCore.QRect(r.left() + MENU_ICON_X - 1, r.top() + (r.height() - MENU_ICON) // 2, MENU_ICON, MENU_ICON)
+            if a.isCheckable() and a.isChecked():
+                p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+                pen = QtGui.QPen(QtGui.QColor(MENU_HOT if on else MENU_OFF), 1.6)
+                pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                c = QtCore.QPointF(box.center()) + QtCore.QPointF(0.5, 0.5)
+                p.drawPolyline([c + QtCore.QPointF(-5, 0), c + QtCore.QPointF(-1.5, 3.5), c + QtCore.QPointF(5, -3.5)])
+            elif not a.icon().isNull():
+                mode = (QtGui.QIcon.Mode.Active if hot else QtGui.QIcon.Mode.Normal) if on else QtGui.QIcon.Mode.Disabled
+                a.icon().paint(p, box, QtCore.Qt.AlignmentFlag.AlignCenter, mode, QtGui.QIcon.State.Off)
+            label, _tab, short = (a.text() or "").partition("\t")
+            if not short and not a.shortcut().isEmpty():
+                short = a.shortcut().toString(QtGui.QKeySequence.SequenceFormat.NativeText)
+            flags = (QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.TextFlag.TextHideMnemonic
+                     | QtCore.Qt.TextFlag.TextSingleLine)
+            f = QtGui.QFont(a.font() if a.font() != QtWidgets.QApplication.font() else m.font())
+            p.setFont(f)
+            p.setPen(col)
+            p.drawText(QtCore.QRect(r.left() + MENU_LEFT - 1, r.top(), r.width() - MENU_LEFT, r.height()),
+                       int(flags | QtCore.Qt.AlignmentFlag.AlignLeft), label)
+            if short:
+                fs = QtGui.QFont(f)
+                fs.setPixelSize(12)
+                p.setFont(fs)
+                p.setPen(QtGui.QColor(MENU_SC if on else MENU_OFF))
+                p.drawText(QtCore.QRect(r.left(), r.top(), r.width() - MENU_RIGHT + 1, r.height()),
+                           int(flags | QtCore.Qt.AlignmentFlag.AlignRight), short)
+            if a.menu() is not None:
+                p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+                pen = QtGui.QPen(col, 1.4)
+                pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                x, y = r.right() - MENU_RIGHT + 0.5, r.center().y() + 0.5
+                p.drawPolyline([QtCore.QPointF(x - 3, y - 4.5), QtCore.QPointF(x + 1.5, y), QtCore.QPointF(x - 3, y + 4.5)])
+            p.restore()
+
+    painter = MenuPaint(QtWidgets.QApplication.instance())
+    return TVStyle("Fusion")
+
+
 STYLESHEET = f"""
 * {{ font-size: 13px; }}
 QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; }}
@@ -236,15 +348,8 @@ QPushButton#primary:pressed {{ background: #1e53e5; }}
 QFrame#vsep {{ background: #2e2e2e; }}
 QLabel#panelTitle {{ background: {BG}; color: white; font-size: 15px; font-weight: 600; padding: 10px 14px 8px 14px; }}
 QToolButton#srcbtn {{ color: #b8b8b8; font-size: 14px; padding: 5px 8px; }}
-QMenu {{ background: #1e1e1e; border: 1px solid #2e2e2e; border-radius: 8px; padding: 6px 0; }}
-QMenu::item {{ padding: 7px 28px 7px 16px; border-radius: 0; color: #dbdbdb; }}
-QMenu::item:selected {{ background: #2e2e2e; color: white; }}
-QMenu::item:disabled {{ color: #6a6d78; }}
-QMenu::item:checked {{ color: #ffffff; background: #262626; }}
-QMenu::item:checked:selected {{ background: #2e2e2e; }}
-QMenu::separator {{ height: 1px; background: #2e2e2e; margin: 5px 0; }}
-QMenu::icon {{ padding-left: 10px; }}
-QMenu::indicator {{ width: 14px; height: 14px; left: 6px; }}
+QMenu {{ background: #161616; border: 1px solid #262626; border-radius: 6px; padding: 6px 0; font-size: 14px; }}
+QMenu::separator {{ height: 1px; background: #303030; margin: 6px 0; }}
 QStatusBar {{ background: {BG}; color: {MUTED}; border-top: 4px solid {GUTTER}; min-height: 20px; font-size: 12px; }}
 QToolTip {{ background: #1a1a1a; color: {TEXT}; border: 1px solid {BORDER}; padding: 4px 6px; }}
 """

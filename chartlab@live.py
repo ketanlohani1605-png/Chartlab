@@ -1,73 +1,32 @@
-"""Real-time prices from the connected Dhan account.
+"""Real-time prices from the connected broker account (Dhan, Zerodha, Upstox, Angel One or Fyers).
 
-One WebSocket (Dhan live market feed v2) carries every instrument that is on screen: the charts, the option chain and
-the watchlist. Ticks update the newest bar in place. If the socket cannot connect, prices are polled once a second
-over the plain HTTPS API instead, so the charts keep moving either way.
+One WebSocket carries every instrument that is on screen: the charts, the option chain and the watchlist. Ticks update
+the newest bar in place. If the socket cannot connect, prices are polled over the broker's plain HTTPS API instead
+(about once a second), so the charts keep moving either way. The socket protocols themselves live in
+brokers/feeds.py; this file only drives them.
 
 Nothing here places orders; it only reads prices."""
 from __future__ import annotations
 
 import datetime as dt
 import json
-import struct
 import time
 
 from PySide6 import QtCore, QtNetwork, QtWidgets
 
 from . import dhan_core
+from .brokers import feeds as _feeds
 
 try:                                                     # QtWebSockets is an add-on module: polling works without it
     from PySide6 import QtWebSockets
 except Exception:  # noqa: BLE001
     QtWebSockets = None
 
-SEG_NUM = {0: "IDX_I", 1: "NSE_EQ", 2: "NSE_FNO", 3: "NSE_CURRENCY", 4: "BSE_EQ", 5: "MCX_COMM", 7: "BSE_CURRENCY",
-           8: "BSE_FNO"}
-_SIZE = {2: 16, 4: 50, 5: 12, 6: 16, 7: 8, 8: 162, 50: 10}
+SEG_NUM = _feeds.DHAN_SEG
 IST = 19800
-ERRORS = {805: "too many live connections on this Dhan account (5 allowed)",
-          806: "this Dhan account has no Data API subscription (needed for live prices and candles)",
-          807: "the Dhan access token has expired: paste a fresh one in Accounts",
-          808: "Dhan did not accept the client id / access token",
-          809: "the Dhan access token is not valid", 810: "the Dhan client id is not valid"}
-
-
-def parse_packets(data: bytes) -> list[dict]:
-    """Dhan's little-endian binary feed -> [{'kind': 'tick'|'prev'|'oi'|'bye', 'seg', 'sid', ...}]."""
-    out, p, n = [], 0, len(data)
-    while p + 8 <= n:
-        code = data[p]
-        mlen = struct.unpack_from("<H", data, p + 1)[0]
-        size = _SIZE.get(code) or (mlen if 8 <= mlen <= n - p else n - p)
-        if p + size > n:
-            break
-        seg = SEG_NUM.get(data[p + 3], str(data[p + 3]))
-        sid = str(struct.unpack_from("<I", data, p + 4)[0])
-        b = p + 8
-        try:
-            if code in (1, 2) and size >= 16:              # index / ticker: price + trade time
-                ltp, ltt = struct.unpack_from("<fI", data, b)
-                out.append({"kind": "tick", "seg": seg, "sid": sid, "ltp": ltp, "ltt": ltt, "vol": -1.0})
-            elif code == 4:                                # quote: + day volume and day open/high/low
-                ltp, _q, ltt, _atp, vol, _ts, _tb, o, c, h, lo = struct.unpack_from("<fHIfIIIffff", data, b)
-                out.append({"kind": "tick", "seg": seg, "sid": sid, "ltp": ltp, "ltt": ltt, "vol": float(vol),
-                            "open": o, "high": h, "low": lo, "close": c})
-            elif code == 8:                                # full packet
-                ltp, _q, ltt, _atp, vol, _ts, _tb, oi, _oh, _ol, o, c, h, lo = struct.unpack_from(
-                    "<fHIfIIIIIIffff", data, b)
-                out.append({"kind": "tick", "seg": seg, "sid": sid, "ltp": ltp, "ltt": ltt, "vol": float(vol),
-                            "open": o, "high": h, "low": lo, "close": c, "oi": float(oi)})
-            elif code == 6:
-                prev, _oi = struct.unpack_from("<fI", data, b)
-                out.append({"kind": "prev", "seg": seg, "sid": sid, "prev": prev})
-            elif code == 5:
-                out.append({"kind": "oi", "seg": seg, "sid": sid, "oi": float(struct.unpack_from("<I", data, b)[0])})
-            elif code == 50:
-                out.append({"kind": "bye", "code": struct.unpack_from("<H", data, b)[0]})
-        except struct.error:
-            break
-        p += size
-    return out
+ERRORS = _feeds.DHAN_ERRORS
+parse_packets = _feeds.dhan_packets                      # kept for callers / tests of the Dhan feed
+LIVE_BROKERS = ("dhan", "zerodha", "upstox", "angel", "fyers")
 
 
 def market_open(now: float | None = None) -> bool:
@@ -92,21 +51,31 @@ class _Call(QtCore.QThread):
             self.failed.emit(str(e))
 
 
+def _broker_of(acct):
+    from . import brokers
+    return brokers.get(acct)
+
+
 class LiveFeed(QtCore.QObject):
-    tick = QtCore.Signal(str, str, float, float, float)       # segment, security id, price, trade time, day volume
+    tick = QtCore.Signal(str, str, float, float, float)       # key part 1, key part 2, price, trade time, day volume
     prev = QtCore.Signal(str, str, float)                     # yesterday's close
     state = QtCore.Signal(str, str)                           # 'off' | 'connecting' | 'live' | 'polling' | 'error', text
+    order = QtCore.Signal(object)                             # an order update pushed by the broker
 
-    URL = "wss://api-feed.dhan.co"
+    URL = "wss://api-feed.dhan.co"                            # Dhan's feed (tests point this at a local server)
     POLL_MS = 1500
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.acct = None
+        self.broker = None
+        self.proto = None
         self.wanted: set = set()
+        self.insts: dict = {}            # key -> Instrument (needed to poll prices of non-Dhan brokers)
         self._subbed: set = set()
         self._ws = None
         self._up = False                 # socket is open
+        self._prep = None                # background pre-step (Upstox: authorise the socket address)
         self._last_packet = 0.0
         self._fails = 0
         self._blocked_until = 0.0        # no socket attempts before this time (auth / subscription errors)
@@ -124,19 +93,37 @@ class LiveFeed(QtCore.QObject):
         self._watch = QtCore.QTimer(self)
         self._watch.setInterval(20000)
         self._watch.timeout.connect(self._watchdog)
+        self._ping = QtCore.QTimer(self)
+        self._ping.timeout.connect(self._send_ping)
 
     # ------------------------------------------------------------------ public
+    @property
+    def broker_name(self) -> str:
+        return getattr(self.broker, "name", "the broker")
+
     def set_account(self, acct: dict | None):
-        key = (acct or {}).get("client_id"), (acct or {}).get("access_token")
-        if key == ((self.acct or {}).get("client_id"), (self.acct or {}).get("access_token")):
+        def sig(a):
+            a = a or {}
+            return (a.get("name"), a.get("broker"), a.get("client_id"), a.get("access_token"), a.get("feed_token"),
+                    a.get("api_key"), a.get("app_id"))
+        if sig(acct) == sig(self.acct):
             return
-        self.acct = acct if acct and acct.get("access_token") else None
+        self.acct = acct if acct and acct.get("access_token") and acct.get("broker") in LIVE_BROKERS else None
+        self.broker = self.proto = None
+        if self.acct is not None:
+            try:
+                self.broker = _broker_of(self.acct)
+                self.proto = _feeds.proto_for(self.broker)
+            except Exception:  # noqa: BLE001 - unknown broker: no live prices, nothing breaks
+                self.acct = None
         self._fails, self._blocked_until, self._poll_fail, self._poll_pause = 0, 0.0, 0, 0.0
         self._close()
         self._kick()
 
-    def watch(self, instruments):
+    def watch(self, instruments, insts: dict | None = None):
         new = {(str(s), str(i)) for s, i in instruments}
+        if insts:
+            self.insts.update(insts)
         if new == self.wanted:
             return
         self.wanted = new
@@ -148,10 +135,11 @@ class LiveFeed(QtCore.QObject):
     def stop(self):
         self.acct, self.wanted = None, set()
         self._close()
-        for t in (self._retry, self._poll, self._watch):
+        for t in (self._retry, self._poll, self._watch, self._ping):
             t.stop()
-        if self._poll_job is not None:
-            self._poll_job.wait(3000)
+        for j in (self._poll_job, self._prep):
+            if j is not None:
+                j.wait(3000)
 
     # ------------------------------------------------------------------ socket
     def _set(self, mode, detail=""):
@@ -165,7 +153,7 @@ class LiveFeed(QtCore.QObject):
             self._poll.stop()
             self._watch.stop()
             self._retry.stop()
-            self._set("off", "" if self.acct else "no Dhan account connected")
+            self._set("off", "" if self.acct else "no broker account connected")
             return
         if not self._watch.isActive():
             self._watch.start()
@@ -175,73 +163,120 @@ class LiveFeed(QtCore.QObject):
             self._open()
 
     def _open(self):
-        if self._ws is not None or not self.acct or not self.wanted:
+        if self._ws is not None or self._prep is not None or not self.acct or not self.wanted or self.proto is None:
             return
         if QtWebSockets is None or time.time() < self._blocked_until:
             return
         self._set("connecting" if self.mode != "polling" else "polling", self.detail if self.mode == "polling" else "")
+        if isinstance(self.proto, _feeds.DhanProto):
+            self.proto.URL = self.URL
+        if type(self.proto).prepare is not _feeds.Proto.prepare:
+            job = _Call(self.proto.prepare, self)            # e.g. Upstox: ask for the authorised address first
+            self._prep = job
+            job.done.connect(lambda _r, p=self.proto: self._connect(p))
+            job.failed.connect(self._prep_failed)
+            job.finished.connect(lambda: setattr(self, "_prep", None))
+            job.start()
+            return
+        self._connect(self.proto)
+
+    def _prep_failed(self, msg):
+        self._prep = None
+        if any(w in msg.lower() for w in ("token", "log in", "auth")):
+            self._blocked_until = time.time() + 600
+            self._set("error", msg[:160])
+            self._drop(schedule=False)
+            return
+        self._drop()
+
+    def _connect(self, proto):
+        if proto is not self.proto or self._ws is not None or not self.acct:
+            return
         ws = QtWebSockets.QWebSocket("", QtWebSockets.QWebSocketProtocol.Version.VersionLatest, self)
         self._ws = ws
         ws.connected.connect(self._connected)
         ws.disconnected.connect(self._gone)
         ws.binaryMessageReceived.connect(self._binary)
-        url = QtCore.QUrl(self.URL)
-        q = QtCore.QUrlQuery()
-        q.addQueryItem("version", "2")
-        q.addQueryItem("token", str(self.acct["access_token"]))
-        q.addQueryItem("clientId", str(self.acct["client_id"]))
-        q.addQueryItem("authType", "2")
-        url.setQuery(q)
-        ws.open(url)
+        ws.textMessageReceived.connect(self._text)
+        req = QtNetwork.QNetworkRequest(QtCore.QUrl(proto.url()))
+        for k, v in (proto.headers() or {}).items():
+            if v:
+                req.setRawHeader(k.encode(), str(v).encode())
+        ws.open(req)
         QtCore.QTimer.singleShot(8000, lambda w=ws: self._give_up(w))
 
     def _give_up(self, ws):
         if ws is self._ws and not self._up:                  # never connected: drop it and try again later
             self._drop()
 
+    def _send(self, msg):
+        if self._ws is None:
+            return
+        if isinstance(msg, (bytes, bytearray)):
+            self._ws.sendBinaryMessage(QtCore.QByteArray(bytes(msg)))
+        else:
+            self._ws.sendTextMessage(msg)
+
     def _connected(self):
         if self.sender() is not self._ws:
             return
         self._up, self._subbed = True, set()
         self._last_packet = time.time()
+        for m in self.proto.on_open():
+            self._send(m)
         self._sync()
+        if self.proto.ping_every:
+            self._ping.start(int(self.proto.ping_every * 1000))
         self._set("live", "")
 
+    def _send_ping(self):
+        if self._up and self.proto is not None:
+            m = self.proto.ping()
+            if m is not None:
+                self._send(m)
+
     def _sync(self):
-        if not self._up or self._ws is None:
+        if not self._up or self._ws is None or self.proto is None:
             return
-        add, gone = self.wanted - self._subbed, self._subbed - self.wanted
-        for items, tick_code, quote_code in ((gone, 16, 18), (add, 15, 17)):
-            # an index has no volume / depth: Dhan sends it as a ticker; everything else as a quote (with volume)
-            for code, part in ((tick_code, [x for x in items if x[0] == "IDX_I"]),
-                               (quote_code, [x for x in items if x[0] != "IDX_I"])):
-                part = sorted(part)
-                for i in range(0, len(part), 100):
-                    chunk = part[i:i + 100]
-                    self._ws.sendTextMessage(json.dumps({
-                        "RequestCode": code, "InstrumentCount": len(chunk),
-                        "InstrumentList": [{"ExchangeSegment": s, "SecurityId": str(k)} for s, k in chunk]}))
+        add, gone = sorted(self.wanted - self._subbed), sorted(self._subbed - self.wanted)
+        if gone:
+            for m in self.proto.unsubscribe(gone):
+                self._send(m)
+        if add:
+            for m in self.proto.subscribe(add[:self.proto.max_keys]):
+                self._send(m)
         self._subbed = set(self.wanted)
 
     def _binary(self, data):
         if self.sender() is not self._ws:
             return
+        self._handle(bytes(data))
+
+    def _text(self, text):
+        if self.sender() is not self._ws:
+            return
+        self._handle(str(text))
+
+    def _handle(self, data):
         self._last_packet = time.time()
         self._fails = 0
-        for m in parse_packets(bytes(data)):
-            k = m["kind"]
+        for e in self.proto.parse(data):
+            k = e["kind"]
             if k == "tick":
-                if m["ltp"] > 0:
-                    self.tick.emit(m["seg"], m["sid"], float(m["ltp"]), float(m["ltt"]), float(m["vol"]))
+                s, i = e["key"]
+                self.tick.emit(str(s), str(i), float(e["ltp"]), float(e.get("ltt") or 0), float(e.get("vol", -1)))
             elif k == "prev":
-                self.prev.emit(m["seg"], m["sid"], float(m["prev"]))
-            elif k == "bye":
-                code = int(m["code"])
-                why = ERRORS.get(code, f"Dhan closed the live feed (code {code})")
-                if code in (806, 807, 808, 809, 810):
+                s, i = e["key"]
+                self.prev.emit(str(s), str(i), float(e["prev"]))
+            elif k == "order":
+                self.order.emit(e.get("data") or {})
+            elif k == "send":
+                self._send(e["data"])
+            elif k == "error":
+                if e.get("fatal"):
                     self._blocked_until = time.time() + 600      # nothing changes until the account does
                     self._drop(schedule=False)
-                    self._set("error", why)
+                    self._set("error", e["msg"])
                 else:
                     self._drop()
                 return
@@ -258,6 +293,7 @@ class LiveFeed(QtCore.QObject):
 
     def _close(self):
         ws, self._ws, self._up, self._subbed = self._ws, None, False, set()
+        self._ping.stop()
         if ws is not None:
             try:
                 ws.abort()
@@ -268,7 +304,7 @@ class LiveFeed(QtCore.QObject):
     def _watchdog(self):
         if self._up and self.wanted and market_open() and time.time() - self._last_packet > 45:
             self._drop()                                     # connected but silent in market hours: start again
-        elif self._ws is None and self.acct and self.wanted and not self._retry.isActive() \
+        elif self._ws is None and self._prep is None and self.acct and self.wanted and not self._retry.isActive() \
                 and time.time() >= self._blocked_until:
             self._open()
 
@@ -279,7 +315,16 @@ class LiveFeed(QtCore.QObject):
         if time.time() < self._poll_pause or QtWidgets.QApplication.instance() is None:
             return
         acct, items = dict(self.acct), sorted(self.wanted)[:1000]
-        job = _Call(lambda: dhan_core.ltp(acct, items), self)
+        if acct.get("broker") == "dhan":
+            fn = lambda: dhan_core.ltp(acct, items)  # noqa: E731
+        else:
+            b, insts = self.broker, {k: self.insts[k] for k in items if k in self.insts}
+            by_tok = {str(v.token): k for k, v in insts.items()}
+
+            def fn():
+                got = b.ltp(list(insts.values()))
+                return {by_tok[t]: px for t, px in got.items() if t in by_tok}
+        job = _Call(fn, self)
         self._poll_job = job
         job.done.connect(self._polled)
         job.failed.connect(self._poll_failed)
@@ -308,19 +353,21 @@ class LiveFeed(QtCore.QObject):
         if self._up:
             return
         low = msg.lower()
-        if any(k in low for k in ("806", "dh-902", "not subscribed", "data api")):
+        if any(k in low for k in ("806", "dh-902", "not subscribed", "data api", "subscription", "permission")):
             self._poll_pause = time.time() + 600
-            self._set("error", ERRORS[806])
-        elif any(k in low for k in ("401", "807", "808", "809", "dh-901", "expired", "invalid")):
+            self._set("error", ERRORS[806] if self.acct and self.acct.get("broker") == "dhan" else msg[:160])
+        elif any(k in low for k in ("401", "807", "808", "809", "dh-901", "expired", "invalid", "log in again")):
             self._poll_pause = time.time() + 600
-            self._set("error", ERRORS[807])
+            self._set("error", ERRORS[807] if self.acct and self.acct.get("broker") == "dhan"
+                      else f"{self.broker_name}: the login has expired - log in again in Accounts")
         elif self._poll_fail >= 3:
             self._set("error", msg[:140])
 
 
 class Clock:
     """Dhan stamps trades with a number of seconds. Whether that number is counted in UTC or in India time is learnt
-    from the first fresh trade (it must be 'now'), so bars never land five and a half hours away."""
+    from the first fresh trade (it must be 'now'), so bars never land five and a half hours away. The other brokers
+    send true Unix times, which this learns the same way (as UTC)."""
 
     def __init__(self):
         self.shift = None                # seconds to add to a trade time to get chart (India wall-clock) time
@@ -353,21 +400,26 @@ class Clock:
 class LiveController(QtCore.QObject):
     """Glue between the feed and the window: which instruments are on screen, and where each tick goes."""
     status = QtCore.Signal(str, str)
+    tickPrice = QtCore.Signal(str, float)            # SYMBOL, price - for the paper broker and order lines
 
     def __init__(self, win):
         super().__init__(win)
         self.win = win
         self.feed = LiveFeed(self)
         self.clock = Clock()
-        self._ids: dict = {}             # SYMBOL -> (segment, security id) or None when Dhan has no such symbol
+        self._acct_sig = None
+        self._ids: dict = {}             # SYMBOL -> key (ns, id) or None when the broker has no such symbol
+        self._insts: dict = {}           # key -> Instrument
         self._queue: list = []           # symbols waiting to be looked up (one background job at a time)
-        self._later: dict = {}           # SYMBOL -> time: the lookup could not reach Dhan, try again after this
+        self._later: dict = {}           # SYMBOL -> time: the lookup could not reach the broker, try again after this
         self._job = None
-        self._routes: dict = {}          # (seg, sid) -> [panels]
-        self._wl: dict = {}              # (seg, sid) -> [watchlist symbols]
-        self._prev: dict = {}            # (seg, sid) -> yesterday's close, as the feed reports it
+        self._routes: dict = {}          # key -> [panels]
+        self._wl: dict = {}              # key -> [watchlist symbols]
+        self._syms: dict = {}            # key -> SYMBOL
+        self._prev: dict = {}            # key -> yesterday's close, as the feed reports it
         self._pending: dict = {}
-        self.extra = None                # callable -> {(seg, sid): callback(ltp)} for the option chain
+        self.extra = None                # callable -> {(seg, sid): callback(ltp)} for the option chain (Dhan)
+        self.wanted_symbols = None       # callable -> extra symbols to follow (open positions / orders)
         self._flush = QtCore.QTimer(self)
         self._flush.setSingleShot(True)
         self._flush.setInterval(40)      # many ticks in one frame are drawn once
@@ -379,8 +431,10 @@ class LiveController(QtCore.QObject):
 
     # ------------------------------------------------------------------ what to listen to
     def account(self):
+        """The account whose live feed is used: the chart's API source if it is one, else the chosen live-data
+        account (Settings), else the first connected Dhan account, else any connected broker."""
         from . import accounts
-        accts = [a for a in accounts.load_accounts() if a.get("broker") == "dhan" and a.get("access_token")]
+        accts = [a for a in accounts.load_accounts() if a.get("broker") in LIVE_BROKERS and a.get("access_token")]
         if not accts:
             return None
         src = str(self.win.active.params.get("source", "")) if getattr(self.win, "active", None) else ""
@@ -388,7 +442,26 @@ class LiveController(QtCore.QObject):
             for a in accts:
                 if a["name"] == src.split(":", 1)[1]:
                     return a
+        pref = ""
+        try:
+            pref = str(self.win.settings.value("live_account", "") or "")
+        except Exception:  # noqa: BLE001
+            pref = ""
+        for a in accts:
+            if a["name"] == pref:
+                return a
+        for a in accts:
+            if a.get("broker") == "dhan":
+                return a
         return accts[0]
+
+    def dhan_account(self):
+        """The option chain reads Dhan's option-chain API: it needs a Dhan account whatever feeds the prices."""
+        a = self.account()
+        if a is not None and a.get("broker") == "dhan":
+            return a
+        from . import accounts
+        return next((x for x in accounts.load_accounts() if x.get("broker") == "dhan" and x.get("access_token")), None)
 
     @staticmethod
     def _norm(symbol) -> str:
@@ -400,7 +473,7 @@ class LiveController(QtCore.QObject):
 
     @classmethod
     def _wants(cls, panel) -> str:
-        """The symbol to follow live for this pane, or '' (own files and non-Indian symbols have no Dhan feed)."""
+        """The symbol to follow live for this pane, or '' (own files and non-Indian symbols have no broker feed)."""
         prm = panel.params
         src = str(prm.get("source", ""))
         if panel.df is None or src == "file" or src.startswith("provider:"):
@@ -411,6 +484,11 @@ class LiveController(QtCore.QObject):
 
     def sync(self):
         acct = self.account() if self.enabled else None
+        sig = (acct or {}).get("name"), (acct or {}).get("broker"), (acct or {}).get("access_token")
+        if sig != self._acct_sig:                    # another broker: its ids and its clock are different
+            self._acct_sig = sig
+            self._ids, self._insts, self._later, self._queue = {}, {}, {}, []
+            self.clock = Clock()
         if acct is None:
             self._routes, self._wl = {}, {}
             self.feed.set_account(None)
@@ -418,6 +496,7 @@ class LiveController(QtCore.QObject):
             return
         routes: dict = {}
         need = []
+        syms: dict = {}
         for p in self.win.panels:
             if not p.isVisible():
                 continue
@@ -429,6 +508,7 @@ class LiveController(QtCore.QObject):
                 continue
             if self._ids[sym]:
                 routes.setdefault(self._ids[sym], []).append(p)
+                syms[self._ids[sym]] = sym
         self._routes = routes
         wl: dict = {}
         wlw = getattr(self.win, "watchlist", None)
@@ -438,37 +518,63 @@ class LiveController(QtCore.QObject):
                 need.append(sym)
             elif self._ids[sym]:
                 wl.setdefault(self._ids[sym], []).append(raw)
+                syms.setdefault(self._ids[sym], sym)
         self._wl = wl
         keys = set(routes) | set(wl)
-        if self.extra is not None:
+        if self.wanted_symbols is not None:
+            try:
+                for raw in self.wanted_symbols() or []:
+                    sym = self._norm(raw)
+                    if sym not in self._ids:
+                        need.append(sym)
+                    elif self._ids[sym]:
+                        keys.add(self._ids[sym])
+                        syms.setdefault(self._ids[sym], sym)
+            except Exception:  # noqa: BLE001
+                pass
+        self._syms = syms
+        if self.extra is not None and acct.get("broker") == "dhan":
             try:
                 keys |= set(self.extra())
             except Exception:  # noqa: BLE001
                 pass
         self.feed.set_account(acct)
-        self.feed.watch(keys)
+        self.feed.watch(keys, {k: self._insts[k] for k in keys if k in self._insts})
         now = time.time()
         self._queue.extend(x for x in dict.fromkeys(need) if x not in self._queue and self._later.get(x, 0) <= now)
         self._resolve()
 
     def _resolve(self):
-        """Look the waiting symbols up in Dhan's instrument list, off the UI thread, one batch at a time."""
+        """Look the waiting symbols up in the broker's instrument list, off the UI thread, one batch at a time."""
         if self._job is not None or not self._queue:
             return
         batch, self._queue = self._queue, []
+        acct = self.account()
+        if acct is None:
+            return
+        dhan = acct.get("broker") == "dhan"
+        proto = self.feed.proto if self.feed.acct is not None and self.feed.acct.get("name") == acct.get("name") \
+            else None
 
         def work():
             out = {}
+            b = proto.b if proto is not None else _broker_of(acct)
+            pr = proto or _feeds.proto_for(b)
             for sym in batch:
                 try:
-                    ins = dhan_core.resolve_any(sym)
-                    out[sym] = (ins["segment"], str(ins["security_id"]))
+                    if dhan:
+                        ins = dhan_core.resolve_any(sym)
+                        out[sym] = ((ins["segment"], str(ins["security_id"])), None)
+                    else:
+                        inst = b.resolve(sym)
+                        out[sym] = (pr.key(inst), inst)
                 except Exception as e:  # noqa: BLE001
                     msg = str(e)
-                    if "Could not reach" in msg or "API error" in msg or "unexpected format" in msg:
+                    if any(w in msg for w in ("Could not reach", "API error", "unexpected format", "did not answer",
+                                              "Could not download")):
                         out[sym] = "later"                   # offline: not an answer, ask again in a minute
                     else:
-                        out[sym] = None                      # not on Dhan (crypto, US stock, typo): no live feed
+                        out[sym] = None                      # not on this broker (crypto, US stock, typo)
             return out
         job = _Call(work, self)
         self._job = job
@@ -483,7 +589,16 @@ class LiveController(QtCore.QObject):
 
     def _resolved(self, res):
         later = [k for k, v in res.items() if v == "later"]
-        self._ids.update({k: v for k, v in res.items() if v != "later"})
+        for k, v in res.items():
+            if v == "later":
+                continue
+            if v is None:
+                self._ids[k] = None
+            else:
+                key, inst = v
+                self._ids[k] = key
+                if inst is not None:
+                    self._insts[key] = inst
         for k in later:
             self._later[k] = time.time() + 60
         if later:
@@ -510,6 +625,9 @@ class LiveController(QtCore.QObject):
             cb = extra.get(key)
             if cb is not None:
                 cb(ltp)
+            sym = self._syms.get(key)
+            if sym:
+                self.tickPrice.emit(sym, ltp)
             t = self.clock.chart_time(ltt)
             names = self._wl.get(key)
             if names:

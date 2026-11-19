@@ -504,13 +504,36 @@ def t_daterange(p, r, c):
     p.drawPolyline([QtCore.QPointF(15.5, 9.5), QtCore.QPointF(18, 12), QtCore.QPointF(15.5, 14.5)])
 
 
+
+def buy_order(p, r, c):
+    """Buy at a price: an arrow rising onto a line."""
+    p.drawLine(QtCore.QPointF(5, 7), QtCore.QPointF(19, 7))
+    p.drawLine(QtCore.QPointF(12, 19), QtCore.QPointF(12, 10))
+    p.drawPolyline([QtCore.QPointF(8.5, 13.5), QtCore.QPointF(12, 10), QtCore.QPointF(15.5, 13.5)])
+
+
+def sell_order(p, r, c):
+    """Sell at a price: an arrow falling onto a line."""
+    p.drawLine(QtCore.QPointF(5, 17), QtCore.QPointF(19, 17))
+    p.drawLine(QtCore.QPointF(12, 5), QtCore.QPointF(12, 14))
+    p.drawPolyline([QtCore.QPointF(8.5, 10.5), QtCore.QPointF(12, 14), QtCore.QPointF(15.5, 10.5)])
+
+
+def order_add(p, r, c):
+    """Add an order: a ticket with a plus."""
+    p.drawRoundedRect(QtCore.QRectF(4.5, 6.5, 15, 11), 1.5, 1.5)
+    p.drawLine(QtCore.QPointF(12, 9.5), QtCore.QPointF(12, 14.5))
+    p.drawLine(QtCore.QPointF(9.5, 12), QtCore.QPointF(14.5, 12))
+
+
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "layout_2h", "layout_2v", "layout_4", "fx", "play",
     "latest",
     "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin", "chain", "st_bars", "st_candles", "st_hollow", "st_heikin", "st_line",
     "st_linemark", "st_step", "st_area", "st_baseline", "t_ext", "t_arrow", "t_ellipse", "t_long", "t_short",
-    "t_pricerange", "t_daterange", "t_channel", "t_brush", "t_stay", "datatype", "chev")}
+    "t_pricerange", "t_daterange", "t_channel", "t_brush", "t_stay", "datatype", "chev", "buy_order", "sell_order",
+    "order_add")}
 
 
 def get(name: str, color: str = _COLOR, size: int = _BOX) -> QtGui.QIcon:

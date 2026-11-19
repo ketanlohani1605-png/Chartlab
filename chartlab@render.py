@@ -149,6 +149,9 @@ def vol_color(up: bool) -> QtGui.QColor:
     return QtGui.QColor(_TV_VOLUME.get(c, c))
 
 
+VOL_FRAC = 0.25                  # TradingView: the tallest visible volume bar fills the bottom 25% of the pane
+
+
 class VolumeItem(pg.GraphicsObject):
     def __init__(self, df=None):
         super().__init__()
@@ -203,7 +206,7 @@ class VolumeItem(pg.GraphicsObject):
             # whole device pixels, and a 2e9-unit rect overflows that on a Retina Mac - the bars were never painted.)
             (x0, x1), (y0, y1) = self.overlay.viewRange()
             span = (y1 - y0) or 1.0
-            return QtCore.QRectF(x0 - 2, y0 - span * 0.01, max(x1 - x0, 1.0) + 4, span * 0.2)
+            return QtCore.QRectF(x0 - 2, y0 - span * 0.01, max(x1 - x0, 1.0) + 4, span * (VOL_FRAC + 0.03))
         return QtCore.QRectF(-1, 0, n + 2, max(float(np.nanmax(self.v)), 1.0))
 
     def viewRangeChanged(self):
@@ -233,7 +236,7 @@ class VolumeItem(pg.GraphicsObject):
             e = i0 + ((n - 1 - i0) // g) * g
             drawn = float(np.nansum(self.v[e:n]))
         (y0, y1) = self.overlay.viewRange()[1]
-        return y0 + min(drawn / vmax, 1.0) * 0.16 * (y1 - y0), last, bool(self.up[n - 1])
+        return y0 + min(drawn / vmax, 1.0) * VOL_FRAC * (y1 - y0), last, bool(self.up[n - 1])
 
     def paint(self, p, *args):
         n = len(self.v)
@@ -250,10 +253,10 @@ class VolumeItem(pg.GraphicsObject):
             xs, w = edges + (g - 1) / 2.0, 0.4 * g
         p.setPen(QtCore.Qt.PenStyle.NoPen)
         base, k = 0.0, 1.0
-        if self.overlay is not None:                   # scale so the tallest visible bar is ~16% of the pane
+        if self.overlay is not None:                   # the tallest visible bar fills the bottom 25% (measured)
             (y0, y1) = self.overlay.viewRange()[1]
             vmax = float(np.nanmax(v)) or 1.0
-            base, k = y0, 0.16 * (y1 - y0) / vmax
+            base, k = y0, VOL_FRAC * (y1 - y0) / vmax
         QR = QtCore.QRectF
         for is_up, col in ((True, self._c(True)), (False, self._c(False))):
             p.setBrush(col)

@@ -47,8 +47,9 @@ def accounts():
     a = account()
     if not a:
         return []
-    return [{"name": a["account"], "client_id": a["client_id"], "access_token": a["access_token"],
-             "live": a.get("live") == "1", "qty_mult": 1}]
+    acct = {k: v for k, v in a.items() if k not in ("account", "live")}
+    acct.update({"name": a["account"], "broker": a.get("broker", "dhan"), "live": a.get("live") == "1", "qty_mult": 1})
+    return [acct]
 
 def warmup():
     """Open all broker connections now so the first order is instant. Call once at start."""
@@ -62,15 +63,40 @@ def option(underlying, strike, kind, expiry=None):
     import chartlab_dhan
     return chartlab_dhan.option(underlying, strike, kind, expiry)
 
-def order(symbol, side, qty=0, order_type="MARKET", price=None, product="INTRADAY", exchange="NSE", lots=0):
-    """Order on ALL accounts of this run at the same instant (in parallel). symbol: 'RELIANCE', 'NIFTY' or an
-    option() contract. For options use lots=1 (quantity = lots x lot size, scaled by each account's multiplier).
+def order(symbol, side, qty=0, order_type="MARKET", price=None, product="INTRADAY", exchange="NSE", lots=0,
+          trigger=None):
+    """Order on ALL accounts of this run at the same instant (in parallel), whatever their broker (Dhan, Zerodha,
+    Upstox, Angel One, Fyers). symbol: 'RELIANCE', 'NIFTY 24NOV 25000 CE', 'BANKNIFTY FUT' ... or an option()
+    contract. For F&O use lots=1 (quantity = lots x lot size, scaled by each account's multiplier).
+    order_type: MARKET, LIMIT (price=), SL (price= and trigger=), SL-M (trigger=).
     Paper accounts only print. Returns one result per account with latency in ms."""
     accts = accounts()
     if not accts:
         raise RuntimeError("chartlab.order() needs accounts: use Accounts -> Run script on multiple accounts")
-    import chartlab_dhan
-    return chartlab_dhan.place_many(accts, symbol, side, qty, order_type, price, product, exchange, lots)
+    if all(a.get("broker", "dhan") == "dhan" for a in accts) and str(order_type).upper() in ("MARKET", "LIMIT"):
+        import chartlab_dhan
+        return chartlab_dhan.place_many(accts, symbol, side, qty, order_type, price, product, exchange, lots)
+    import chartlab_brokers as B
+    if isinstance(symbol, dict):
+        symbol = symbol.get("symbol") or symbol.get("name") or ""
+    sym = str(symbol)
+    if exchange and exchange.upper() not in ("NSE", "") and ":" not in sym:
+        sym = f"{exchange.upper()}:{sym}"
+    req = B.OrderRequest(sym, side, qty=int(qty or 0), lots=int(lots or 0), order_type=order_type,
+                         price=float(price or 0), trigger=float(trigger or 0), product=product, tag="chartlab")
+    live = [a for a in accts if a.get("live")]
+    res = B.place_many(live, req) if live else []
+    for r in res:
+        if r["ok"]:
+            print(f"[LIVE] {r['account']} ({r.get('broker')}): {side} {qty or str(lots) + ' lot'} {sym} {order_type}"
+                  f" -> order {r.get('order_id')} ({r['ms']} ms)")
+        else:
+            print(f"[FAILED] {r['account']}: {r['error']}")
+    for a in accts:
+        if not a.get("live"):
+            print(f"[PAPER] {a['name']}: {side} {qty or str(lots) + ' lot'} {sym} {order_type}")
+            res.append({"account": a["name"], "ok": True, "paper": True, "ms": 0})
+    return res
 
 def report(trades=None, equity=None, plots=None):
     import pandas as pd
@@ -155,11 +181,37 @@ def find_python(saved: str = "") -> tuple[str, list[str]]:
         "(the one you normally run your scripts with). Checked: " + ("; ".join(notes) or "nothing"))
 
 
+def helper_sources() -> dict:
+    """Source text of the modules a script can import (chartlab_dhan, chartlab_brokers): {'dhan_core.py': ...,
+    'brokers/base.py': ...}. Run from source they are read from the package itself; the built Mac app has no .py
+    files of its own, so it carries copies in assets/script (tests keep the copies identical)."""
+    here = Path(__file__).parent
+    out = {}
+    if (here / "dhan_core.py").exists() and (here / "brokers" / "base.py").exists():
+        out["dhan_core.py"] = (here / "dhan_core.py").read_text()
+        for f in sorted((here / "brokers").glob("*.py")):
+            out["brokers/" + f.name] = f.read_text()
+        return out
+    root = Path(getattr(sys, "_MEIPASS", here.parent)) / "assets" / "script"
+    if not (root / "dhan_core.py").exists():
+        raise RuntimeError("The script helper files are missing from this copy of ChartLab (assets/script).")
+    out["dhan_core.py"] = (root / "dhan_core.py").read_text()
+    for f in sorted((root / "brokers").glob("*.py")):
+        out["brokers/" + f.name] = f.read_text()
+    return out
+
+
 def prepare(df: pd.DataFrame | None) -> Path:
     d = Path(tempfile.mkdtemp(prefix="chartlab_run_"))
     (d / "chartlab.py").write_text(HELPER)
     (d / "_runner.py").write_text(RUNNER)
-    (d / "chartlab_dhan.py").write_text((Path(__file__).parent / "dhan_core.py").read_text())
+    src = helper_sources()
+    (d / "chartlab_dhan.py").write_text(src["dhan_core.py"])
+    pkg = d / "chartlab_brokers"                       # every broker adapter, for orders on any broker
+    pkg.mkdir()
+    for name, text in src.items():
+        if name.startswith("brokers/"):
+            (pkg / name.split("/", 1)[1]).write_text(text)
     if df is not None:
         df.to_parquet(d / "data.parquet")
     return d

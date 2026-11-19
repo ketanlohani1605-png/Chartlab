@@ -32,6 +32,36 @@ ANGLE_TOOLS = ("trend", "ray", "ext", "arrow")           # Shift while drawing: 
 EXTRA_KEYS = ("text", "w", "ls", "lock")                 # optional per-drawing properties that are saved
 _CLIP: dict = {}                                         # last copied drawing (Cmd+C), shared by all panes
 HIT_PIXELS = 9
+# A selected drawing, measured on TradingView's own chart canvas (dark theme, Retina):
+SEL_RING = "#1e53e5"     # its handles: a ring in this blue whatever the line colour, filled with the chart background
+HANDLE_R = 5.25          # 12 px across on the outside, 9 px inside: a 1.5 px ring around a 10.5 px path
+HANDLE_W = 1.5
+SEL_LABEL = "#2962ff"    # each anchor's price / time is labelled on the scales in this blue (band between: 25 %)
+FLOAT_AT = 0.9           # a horizontal line's handle sits 90 % across the pane, a vertical line's 90 % down
+
+
+class _Handle(QtWidgets.QGraphicsEllipseItem):
+    """One handle of the selected drawing: the same size on screen at any zoom, antialiased (the chart itself is
+    drawn without antialiasing for speed). Clicks go through to the chart, which does the dragging."""
+
+    def __init__(self, x: float, y: float, bg: str):
+        r = HANDLE_R
+        super().__init__(-r, -r, 2 * r, 2 * r)
+        self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+        self.setAcceptHoverEvents(False)
+        pen = QtGui.QPen(QtGui.QColor(SEL_RING))
+        pen.setWidthF(HANDLE_W)
+        self.setPen(pen)
+        self.setBrush(QtGui.QBrush(QtGui.QColor(bg)))
+        self.setPos(x, y)
+        self.setZValue(55)                     # above the drawings and the crosshair lines
+
+    def paint(self, p, opt, widget=None):
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setPen(self.pen())
+        p.setBrush(self.brush())
+        p.drawEllipse(self.rect())
 
 
 def _seg_dist(p, a, b) -> float:
@@ -60,6 +90,11 @@ class DrawingLayer(QtCore.QObject):
         self._drag = None
         self._tags: dict = {}          # id -> price-scale label of a horizontal line / ray (TradingView shows it)
         self._tag_y: dict = {}
+        self._float: list = []         # (handle, drawing id): handles that keep their place on screen (h / v line)
+        self._sel_y: list = []         # the selected drawing's anchor labels on the price scale ...
+        self._sel_x: list = []         # ... and on the time scale
+        self._sel_plot = None          # the plot whose time scale carries the time labels
+        self._band_axes: list = []     # scales showing the selected drawing's band
 
     # ------------------------------------------------------------------ undo / redo
     def _snapshot(self):
@@ -103,20 +138,30 @@ class DrawingLayer(QtCore.QObject):
             for it in items:
                 it.setVisible(not on)
         self.place_tags()
+        self._sync_sel()
         self.chart.selection_changed()
+
+    def handle_at(self, x: float, y: float):
+        """The handle of the selected drawing under view point (x, y): its drag mode, or None."""
+        d = self.get(self.selected) if self.selected is not None else None
+        if d is None or d.get("lock") or not self.chart.has_data():
+            return None
+        vb = self.chart.price.vb
+        click = vb.mapViewToScene(QtCore.QPointF(x, y))
+        best, best_d = None, HIT_PIXELS + 2.0
+        for hx, hy, mode in self._handles(d):
+            ps = vb.mapViewToScene(QtCore.QPointF(hx, hy))
+            dist = math.hypot(ps.x() - click.x(), ps.y() - click.y())
+            if dist <= best_d:
+                best, best_d = mode, dist
+        return best
 
     def begin_drag(self, x: float, y: float) -> bool:
         if self.tool or self.locked or not self.chart.has_data():
             return False
-        vb = self.chart.price.vb
-        click = vb.mapViewToScene(QtCore.QPointF(x, y))
-        if self.selected is not None:                      # grab a handle of the selected drawing
-            d = next((d for d in self.drawings if d["id"] == self.selected), None)
-            if d and d["type"] not in ("hline", "vline", "text", "brush") and not d.get("lock"):
-                for i, (hx, hy) in enumerate(self._xy(d)):
-                    ps = vb.mapViewToScene(QtCore.QPointF(hx, hy))
-                    if math.hypot(ps.x() - click.x(), ps.y() - click.y()) <= HIT_PIXELS + 2:
-                        return self._start_drag(d, ("pt", i), x, y)
+        mode = self.handle_at(x, y)                        # grab a handle of the selected drawing
+        if mode is not None:
+            return self._start_drag(self.get(self.selected), mode, x, y)
         hit = self._hit_test(x, y)
         if hit is None:
             return False
@@ -160,13 +205,39 @@ class DrawingLayer(QtCore.QObject):
         if d is None:
             return
         g["moved"] = True
-        kind, idx = g["mode"]
+        ch = self.chart
+        mode = g["mode"]
+        kind = mode[0]
+        sx, sy = ch.snap(x, y) if ch.magnet else (x, y)
         if kind == "pt":
-            sx, sy = self.chart.snap(x, y) if self.chart.magnet else (x, y)
+            idx = mode[1]
             if d["type"] in ANGLE_TOOLS and len(d["pts"]) == 2 and self._shift():
                 ax, ay = self._xy(d)[1 - idx]
                 sx, sy = self._constrain(ax, ay, x, y)
-            d["pts"][idx] = [self.chart.x_to_time(sx), float(self.chart.iy(sy))]
+            d["pts"][idx] = [ch.x_to_time(sx), float(ch.iy(sy))]
+        elif kind == "xy":                               # a corner / side of a box: moves one or two of its sides
+            _k, ix, iy = mode
+            if ix is not None:
+                d["pts"][ix][0] = ch.x_to_time(sx)
+            if iy is not None:
+                d["pts"][iy][1] = float(ch.iy(sy))
+        elif kind == "pos":                              # long / short position: entry, target, stop, width
+            pts = d["pts"]
+            if len(pts) < 3:
+                pts.append([pts[1][0], pts[0][1] - (pts[1][1] - pts[0][1])])
+            il = 0 if ch.time_to_x(pts[0][0]) <= ch.time_to_x(pts[1][0]) else 1
+            which = mode[1]
+            if which == "entry":
+                pts[0][1] = float(ch.iy(sy))
+                pts[il][0] = ch.x_to_time(sx)
+            elif which == "target":
+                pts[1][1] = float(ch.iy(sy))
+            elif which == "stop":
+                pts[2][1] = float(ch.iy(sy))
+            else:
+                pts[1 - il][0] = ch.x_to_time(sx)
+        elif kind == "chan":
+            self._drag_channel(d, mode[1], g, y, sx, sy)
         else:
             dx, dy = x - g["x0"], y - g["y0"]
             new = []
@@ -178,6 +249,73 @@ class DrawingLayer(QtCore.QObject):
             d["pts"][2][0] = d["pts"][1][0]
         self._drop_items(d["id"])
         self._build(d)
+        self._sync_sel()
+
+    def _drag_channel(self, d, which, g, y, sx, sy):
+        """Parallel channel, TradingView's six handles: the ends of the first line re-aim it (the channel keeps its
+        width), its middle moves it up / down (the second line stays), the second line's handles set the width."""
+        ch = self.chart
+        o = g["orig"]
+        (x1, y1), (x2, y2), (x3, _y3) = [(ch.time_to_x(t), float(ch.ty(p))) for t, p in o[:3]]
+        off = self._channel_offset([(x1, y1), (x2, y2), (x3, _y3)])
+
+        def on_line(xx, a, b):
+            (ax, ay), (bx, by) = a, b
+            return ay if bx == ax else ay + (by - ay) * (xx - ax) / (bx - ax)
+
+        if which in ("p0", "p1"):
+            ends = [[x1, y1], [x2, y2]]
+            ends[0 if which == "p0" else 1] = [sx, sy]
+            base = on_line(x3, ends[0], ends[1])
+            d["pts"] = [[ch.x_to_time(ends[0][0]), float(ch.iy(ends[0][1]))],
+                        [ch.x_to_time(ends[1][0]), float(ch.iy(ends[1][1]))],
+                        [o[2][0], float(ch.iy(base + off))]]
+        elif which == "mid1":
+            dy = y - g["y0"]
+            d["pts"] = [[o[0][0], float(ch.iy(y1 + dy))], [o[1][0], float(ch.iy(y2 + dy))], list(o[2])]
+        else:                                            # "w": the second line goes through the mouse
+            width = sy - on_line(sx, (x1, y1), (x2, y2))
+            d["pts"] = [list(o[0]), list(o[1]), [o[0][0], float(ch.iy(y1 + width))]]
+
+    def _handles(self, d) -> list:
+        """TradingView's handles of a selected drawing: [(x, y, drag mode)] in view coordinates. Measured on its chart:
+        a box has its 4 corners and 4 side middles, a channel both ends and the middle of each line, a position tool
+        entry / target / stop on its left side and its width on the right, a horizontal line one handle 90 % across
+        the pane (a vertical one 90 % down), everything else a handle on each of its points."""
+        t = d["type"]
+        if t in ("text", "brush") or not d["pts"] or not self.chart.has_data():
+            return []
+        pts = self._xy(d)
+        if t == "hline":
+            (x0, x1), _ = self.chart.price.vb.viewRange()
+            return [(x0 + FLOAT_AT * (x1 - x0), pts[0][1], ("move", 0))]
+        if t == "vline":
+            _, (y0, y1) = self.chart.price.vb.viewRange()
+            return [(pts[0][0], y1 - FLOAT_AT * (y1 - y0), ("move", 0))]
+        if t == "rect" and len(pts) == 2:
+            (x0, y0), (x1, y1) = pts
+            xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+            return [(x0, y0, ("xy", 0, 0)), (x1, y1, ("xy", 1, 1)), (x0, y1, ("xy", 0, 1)), (x1, y0, ("xy", 1, 0)),
+                    (xm, y0, ("xy", None, 0)), (xm, y1, ("xy", None, 1)),
+                    (x0, ym, ("xy", 0, None)), (x1, ym, ("xy", 1, None))]
+        if t == "ellipse" and len(pts) == 2:            # on the ellipse itself: top, bottom, left, right
+            (x0, y0), (x1, y1) = pts
+            xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+            return [(xm, y0, ("xy", None, 0)), (xm, y1, ("xy", None, 1)),
+                    (x0, ym, ("xy", 0, None)), (x1, ym, ("xy", 1, None))]
+        if t in ("long", "short") and len(pts) >= 2:
+            (x1, y1), (x2, y2) = pts[0], pts[1]
+            stop = pts[2][1] if len(pts) >= 3 else y1 - (y2 - y1)
+            xa, xb = min(x1, x2), max(x1, x2)
+            return [(xa, y1, ("pos", "entry")), (xa, y2, ("pos", "target")), (xa, stop, ("pos", "stop")),
+                    (xb, y1, ("pos", "width"))]
+        if t == "channel" and len(pts) >= 3:
+            (x1, y1), (x2, y2) = pts[0], pts[1]
+            off = self._channel_offset(pts)
+            xm, ym = (x1 + x2) / 2, (y1 + y2) / 2
+            return [(x1, y1, ("chan", "p0")), (x2, y2, ("chan", "p1")), (xm, ym, ("chan", "mid1")),
+                    (x1, y1 + off, ("chan", "w")), (x2, y2 + off, ("chan", "w")), (xm, ym + off, ("chan", "w"))]
+        return [(x, y, ("pt", i)) for i, (x, y) in enumerate(pts)]
 
     def end_drag(self):
         g, self._drag = self._drag, None
@@ -188,7 +326,7 @@ class DrawingLayer(QtCore.QObject):
             self.changed.emit()
 
     def hover_hit(self, x: float, y: float) -> bool:
-        return (not self.tool) and self._hit_test(x, y) is not None
+        return (not self.tool) and (self.handle_at(x, y) is not None or self._hit_test(x, y) is not None)
 
     def duplicate_selected(self):
         d = next((d for d in self.drawings if d["id"] == self.selected), None)
@@ -486,25 +624,129 @@ class DrawingLayer(QtCore.QObject):
             tag.hide()
             tag.deleteLater()
         self.place_tags()
+        self._sync_sel()
 
-    def place_tags(self):
-        if not self._tags:
+    # -- the selected drawing on the scales (TradingView): a blue label at each anchor, a light band between them
+    def _sel_values(self, d):
+        """(prices, times) of drawing d that TradingView labels on the scales while it is selected."""
+        t, pts = d["type"], d["pts"]
+        if t in ("text", "brush") or not pts:
+            return [], []
+        q = pts[:3] if t in ("long", "short", "channel") else pts
+        prices = [] if t in ("vline", "hline", "hray") else [float(p) for _t, p in q]   # (h lines: their own label)
+        times = [] if t == "hline" else [float(tt) for tt, _p in (pts[:2] if t in ("long", "short", "channel") else pts)]
+        return sorted(set(prices)), sorted(set(times))
+
+    def _time_text(self, t: float, xv: float) -> str:
+        ch = self.chart
+        ts = ch._time_at(int(round(xv)))                 # the bar the anchor sits on, like TradingView
+        if ts is None:
+            import pandas as pd
+            ts = pd.Timestamp(int(round(t)), unit="s")
+        return ch._crosshair_time(ts)
+
+    def _sync_sel(self):
+        ch = self.chart
+        d = self.get(self.selected) if self.selected is not None else None
+        live = d is not None and not self.hidden and ch.has_data() and d["id"] in self._items
+        prices, times = self._sel_values(d) if live else ([], [])
+        if not (prices or times or self._sel_y or self._sel_x or self._band_axes):
+            return
+        from .chart import AxisTag
+        plot = ch._bottom_plot()
+        if plot is not self._sel_plot:                   # an indicator pane came or went: the time scale moved
+            for tg in self._sel_x:
+                tg.hide()
+                tg.deleteLater()
+            self._sel_x, self._sel_plot = [], plot
+        while len(self._sel_y) < len(prices):
+            self._sel_y.append(AxisTag(ch, ch.price, "y", SEL_LABEL))
+        while len(self._sel_x) < len(times):
+            self._sel_x.append(AxisTag(ch, plot, "x", SEL_LABEL))
+        for i, tg in enumerate(self._sel_y):
+            tg._v = float(ch.ty(prices[i])) if i < len(prices) else None
+            if tg._v is not None:
+                tg.setText(ch.axis_label(tg._v))
+        for i, tg in enumerate(self._sel_x):
+            tg._v = float(ch.time_to_x(times[i])) if i < len(times) else None
+            if tg._v is not None:
+                tg.setText(self._time_text(times[i], tg._v))
+        want = []
+        if len(prices) >= 2:
+            want.append((ch.price.getAxis("right"), (float(ch.ty(prices[0])), float(ch.ty(prices[-1])))))
+        if len(times) >= 2:
+            want.append((plot.getAxis("bottom"), (float(ch.time_to_x(times[0])), float(ch.time_to_x(times[-1])))))
+        for ax in self._band_axes:
+            if all(ax is not a for a, _b in want) and ax.sel_band is not None:
+                ax.sel_band = None
+                ax.picture = None
+                ax.update()
+        for ax, band in want:
+            if ax.sel_band != band:
+                ax.sel_band = band
+                ax.picture = None
+                ax.update()
+        self._band_axes = [a for a, _b in want]
+        self._place_sel()
+        self._blocks()
+
+    def _place_sel(self):
+        tags = self._sel_y + self._sel_x
+        if not tags:
             return
         ch = self.chart
         if not ch.has_data():
-            for tag in self._tags.values():
-                tag.hide()
+            for tg in tags:
+                tg.hide()
             return
-        (_x0, x1), (y0, y1) = ch.price.vb.viewRange()
-        for did, tag in self._tags.items():
-            y = self._tag_y.get(did)
-            ok = y is not None and y0 <= y <= y1 and not self.hidden and did in self._items
-            tag.setVisible(ok)
+        (x0, x1), (y0, y1) = ch.price.vb.viewRange()
+        for tg in self._sel_y:
+            v = getattr(tg, "_v", None)
+            ok = v is not None and y0 <= v <= y1
+            tg.setVisible(ok)
             if ok:
-                tag.setPos(x1, y)
-        ch.last_tag.raise_()                    # the live price label stays on top, like TradingView
+                tg.setPos(x1, v)
+        for tg in self._sel_x:
+            v = getattr(tg, "_v", None)
+            ok = v is not None and x0 <= v <= x1
+            tg.setVisible(ok)
+            if ok:
+                tg.setPos(v, 0.0)
+
+    def _place_float(self):
+        for h, did in self._float:
+            d = self.get(did)
+            hs = self._handles(d) if d is not None else []
+            if hs:
+                h.setPos(hs[0][0], hs[0][1])
+
+    def place_tags(self):
+        self._place_float()
+        self._place_sel()
+        ch = self.chart
+        if self._tags:
+            if not ch.has_data():
+                for tag in self._tags.values():
+                    tag.hide()
+            else:
+                (_x0, x1), (y0, y1) = ch.price.vb.viewRange()
+                for did, tag in self._tags.items():
+                    y = self._tag_y.get(did)
+                    ok = y is not None and y0 <= y <= y1 and not self.hidden and did in self._items
+                    tag.setVisible(ok)
+                    if ok:
+                        tag.setPos(x1, y)
+                ch.last_tag.raise_()            # the live price label stays on top, like TradingView
+        self._blocks()
+
+    def _blocks(self):
+        """The scale's own numbers are not drawn under these labels (TradingView), as under the last price."""
+        f = getattr(self.chart, "_sync_scale_blocks", None)
+        if f is not None and hasattr(self.chart, "last_tag"):
+            f()
 
     def _drop_items(self, did):
+        self._float = [(h, i) for h, i in self._float if i != did]
         for it in self._items.pop(did, []):
             self.chart.price.removeItem(it)
 
@@ -523,7 +765,8 @@ class DrawingLayer(QtCore.QObject):
         sel = d["id"] == self.selected and not preview
         color = d.get("color", DEFAULT_COLOR)
         w = float(d.get("w", DEFAULT_WIDTH))
-        pen = pg.mkPen(color, width=w + 0.9 if sel else w,
+        # (TradingView keeps the line as it is when it is selected: the handles show the selection)
+        pen = pg.mkPen(color, width=w,
                        style=QtCore.Qt.PenStyle.DashLine if preview else STYLES.get(d.get("ls"), QtCore.Qt.PenStyle.SolidLine))
         pts = self._xy(d)
         items: list = []
@@ -672,7 +915,7 @@ class DrawingLayer(QtCore.QObject):
                     band.setZValue(-2)
                     items.append(band)
                 prev = price
-                items.append(pg.PlotDataItem([xa, xb], [price, price], pen=pg.mkPen(col, width=1.4 if sel else 1)))
+                items.append(pg.PlotDataItem([xa, xb], [price, price], pen=pg.mkPen(col, width=1)))
                 tx = pg.TextItem(f"{lvl:g}  ({self.chart.iy(price):,.2f})", color=col, anchor=(0, 1))
                 tx.setPos(xa, price)
                 items.append(tx)
@@ -704,13 +947,14 @@ class DrawingLayer(QtCore.QObject):
                              fill=pg.mkBrush(color))
             tx.setPos(*pts[0])
             items.append(tx)
-        if sel:
-            hs = [p for p in pts] if t not in ("hline", "vline", "text", "brush") else []
-            if d.get("lock"):
-                hs = []
-            if hs:
-                items.append(pg.ScatterPlotItem(x=[p[0] for p in hs], y=[p[1] for p in hs], size=9,
-                                                brush=pg.mkBrush(theme.BG), pen=pg.mkPen(color, width=2)))
+        if sel and not d.get("lock"):
+            bg = self.chart.glw.backgroundBrush().color()
+            bg = bg.name() if bg.alpha() else theme.BG
+            for hx, hy, _mode in self._handles(d):
+                h = _Handle(hx, hy, bg)
+                items.append(h)
+                if t in ("hline", "vline"):
+                    self._float.append((h, d["id"]))           # keeps its place on screen while the chart moves
         return items
 
     @staticmethod

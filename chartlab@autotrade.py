@@ -69,7 +69,7 @@ class AutoTradeDialog(QtWidgets.QDialog):
             "Every time a bar closes, the strategy in the editor runs again. When it gives a new buy / sell on that "
             "bar, <b>one order goes to every ticked account at the same moment</b>. Old signals are never traded.<br>"
             f"<span style='color:{theme.DOWN}'>Accounts marked LIVE get REAL orders with real money. "
-            "PAPER accounts only write the order in the Log.</span>")
+            "PAPER accounts trade on ChartLab's paper broker (Trading Panel).</span>")
         info.setWordWrap(True)
         v.addWidget(info)
         self.list = QtWidgets.QListWidget()
@@ -185,9 +185,13 @@ class AutoTrader(QtCore.QObject):
                       f"-> {len(accts)} accounts (strategy position now {new_pos:+d})")
         sym, product, exchange = self.symbol.split(":")[-1], self.product, self.exchange
 
+        full = self.symbol if ":" in self.symbol else (sym if exchange in ("NSE", "") else f"{exchange}:{sym}")
+
         def send():
-            from . import dhan_core
-            return dhan_core.place_many(accts, sym, side, n, product=product, exchange=exchange, tag="auto")
+            from . import brokers
+            brokers.Paper.set_price(self.symbol, price)      # PAPER accounts fill at the closed bar's price
+            req = brokers.OrderRequest(full, side, qty=n, product=product, tag="auto")
+            return brokers.place_many(accts, req)
         w = _OrderWorker(send, self)
         self._workers.append(w)
 
@@ -200,10 +204,12 @@ class AutoTrader(QtCore.QObject):
                 return
             lines, bad = [], 0
             for r in res:
-                if r.get("paper"):
-                    lines.append(f"[auto-trade] {r['account']}: PAPER {side} {r['request'].get('quantity', n)}")
+                if r.get("ok") and r.get("paper"):
+                    lines.append(f"[auto-trade] {r['account']}: PAPER {side} {n} (order {r.get('order_id')}, "
+                                 "see Trading Panel)")
                 elif r.get("ok"):
-                    lines.append(f"[auto-trade] {r['account']}: LIVE order sent in {r.get('ms', 0)} ms  {r.get('response')}")
+                    lines.append(f"[auto-trade] {r['account']} ({r.get('broker')}): LIVE order sent in "
+                                 f"{r.get('ms', 0)} ms  (order {r.get('order_id')})")
                 else:
                     bad += 1
                     lines.append(f"[auto-trade] {r['account']}: FAILED  {r.get('error')}")

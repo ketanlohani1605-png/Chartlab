@@ -16,8 +16,12 @@ from . import data as datamod
 from . import theme
 
 PATH = datamod.USER_DIR / "accounts.json"
-BROKERS = {"dhan": "Dhan"}
-FIELDS = {"dhan": [("client_id", "Client ID"), ("access_token", "Access token")]}
+from . import brokers as _brokers  # noqa: E402
+
+BROKERS = {k: _brokers.NAMES[k] for k in _brokers.ORDER}
+# what a script running on an account gets in its environment (never the PIN or the TOTP key)
+FIELDS = {k: [(f[0], f[1]) for f in _brokers.REGISTRY[k].fields if f[2] not in ("pin", "totp")]
+          for k in _brokers.ORDER}
 
 
 # ---------------------------------------------------------------------- store
@@ -170,6 +174,9 @@ def fetch_dhan(acct: dict, symbol: str, interval: str, period: str) -> pd.DataFr
 
 def test_account(acct: dict) -> str:
     """Cheap authenticated call; returns a human message or raises."""
+    if acct["broker"] not in ("dhan",):
+        prof = _brokers.get(acct).profile()
+        return f"Connected to {BROKERS.get(acct['broker'])}. Client {prof.get('client') or prof.get('name') or '?'}"
     if acct["broker"] == "dhan":
         raw = _http(f"{DHAN}/profile", None, {"access-token": acct["access_token"],
                                               "client-id": acct["client_id"]})
@@ -194,14 +201,35 @@ def _parse_validity(s) -> float | None:
     return None
 
 
+def _generic_status(acct: dict) -> dict:
+    """Status of a Zerodha / Upstox / Angel One / Fyers / paper account, in the shape the dialog shows."""
+    st = {"state": "error", "msg": "", "client": acct.get("client_id") or acct.get("client_code") or "",
+          "validity": "", "days_left": None, "funds": None, "segments": "", "plan": "", "data": None, "open": None,
+          "pnl": None, "ts": dt.datetime.now().strftime("%H:%M:%S")}
+    try:
+        b = _brokers.get(acct)
+        got = b.status()
+    except Exception as e:  # noqa: BLE001 - a status check never breaks the app
+        st["msg"] = str(e)[:160]
+        return st
+    st.update({k: got.get(k) for k in ("state", "msg", "funds", "open", "pnl") if k in got})
+    st["client"] = got.get("client") or st["client"]
+    exp = got.get("expires")
+    if exp:
+        st["validity"] = dt.datetime.fromtimestamp(exp).strftime("%d/%m/%Y %H:%M")
+        st["days_left"] = (exp - dt.datetime.now().timestamp()) / 86400
+    st["plan"] = getattr(b, "data_note", "") or ""
+    st["broker"] = BROKERS.get(acct.get("broker"), acct.get("broker"))
+    return st
+
+
 def get_status(acct: dict) -> dict:
     """Never raises. {state: ok|expiring|expired|auth|offline|error, msg, client, validity, days_left, funds, segments, plan}"""
     st = {"state": "error", "msg": "", "client": acct.get("client_id", ""), "validity": "", "days_left": None,
           "funds": None, "segments": "", "plan": "", "data": None, "open": None, "pnl": None,
           "ts": dt.datetime.now().strftime("%H:%M:%S")}
     if acct.get("broker") != "dhan":
-        st["msg"] = "Unsupported broker"
-        return st
+        return _generic_status(acct)
     hdr = {"access-token": acct.get("access_token", ""), "client-id": acct.get("client_id", "")}
     try:
         js = json.loads(_http(f"{DHAN}/profile", None, hdr, timeout=12))
@@ -387,8 +415,17 @@ def overall_state(accts: list[dict] | None = None) -> tuple[str | None, str]:
 def load_api(account: str, symbol: str, interval: str, period: str):
     """Entry point used by the chart panel: -> (DataFrame cleaned like other sources, label)."""
     a = get_account(account)
+    if a["broker"] == "paper":
+        raise RuntimeError("A paper account has no market data of its own: choose a broker account or Auto")
     if a["broker"] != "dhan":
-        raise RuntimeError(f"Broker '{a['broker']}' has no data adapter")
+        bk = _brokers.get(a)
+        if not bk.has_token():
+            raise RuntimeError(f"{BROKERS.get(a['broker'])} account '{a['name']}' is not logged in: Accounts -> Log in")
+        inst = bk.resolve(symbol)
+        raw = bk.history(inst, interval, period)
+        if raw is None or not len(raw):
+            raise RuntimeError(f"{bk.name} returned no candles for {symbol} ({interval})")
+        return datamod.standardise(raw), f"{inst.display} \u00b7 {interval} \u00b7 {a['name']}"
     from .dhan_core import is_option, resolve_option
     raw = fetch_dhan(a, symbol, interval, period)
     name = symbol.strip().upper()
@@ -430,10 +467,10 @@ class _AccountCard(QtWidgets.QStyledItemDelegate):
         f.setPointSize(10)
         p.setFont(f)
         p.setPen(QtGui.QColor(theme.MUTED))
-        cid = str(a.get("client_id", ""))
+        cid = str(a.get("client_id") or a.get("client_code") or a.get("user_id") or a.get("app_id") or "")
         p.drawText(r.adjusted(54, 0, -74, -9), QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignLeft,
                    f"{BROKERS.get(a['broker'], a['broker'])}  ·  {cid[:4]}…{cid[-3:]}" if len(cid) > 8 else
-                   f"{BROKERS.get(a['broker'], a['broker'])}  ·  {cid}")
+                   f"{BROKERS.get(a['broker'], a['broker'])}" + (f"  ·  {cid}" if cid else ""))
         st = STATUS.get(a["name"])
         dc = QtGui.QColor(STATE_COLOR.get(st["state"] if st else None))
         p.setPen(QtGui.QPen(QtGui.QColor("#1a1a1a"), 2))
@@ -456,20 +493,28 @@ class _AccountCard(QtWidgets.QStyledItemDelegate):
 
 
 class AccountsDialog(QtWidgets.QDialog):
+    """Every broker account in one place. The form follows the broker: its own fields, its own way of logging in
+    (browser login, PIN + TOTP, or a pasted token) and its own renewal."""
+
     def __init__(self, parent=None, path: Path | None = None):
         super().__init__(parent)
         self.path = path
         self.setWindowTitle("Broker accounts")
-        self.resize(860, 540)
+        self.resize(900, 640)
         self.setStyleSheet(f"QDialog {{ background: #1e1e1e; }} QLabel#h {{ font-size: 15px; font-weight: 700; color: white; }} "
                            f"QLabel#sub {{ color: {theme.MUTED}; font-size: 12px; }} QLabel#lbl {{ color: {theme.MUTED}; font-size: 11px; }} "
                            f"QLineEdit, QDoubleSpinBox, QComboBox {{ background: #121212; border: 1px solid #3a3a3a; "
-                           f"border-radius: 8px; padding: 8px 10px; min-height: 18px; }} "
+                           f"border-radius: 8px; padding: 7px 10px; min-height: 18px; }} "
                            f"QLineEdit:focus, QDoubleSpinBox:focus {{ border-color: {theme.ACCENT}; }} "
                            f"QPushButton#danger {{ background: transparent; color: {theme.DOWN}; }} "
-                           f"QPushButton#danger:hover {{ background: rgba(242,54,69,40); }}")
+                           f"QPushButton#danger:hover {{ background: rgba(242,54,69,40); }} "
+                           f"QPushButton#login {{ background: #2a2e39; border: 1px solid #434651; border-radius: 6px; "
+                           f"padding: 6px 12px; color: white; font-weight: 600; }} QPushButton#login:hover {{ border-color: {theme.ACCENT}; }}")
         self.accts = load_accounts(path)
         self.editing = -1
+        self.inputs: dict = {}
+        self._catcher = None
+        self._login_job = None
         self.poller = StatusPoller(self)
         self.poller.updated.connect(self._status_updated)
         root = QtWidgets.QHBoxLayout(self)
@@ -504,8 +549,8 @@ class AccountsDialog(QtWidgets.QDialog):
         self.empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         lv.addWidget(self.empty, 1)
         many = QtWidgets.QHBoxLayout()
-        bm = QtWidgets.QPushButton("Add many\u2026")
-        bm.setToolTip("Paste a list of accounts (name, client id, token) and connect them all in one go")
+        bm = QtWidgets.QPushButton("Add many…")
+        bm.setToolTip("Paste a list of Dhan accounts (name, client id, token) and connect them all in one go")
         bm.clicked.connect(self.add_many)
         bo = QtWidgets.QPushButton("All accounts")
         bo.setToolTip("Every account in one table: connection, token time left, balance, positions, today's P&L")
@@ -515,15 +560,19 @@ class AccountsDialog(QtWidgets.QDialog):
         lv.addLayout(many)
         root.addWidget(left)
 
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         right = QtWidgets.QWidget()
+        scroll.setWidget(right)
         rv = QtWidgets.QVBoxLayout(right)
-        rv.setContentsMargins(28, 22, 28, 20)
+        rv.setContentsMargins(28, 20, 28, 18)
         rv.setSpacing(6)
         self.title = QtWidgets.QLabel("New account")
         self.title.setObjectName("h")
         rv.addWidget(self.title)
-        sub = QtWidgets.QLabel("Used for API data and for running scripts on many accounts at once. Saved only on this "
-                               "Mac (~/ChartLab/accounts.json, private to your user).")
+        sub = QtWidgets.QLabel("Live prices, candles, the Trading Panel and scripts use these accounts. Saved only on "
+                               "this Mac (~/ChartLab/accounts.json, private to your user); sent only to the broker itself.")
         sub.setObjectName("sub")
         sub.setWordWrap(True)
         rv.addWidget(sub)
@@ -535,56 +584,96 @@ class AccountsDialog(QtWidgets.QDialog):
         rv.addWidget(self.card)
         rv.addSpacing(6)
 
-        def field(label, w):
-            l = QtWidgets.QLabel(label.upper())
-            l.setObjectName("lbl")
-            rv.addWidget(l)
-            rv.addWidget(w)
-            rv.addSpacing(4)
+        def lab(text):
+            x = QtWidgets.QLabel(text.upper())
+            x.setObjectName("lbl")
+            return x
         self.name = QtWidgets.QLineEdit()
         self.name.setPlaceholderText("e.g. Main, Papa, Fund 2")
+        rv.addWidget(lab("Account name"))
+        rv.addWidget(self.name)
+        rv.addSpacing(4)
         self.broker = QtWidgets.QComboBox()
         for k, tt in BROKERS.items():
             self.broker.addItem(tt, k)
-        self.client = QtWidgets.QLineEdit()
-        self.client.setPlaceholderText("Dhan client ID")
-        self.token = QtWidgets.QLineEdit()
-        self.token.setPlaceholderText("Paste access token")
-        self.token.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.show_tok = QtWidgets.QCheckBox("Show token")
-        self.show_tok.toggled.connect(lambda on: self.token.setEchoMode(
-            QtWidgets.QLineEdit.EchoMode.Normal if on else QtWidgets.QLineEdit.EchoMode.Password))
+        self.broker.currentIndexChanged.connect(lambda _i: self._build_fields())
+        rv.addWidget(lab("Broker"))
+        rv.addWidget(self.broker)
+        rv.addSpacing(4)
+        self.fields_box = QtWidgets.QWidget()
+        self.fields_lay = QtWidgets.QVBoxLayout(self.fields_box)
+        self.fields_lay.setContentsMargins(0, 0, 0, 0)
+        self.fields_lay.setSpacing(6)
+        rv.addWidget(self.fields_box)
+        self.more = QtWidgets.QToolButton()
+        self.more.setText("More ways to log in ▸")
+        self.more.setCheckable(True)
+        self.more.setStyleSheet(f"QToolButton {{ border: 0; color: {theme.ACCENT}; padding: 2px 0; }}")
+        self.more.toggled.connect(self._more_toggled)
+        rv.addWidget(self.more)
+        self.more_box = QtWidgets.QWidget()
+        self.more_lay = QtWidgets.QVBoxLayout(self.more_box)
+        self.more_lay.setContentsMargins(0, 0, 0, 0)
+        self.more_lay.setSpacing(6)
+        rv.addWidget(self.more_box)
+        self.show_tok = QtWidgets.QCheckBox("Show secrets")
+        self.show_tok.toggled.connect(self._echo)
+        rv.addWidget(self.show_tok)
+        self.redirect_row = QtWidgets.QWidget()
+        rr = QtWidgets.QHBoxLayout(self.redirect_row)
+        rr.setContentsMargins(0, 2, 0, 2)
+        self.redirect_lbl = QtWidgets.QLabel("")
+        self.redirect_lbl.setObjectName("sub")
+        self.redirect_lbl.setWordWrap(True)
+        self.redirect_lbl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        rr.addWidget(self.redirect_lbl, 1)
+        cp = QtWidgets.QPushButton("Copy")
+        cp.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self._redirect()))
+        rr.addWidget(cp)
+        rv.addWidget(self.redirect_row)
+        lrow = QtWidgets.QHBoxLayout()
+        self.login_btn = QtWidgets.QPushButton("Log in")
+        self.login_btn.setObjectName("login")
+        self.login_btn.clicked.connect(self.login_browser)
+        lrow.addWidget(self.login_btn)
+        self.totp_btn = QtWidgets.QPushButton("Log in with PIN + TOTP")
+        self.totp_btn.setObjectName("login")
+        self.totp_btn.clicked.connect(self.login_totp)
+        lrow.addWidget(self.totp_btn)
+        lrow.addStretch(1)
+        rv.addLayout(lrow)
+        self.paste_row = QtWidgets.QWidget()
+        pr = QtWidgets.QHBoxLayout(self.paste_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        self.paste = QtWidgets.QLineEdit()
+        self.paste.setPlaceholderText("…or paste the address the browser landed on after logging in")
+        pr.addWidget(self.paste, 1)
+        pb = QtWidgets.QPushButton("Use it")
+        pb.clicked.connect(self._use_pasted)
+        pr.addWidget(pb)
+        self.paste_row.hide()
+        rv.addWidget(self.paste_row)
+        rv.addSpacing(4)
         self.mult = QtWidgets.QDoubleSpinBox()
         self.mult.setRange(0.1, 1000)
         self.mult.setDecimals(2)
         self.mult.setValue(1.0)
-        self.mult.setToolTip("2 = double the quantity/lots your script sends on this account")
-        field("Account name", self.name)
-        row = QtWidgets.QHBoxLayout()
-        c1, c2 = QtWidgets.QVBoxLayout(), QtWidgets.QVBoxLayout()
-        for lay, lab, w in ((c1, "Broker", self.broker), (c2, "Client ID", self.client)):
-            l = QtWidgets.QLabel(lab.upper())
-            l.setObjectName("lbl")
-            lay.addWidget(l)
-            lay.addWidget(w)
-        row.addLayout(c1, 1)
-        row.addLayout(c2, 2)
-        rv.addLayout(row)
+        self.mult.setToolTip("2 = double the quantity/lots a script or a broadcast order sends on this account")
+        rv.addWidget(lab("Quantity multiplier"))
+        rv.addWidget(self.mult)
         rv.addSpacing(4)
-        field("Access token", self.token)
-        rv.insertWidget(rv.count() - 1, self.show_tok)
-        field("Quantity multiplier", self.mult)
-
         self.live = QtWidgets.QCheckBox("  Live orders  -  REAL money")
         self.live.setStyleSheet(f"QCheckBox {{ color: {theme.DOWN}; font-weight: 600; }}")
-        self.live.setToolTip("Off = paper: chartlab.order() only prints what it would send")
+        self.live.setToolTip("Off = paper: orders fill on ChartLab's paper broker, nothing reaches the broker")
         rv.addWidget(self.live)
-        note = QtWidgets.QLabel("Leave off to test safely. Paper accounts never send an order.")
+        note = QtWidgets.QLabel("Leave off to test safely: while it is off, orders on this account are paper orders.")
         note.setObjectName("sub")
+        note.setWordWrap(True)
         rv.addWidget(note)
         rv.addStretch(1)
         self.msg = QtWidgets.QLabel("")
         self.msg.setWordWrap(True)
+        self.msg.setTextFormat(QtCore.Qt.TextFormat.RichText)
         rv.addWidget(self.msg)
         btns = QtWidgets.QHBoxLayout()
         self.del_btn = d = QtWidgets.QPushButton("Delete")
@@ -593,8 +682,8 @@ class AccountsDialog(QtWidgets.QDialog):
         btns.addWidget(d)
         btns.addStretch(1)
         self.rbtn = rb = QtWidgets.QPushButton("Renew token")
-        rb.setToolTip("Dhan tokens last 24 hours. This swaps the saved token for a fresh 24-hour one, while the old one "
-                      "is still valid (tokens made on Dhan Web only). The old token stops working.")
+        rb.setToolTip("Swap the saved login for a fresh one while it is still valid (Dhan: 24 hours more; Angel One / "
+                      "Fyers: with the saved refresh token)")
         rb.clicked.connect(self.renew)
         btns.addWidget(rb)
         self.tbtn = tb = QtWidgets.QPushButton("Test connection")
@@ -609,16 +698,111 @@ class AccountsDialog(QtWidgets.QDialog):
         sb.clicked.connect(self.save)
         btns.addWidget(sb)
         rv.addLayout(btns)
-        root.addWidget(right, 1)
-        self.token.textChanged.connect(lambda *_: self._token_edited())
+        root.addWidget(scroll, 1)
+        self._poll = QtCore.QTimer(self)
+        self._poll.setInterval(300)
+        self._poll.timeout.connect(self._check_catch)
+        self._build_fields()
         self._fill()
         self.poller.refresh(self.accts, force=False)
 
+    # ------------------------------------------------------------------ the broker's own form
+    @property
+    def client(self):
+        return self.inputs.get("client_id") or self.inputs.get("client_code") or self._spare("client")
+
+    @property
+    def token(self):
+        return self.inputs.get("access_token") or self._spare("token")
+
+    def _spare(self, key):
+        w = getattr(self, "_spares", {}).get(key)
+        if w is None:
+            self._spares = getattr(self, "_spares", {})
+            w = self._spares[key] = QtWidgets.QLineEdit()
+        return w
+
+    def _cls(self):
+        return _brokers.cls_of(self.broker.currentData() or "dhan")
+
+    def _build_fields(self, values: dict | None = None):
+        keep = {k: w.text() for k, w in self.inputs.items()}
+        if values is not None:
+            keep = {k: str(v) for k, v in values.items() if v is not None}
+        for lay in (self.fields_lay, self.more_lay):
+            while lay.count():
+                it = lay.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
+        self.inputs = {}
+        c = self._cls()
+        extra = c.id == "dhan"                                 # Dhan: the token is enough, the rest is optional
+        for key, label, kind, req, helptext in c.fields:
+            w = QtWidgets.QLineEdit()
+            w.setPlaceholderText(helptext or label)
+            w.setToolTip(helptext)
+            if kind in ("secret", "pin", "totp"):
+                w.setEchoMode(QtWidgets.QLineEdit.EchoMode.Normal if self.show_tok.isChecked()
+                              else QtWidgets.QLineEdit.EchoMode.Password)
+            if key == "redirect_uri" and not keep.get(key):
+                from .brokers.oauth import DEFAULT_REDIRECT
+                w.setText(DEFAULT_REDIRECT)
+            if keep.get(key):
+                w.setText(keep[key])
+                w.setCursorPosition(0)
+            if key == "access_token":
+                w.textChanged.connect(lambda *_: self._token_edited())
+            x = QtWidgets.QLabel((label + ("" if req else "  (optional)")).upper())
+            x.setObjectName("lbl")
+            lay = self.more_lay if (extra and key in ("app_id", "app_secret", "pin", "totp_secret")) else self.fields_lay
+            lay.addWidget(x)
+            lay.addWidget(w)
+            self.inputs[key] = w
+        self.more.setVisible(extra)
+        self.more_box.setVisible(extra and self.more.isChecked())
+        caps = c.caps
+        self.login_btn.setVisible("login_oauth" in caps)
+        self.login_btn.setText(f"Log in with {c.name}")
+        self.totp_btn.setVisible("login_totp" in caps and (c.id != "dhan" or self.more.isChecked()))
+        self.redirect_row.setVisible("login_oauth" in caps)
+        self.redirect_lbl.setText(f"In your {c.name} API app, set the redirect URL to <b>{self._redirect()}</b>")
+        self.redirect_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.rbtn.setVisible("renew" in caps and self.editing >= 0)
+        self.tbtn.setVisible(c.id != "paper")
+        if c.id == "paper":
+            self.live.setChecked(False)
+        self.live.setVisible(c.id != "paper")
+        if self.editing < 0:
+            hint = {"paper": "A practice account: set the starting cash and trade on the prices on your charts.",
+                    "dhan": "Fill in the Client ID and paste the access token (or use More ways to log in).",
+                    "angel": "Fill in the API key and client code, then Log in with PIN + TOTP.",
+                    }.get(c.id, f"Fill in the {c.name} app details, then Log in with {c.name}.")
+            self.card.setText(f"<span style='color:#787b86'>{hint}</span>")
+
+    def _more_toggled(self, on):
+        self.more.setText("More ways to log in ▾" if on else "More ways to log in ▸")
+        self.more_box.setVisible(on)
+        self.totp_btn.setVisible("login_totp" in self._cls().caps and (self._cls().id != "dhan" or on))
+        self.login_btn.setVisible("login_oauth" in self._cls().caps and (self._cls().id != "dhan" or on))
+
+    def _echo(self, on):
+        c = self._cls()
+        kinds = {f[0]: f[2] for f in c.fields}
+        for k, w in self.inputs.items():
+            if kinds.get(k) in ("secret", "pin", "totp"):
+                w.setEchoMode(QtWidgets.QLineEdit.EchoMode.Normal if on else QtWidgets.QLineEdit.EchoMode.Password)
+
+    def _redirect(self) -> str:
+        from .brokers.oauth import DEFAULT_REDIRECT
+        w = self.inputs.get("redirect_uri")
+        return (w.text().strip() if w is not None else "") or DEFAULT_REDIRECT
+
     def _token_edited(self):
         t = self.token.text().strip()
-        if len(t) > 40 and self.client.text().strip():
+        if len(t) > 40 and (self.broker.currentData() != "dhan" or self.client.text().strip()):
             self._debounce.start(700)
 
+    # ------------------------------------------------------------------ status
     def _status_updated(self, name: str):
         self.list.viewport().update()
         if (0 <= self.editing < len(self.accts) and self.accts[self.editing]["name"] == name) or (self.editing < 0 and name in ("_new", self.name.text().strip())):
@@ -631,23 +815,23 @@ class AccountsDialog(QtWidgets.QDialog):
             self.card.setText("<span style='color:#787b86'>Not checked yet</span>")
             return
         c = STATE_COLOR.get(st["state"])
-        rows = [f"<b style='color:{c}'>\u25CF {st['msg'] or st['state']}</b>"]
+        rows = [f"<b style='color:{c}'>● {st['msg'] or st['state']}</b>"]
         if st.get("client"):
             rows.append(f"Client <b>{st['client']}</b>")
         if st.get("validity"):
             d = st.get("days_left")
             left = "" if d is None or d <= 0 else (f"  ({d * 24:.0f} hours left)" if d < 2 else f"  ({d:.1f} days left)")
-            rows.append(f"Token valid until <b>{st['validity']}</b>" + left)
+            rows.append(f"Login valid until <b>{st['validity']}</b>" + left)
         if st.get("segments"):
             rows.append(f"Segments: {st['segments']}")
         if st.get("plan"):
             rows.append(st["plan"])
         if st.get("funds") is not None:
-            rows.append(f"Available balance <b>\u20B9{st['funds']:,.2f}</b>")
+            rows.append(f"Available balance <b>₹{st['funds']:,.2f}</b>")
         if st.get("open") is not None:
             pc = theme.UP if (st.get("pnl") or 0) >= 0 else theme.DOWN
             rows.append(f"Open positions <b>{st['open']}</b> &nbsp; today's P&amp;L "
-                        f"<b style='color:{pc}'>\u20B9{st.get('pnl') or 0:+,.2f}</b>")
+                        f"<b style='color:{pc}'>₹{st.get('pnl') or 0:+,.2f}</b>")
         rows.append(f"<span style='color:#787b86'>checked {st.get('ts', '')}</span>")
         self.card.setText("<br>".join(rows))
 
@@ -655,6 +839,7 @@ class AccountsDialog(QtWidgets.QDialog):
         col = theme.UP if ok else (theme.DOWN if ok is False else theme.MUTED)
         self.msg.setText(f"<span style='color:{col}'>{text}</span>")
 
+    # ------------------------------------------------------------------ list
     def _fill(self, keep: str = ""):
         self.list.blockSignals(True)
         self.list.clear()
@@ -676,14 +861,13 @@ class AccountsDialog(QtWidgets.QDialog):
         if 0 <= i < len(self.accts):
             self.editing = i
             self.del_btn.show()
-            self.rbtn.show()
             a = self.accts[i]
             self.title.setText(a["name"])
             self.name.setText(a["name"])
-            self.broker.setCurrentIndex(max(0, self.broker.findData(a["broker"])))
-            self.client.setText(a.get("client_id", ""))
-            self.token.setText(a.get("access_token", ""))
-            self.token.setCursorPosition(0)                 # show the token from its start, not a clipped tail
+            self.broker.blockSignals(True)
+            self.broker.setCurrentIndex(max(0, self.broker.findData(a.get("broker", "dhan"))))
+            self.broker.blockSignals(False)
+            self._build_fields({k: a.get(k, "") for k in (f[0] for f in self._cls().fields)})
             self.live.setChecked(bool(a.get("live")))
             self.mult.setValue(float(a.get("qty_mult", 1) or 1))
             self._say("")
@@ -693,29 +877,41 @@ class AccountsDialog(QtWidgets.QDialog):
     def _new(self):
         self.editing = -1
         self.del_btn.hide()                                  # nothing saved yet -> nothing to delete
-        self.rbtn.hide()
         self.list.blockSignals(True)
         self.list.setCurrentRow(-1)
         self.list.blockSignals(False)
         self.title.setText("New account")
-        for w in (self.name, self.client, self.token):
-            w.clear()
+        self.name.clear()
+        self._build_fields({})
         self.live.setChecked(False)
         self.mult.setValue(1.0)
         self._say("")
-        self.card.setText("<span style='color:#787b86'>Fill in Client ID + access token - the connection is checked automatically.</span>")
         self.name.setFocus()
 
     def _current(self) -> dict:
-        return {"name": self.name.text().strip(), "broker": self.broker.currentData(),
-                "client_id": self.client.text().strip(), "access_token": self.token.text().strip(),
-                "live": self.live.isChecked(), "qty_mult": self.mult.value()}
+        a = {"name": self.name.text().strip(), "broker": self.broker.currentData(),
+             "live": self.live.isChecked() and self.broker.currentData() != "paper", "qty_mult": self.mult.value()}
+        for k, w in self.inputs.items():
+            a[k] = w.text().strip()
+        old = self.accts[self.editing] if 0 <= self.editing < len(self.accts) else {}
+        for k in ("feed_token", "refresh_token", "login_time", "user_id"):     # kept from the last login
+            if old.get(k) and old.get("broker") == a["broker"]:
+                a.setdefault(k, old[k])
+        return a
 
-    def save(self):
+    def _missing(self, a: dict) -> list:
+        c = _brokers.cls_of(a["broker"])
+        need = [f[1] for f in c.fields if f[3] and not a.get(f[0])]
+        if a["broker"] == "dhan" and not a.get("access_token") and not (a.get("app_id") or a.get("pin")):
+            need.append("Access token")
+        return need
+
+    def save(self, quiet: bool = False):
         a = self._current()
-        if not a["name"] or not a["client_id"] or not a["access_token"]:
-            self._say("Name, Client ID and Access token are all required.", False)
-            return
+        need = self._missing(a)
+        if not a["name"] or need:
+            self._say("Fill in: " + ", ".join((["Account name"] if not a["name"] else []) + need), False)
+            return False
         dup = [i for i, x in enumerate(self.accts) if x["name"] == a["name"]]
         if self.editing >= 0:
             self.accts[self.editing] = a
@@ -725,9 +921,12 @@ class AccountsDialog(QtWidgets.QDialog):
             self.accts.append(a)
         save_accounts(self.accts, self.path)
         self._fill(a["name"])
-        self._say("Saved.", True)
+        if not quiet:
+            self._say("Saved.", True)
         self.saved = a["name"]
-        self.poller.refresh([a], force=True)
+        if a["broker"] != "paper":
+            self.poller.refresh([a], force=True)
+        return True
 
     def delete(self):
         if 0 <= self.editing < len(self.accts):
@@ -738,38 +937,211 @@ class AccountsDialog(QtWidgets.QDialog):
 
     def test(self):
         cur = self._current()
-        if not cur["client_id"] or not cur["access_token"]:
+        if cur["broker"] == "dhan" and (not cur.get("client_id") or not cur.get("access_token")):
             self._say("Enter Client ID and access token first.", False)
+            return
+        if cur["broker"] != "dhan" and not cur.get("access_token") and cur["broker"] != "paper":
+            self._say(f"Log in to {BROKERS.get(cur['broker'])} first.", False)
             return
         self.tbtn.setEnabled(False)
         self.tbtn.setText("Testing…")
-        self.card.setText("<span style='color:#787b86'>Checking with Dhan…</span>")
+        self.card.setText(f"<span style='color:#787b86'>Checking with {BROKERS.get(cur['broker'])}…</span>")
         key = cur["name"] or "_new"
         cur["name"] = key
         if self.editing < 0:
             self._pending_new = key
         self.poller.refresh([cur], force=True)
 
+    # ------------------------------------------------------------------ logging in
+    def _login_values(self, got: dict):
+        """A login finished: put what it returned into the form and save the account."""
+        for k, v in got.items():
+            if k in self.inputs and v:
+                self.inputs[k].setText(str(v))
+                self.inputs[k].setCursorPosition(0)
+        a = self._current()
+        a.update({k: v for k, v in got.items() if v not in (None, "")})
+        if not a["name"]:
+            a["name"] = f"{BROKERS.get(a['broker'])} {a.get('client_id') or a.get('client_code') or a.get('user_id') or ''}".strip()
+            self.name.setText(a["name"])
+        dup = [i for i, x in enumerate(self.accts) if x["name"] == a["name"]]
+        if self.editing >= 0:
+            self.accts[self.editing] = a
+        elif dup:
+            self.accts[dup[0]] = a
+        else:
+            self.accts.append(a)
+        save_accounts(self.accts, self.path)
+        self.saved = a["name"]
+        self._fill(a["name"])
+        self._say(f"Logged in to {BROKERS.get(a['broker'])}. Saved.", True)
+        self.poller.refresh([a], force=True)
+
+    def login_browser(self):
+        from .brokers import oauth
+        import secrets
+        cur = self._current()
+        need = [f[1] for f in self._cls().fields if f[3] and f[0] != "access_token" and not cur.get(f[0])]
+        if cur["broker"] == "dhan":
+            need = [lbl for k, lbl in (("client_id", "Client ID"), ("app_id", "API key"), ("app_secret", "API secret"))
+                    if not cur.get(k)]
+        if need:
+            self._say("Fill in first: " + ", ".join(need), False)
+            return
+        b = _brokers.cls_of(cur["broker"])(cur)
+        redirect = self._redirect()
+        state = secrets.token_urlsafe(8)
+        problem = oauth.check_redirect(redirect)
+        self._stop_catch()
+        if not problem:
+            try:
+                self._catcher = oauth.Catcher(redirect, state if cur["broker"] in ("zerodha", "upstox", "fyers") else "").start()
+            except OSError as e:
+                problem = f"ChartLab could not listen on {redirect} ({e})."
+        self.login_btn.setEnabled(False)
+        self._say(f"Opening the {b.name} login page…")
+
+        def got_url(url):
+            self.login_btn.setEnabled(True)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+            self.paste_row.show()
+            self._login_b, self._login_redirect = b, redirect
+            if self._catcher is not None:
+                self._say(f"Log in on the {b.name} page in your browser. ChartLab is waiting for it to come back "
+                          f"(to {redirect})…")
+                self._poll_until = QtCore.QDateTime.currentSecsSinceEpoch() + 300
+                self._poll.start()
+            else:
+                self._say(problem + " After logging in, paste the address you land on below.", None)
+
+        def failed(msg):
+            self.login_btn.setEnabled(True)
+            self._stop_catch()
+            self._say(f"Could not start the {b.name} login: {msg[:200]}", False)
+        job = _Job(lambda: b.login_url(redirect, state), self)
+        job.done.connect(got_url)
+        job.failed.connect(failed)
+        self._login_job = job
+        job.start()
+
+    def _check_catch(self):
+        c = self._catcher
+        if c is None:
+            self._poll.stop()
+            return
+        if c.params is not None:
+            params = c.params
+            self._stop_catch()
+            self._finish_login(params)
+        elif QtCore.QDateTime.currentSecsSinceEpoch() > getattr(self, "_poll_until", 0):
+            self._stop_catch()
+            self._say("No answer from the login page in 5 minutes. Try again, or paste the address you landed on.",
+                      False)
+
+    def _stop_catch(self):
+        self._poll.stop()
+        if self._catcher is not None:
+            self._catcher.stop()
+            self._catcher = None
+
+    def _use_pasted(self):
+        from .brokers import oauth
+        params = oauth.parse_pasted(self.paste.text())
+        if not params:
+            self._say("That is not an address with a login result in it.", False)
+            return
+        self._stop_catch()
+        self._finish_login(params)
+
+    def _finish_login(self, params: dict):
+        b = getattr(self, "_login_b", None) or _brokers.cls_of(self.broker.currentData())(self._current())
+        redirect = getattr(self, "_login_redirect", self._redirect())
+        self._say(f"Finishing the {b.name} login…")
+        job = _Job(lambda: b.complete_login(params, redirect), self)
+        job.done.connect(lambda got: (self.paste_row.hide(), self.paste.clear(), self._login_values(got)))
+        job.failed.connect(lambda msg: self._say(f"{b.name} login failed: {msg[:220]}", False))
+        self._login_job = job
+        job.start()
+
+    def login_totp(self):
+        cur = self._current()
+        c = self._cls()
+        who = cur.get("client_code") or cur.get("client_id")
+        if not who or (c.id == "angel" and not cur.get("api_key")):
+            self._say("Fill in " + ("the API key and client code" if c.id == "angel" else "the Client ID") + " first.",
+                      False)
+            return
+        pin, code = cur.get("pin", ""), ""
+        if not pin or not cur.get("totp_secret"):
+            d = QtWidgets.QDialog(self)
+            d.setWindowTitle(f"{c.name} login")
+            f = QtWidgets.QFormLayout(d)
+            pin_e = QtWidgets.QLineEdit(pin)
+            pin_e.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+            code_e = QtWidgets.QLineEdit()
+            code_e.setPlaceholderText("6 digits from your authenticator app")
+            code_e.setMaxLength(6)
+            if not pin:
+                f.addRow("PIN", pin_e)
+            if not cur.get("totp_secret"):
+                f.addRow("TOTP code", code_e)
+            bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                            QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+            bb.accepted.connect(d.accept)
+            bb.rejected.connect(d.reject)
+            f.addRow(bb)
+            if not d.exec():
+                return
+            pin, code = pin_e.text().strip(), code_e.text().strip()
+        b = c(cur)
+        self.totp_btn.setEnabled(False)
+        self._say(f"Logging in to {c.name}…")
+        job = _Job(lambda: b.login_totp(pin, code), self)
+
+        def done(got):
+            self.totp_btn.setEnabled(True)
+            self._login_values(got)
+
+        def failed(msg):
+            self.totp_btn.setEnabled(True)
+            self._say(f"{c.name} login failed: {msg[:220]}", False)
+        job.done.connect(done)
+        job.failed.connect(failed)
+        self._login_job = job
+        job.start()
+
+    def reject(self):
+        self._stop_catch()
+        super().reject()
+
+    def accept(self):
+        self._stop_catch()
+        super().accept()
 
     # ------------------------------------------------------------------ many accounts
     def renew(self):
         if not 0 <= self.editing < len(self.accts):
             return
-        name = self.accts[self.editing]["name"]
+        a = self.accts[self.editing]
+        name = a["name"]
         self.rbtn.setEnabled(False)
-        self._say("Asking Dhan for a fresh token\u2026")
-        job = _Job(lambda: renew_saved(name, self.path), self)
+        self._say(f"Asking {BROKERS.get(a.get('broker'))} for a fresh login…")
+        if a.get("broker") == "dhan":
+            job = _Job(lambda: renew_saved(name, self.path), self)
+        else:
+            b = _brokers.cls_of(a["broker"])(a)
+            job = _Job(lambda: (_save_fields(name, b.renew(), self.path), f"{name}: login renewed")[1], self)
 
         def done(msg):
             self.rbtn.setEnabled(True)
             self.accts = load_accounts(self.path)
             self._fill(name)
             self._say(msg, True)
-            self.poller.refresh([a for a in self.accts if a["name"] == name], force=True)
+            self.poller.refresh([x for x in self.accts if x["name"] == name], force=True)
 
         def failed(msg):
             self.rbtn.setEnabled(True)
-            self._say("Could not renew: " + msg[:200] + "  (an expired token cannot be renewed: paste a new one)", False)
+            self._say("Could not renew: " + msg[:200] + "  (an expired login cannot be renewed: log in again)", False)
         job.done.connect(done)
         job.failed.connect(failed)
         job.start()
@@ -794,6 +1166,15 @@ class AccountsDialog(QtWidgets.QDialog):
         self.accts = load_accounts(self.path)                 # tokens may have been renewed there
         keep = self.accts[self.editing]["name"] if 0 <= self.editing < len(self.accts) else ""
         self._fill(keep)
+
+
+def _save_fields(name: str, fields: dict, path: Path | None = None):
+    """Write fields returned by a login / renewal into a saved account (re-read first: never undo another edit)."""
+    accts = load_accounts(path)
+    for x in accts:
+        if x["name"] == name:
+            x.update({k: v for k, v in fields.items() if v not in (None, "")})
+    save_accounts(accts, path)
 
 
 class _Job(QtCore.QThread):

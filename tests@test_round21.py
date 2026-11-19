@@ -71,8 +71,8 @@ d = next(d for d in lay.drawings if d["id"] == lid)
 assert len(d["pts"]) == 3 and abs(d["pts"][2][1] - 90.0) < 1e-9          # mirrored stop to start with
 lay.selected = lid
 lay.rebuild()
-sx, sy = lay._xy(d)[2]
-assert lay.begin_drag(sx, sy) and lay._drag["mode"] == ("pt", 2)
+sx, sy = lay._xy(d)[0][0], lay._xy(d)[2][1]          # the stop handle sits on the left side (TradingView)
+assert lay.begin_drag(sx, sy) and lay._drag["mode"] == ("pos", "stop")
 lay.drag_to(sx, ch.ty(95.0)); lay.end_drag()
 assert abs(d["pts"][2][1] - 95.0) < 1e-6 and d["pts"][2][0] == d["pts"][1][0]
 texts = [it.toPlainText() for it in lay._items[lid] if hasattr(it, "toPlainText")]
