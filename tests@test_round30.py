@@ -289,7 +289,7 @@ assert st in ("open", "pre", "closed")
 assert ch.header.text().count("<img") == 2, ch.header.text()[:300]       # TradingView shows "Open" too
 from chartlab.chart import status_pill_html
 assert all("<img" in status_pill_html(k) for k in ("open", "closed", "pre")) and status_pill_html("") == ""
-assert theme.fmt_vol(342_550_000) == "342.55\u202fM"           # TradingView's narrow space before the unit
+assert theme.fmt_vol(342_550_000) == "342.55M"                 # the unit follows the number, as TradingView looks
 move_to(at(0.985, 0.4))
 fut = ch.axes[0]._future
 assert fut[0].strftime("%H:%M") == "09:15" and fut[0].normalize() > dfi.index[-1].normalize()   # next session

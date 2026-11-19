@@ -2083,9 +2083,11 @@ class ChartWidget(QtWidgets.QWidget):
         if df is None or not len(df):
             return
         fm = QtGui.QFontMetrics(_scale_font())
-        widest = max(fm.horizontalAdvance(self.axis_price(float(np.nanmax(df["High"])) * 1.2)),
-                     fm.horizontalAdvance("-100.00%"))
-        w = int(max(64, widest + PRICE_TEXT_LEFT + 12))      # TradingView: 10 px before the text, ~12 after
+        # TradingView's scale is 64 px for '1,384.0' and only grows for longer numbers (percent mode: '-100.00%')
+        widest = fm.horizontalAdvance(self.axis_price(float(np.nanmax(df["High"]))))
+        if self.scale_mode == "percent":
+            widest = max(widest, fm.horizontalAdvance("-100.00%"))
+        w = int(max(64, widest + PRICE_TEXT_LEFT + 13))      # 10 px before the text, ~13 after
         for pl in self._plots():
             if pl.getAxis("right").width() != w:
                 pl.getAxis("right").setWidth(w)
@@ -2511,7 +2513,7 @@ class ChartWidget(QtWidgets.QWidget):
             else:
                 x = np.asarray(o.x, float) if o.kind == "step" else np.arange(n, dtype=float) + o.offset
                 pen = pg.mkPen(o.color, width=o.width, style=_PEN_STYLES.get(o.style, QtCore.Qt.PenStyle.SolidLine))
-                it = pg.PlotDataItem(x=x, y=y, pen=pen, connect="finite")
+                it = pg.PlotDataItem(x=x, y=y, pen=pen, connect="finite", antialias=True)   # smooth, like TradingView
                 it._full = (x, y)
                 it._step = o.kind == "step"
             it._raw = raw if o.vals is None else np.asarray(o.vals, float)
@@ -2686,7 +2688,7 @@ class ChartWidget(QtWidgets.QWidget):
         for i, (name, series) in enumerate(overlays.items()):
             color = theme.LINE_COLORS[(i + 2) % len(theme.LINE_COLORS)]
             sy = self.ty(series.to_numpy(float))
-            item = pg.PlotDataItem(x=x, y=sy, pen=pg.mkPen(color, width=1.4), connect="finite")
+            item = pg.PlotDataItem(x=x, y=sy, pen=pg.mkPen(color, width=1.4), connect="finite", antialias=True)
             item._full = (x, sy)
             item._raw = series.to_numpy(float)
             self.price.addItem(item)

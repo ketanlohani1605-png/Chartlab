@@ -22,16 +22,17 @@ LINE_COLORS = ["#f5a623", "#2196f3", "#e91e63", "#9c27b0", "#00bcd4", "#8bc34a",
 
 
 def fmt_vol(v: float) -> str:
-    """Volume the way TradingView writes it: 342.55\u202fK, 3.42\u202fM, 30.03\u202fB (a narrow no-break space before
-    the unit - copied from TradingView's own legend text)."""
+    """Volume the way TradingView shows it: 342.55K, 3.42M, 30.03B. (Its text has a narrow space before the unit that
+    is about 2 px wide on screen; in this app's font that character came out as wide as a full space, so the unit
+    simply follows the number.)"""
     v = float(v)
     a = abs(v)
     if a >= 1e9:
-        return f"{v / 1e9:.2f}\u202fB"
+        return f"{v / 1e9:.2f}B"
     if a >= 1e6:
-        return f"{v / 1e6:.2f}\u202fM"
+        return f"{v / 1e6:.2f}M"
     if a >= 1e3:
-        return f"{v / 1e3:.2f}\u202fK"
+        return f"{v / 1e3:.2f}K"
     return f"{v:,.0f}"
 
 

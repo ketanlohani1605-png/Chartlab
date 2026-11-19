@@ -40,6 +40,21 @@ SEL_LABEL = "#2962ff"    # each anchor's price / time is labelled on the scales 
 FLOAT_AT = 0.9           # a horizontal line's handle sits 90 % across the pane, a vertical line's 90 % down
 
 
+def _seg(*a, **k):
+    """A drawing's line. Slanted and curved lines are antialiased, like TradingView's (smooth, no stair-steps);
+    exactly horizontal / vertical ones are not, so they stay one crisp pixel wide."""
+    xs = k.get("x", a[0] if len(a) > 0 else None)
+    ys = k.get("y", a[1] if len(a) > 1 else None)
+    straight = False
+    try:
+        if xs is not None and ys is not None and len(xs) == 2:
+            straight = float(xs[0]) == float(xs[1]) or float(ys[0]) == float(ys[1])
+    except Exception:  # noqa: BLE001
+        straight = False
+    k.setdefault("antialias", not straight)
+    return pg.PlotDataItem(*a, **k)
+
+
 class _Handle(QtWidgets.QGraphicsEllipseItem):
     """One handle of the selected drawing: the same size on screen at any zoom, antialiased (the chart itself is
     drawn without antialiasing for speed). Clicks go through to the chart, which does the dragging."""
@@ -774,7 +789,7 @@ class DrawingLayer(QtCore.QObject):
         xmax = self.chart.x_limit()
 
         if t == "trend" and len(pts) == 2:
-            items.append(pg.PlotDataItem([pts[0][0], pts[1][0]], [pts[0][1], pts[1][1]], pen=pen))
+            items.append(_seg([pts[0][0], pts[1][0]], [pts[0][1], pts[1][1]], pen=pen))
         elif t == "ray" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             if x2 == x1:
@@ -782,13 +797,13 @@ class DrawingLayer(QtCore.QObject):
             else:
                 ex = xmax if x2 > x1 else -5
                 ey = y1 + (y2 - y1) * (ex - x1) / (x2 - x1)
-            items.append(pg.PlotDataItem([x1, ex], [y1, ey], pen=pen))
+            items.append(_seg([x1, ex], [y1, ey], pen=pen))
         elif t == "hline" and pts:
             items.append(pg.InfiniteLine(pos=pts[0][1], angle=0, movable=False, pen=pen))
         elif t == "vline" and pts:
             items.append(pg.InfiniteLine(pos=pts[0][0], angle=90, movable=False, pen=pen))
         elif t == "hray" and pts:
-            items.append(pg.PlotDataItem([pts[0][0], xmax], [pts[0][1], pts[0][1]], pen=pen))
+            items.append(_seg([pts[0][0], xmax], [pts[0][1], pts[0][1]], pen=pen))
         elif t == "crossline" and pts:
             items.append(pg.InfiniteLine(pos=pts[0][1], angle=0, movable=False, pen=pen))
             items.append(pg.InfiniteLine(pos=pts[0][0], angle=90, movable=False, pen=pen))
@@ -803,14 +818,14 @@ class DrawingLayer(QtCore.QObject):
             r.setBrush(QtGui.QBrush(c))
             items.append(r)
         elif t == "brush" and len(pts) >= 2:
-            items.append(pg.PlotDataItem([q[0] for q in pts], [q[1] for q in pts], pen=pen))
+            items.append(_seg([q[0] for q in pts], [q[1] for q in pts], pen=pen))
         elif t == "channel" and len(pts) >= 2:
             (x1, y1), (x2, y2) = pts[0], pts[1]
-            items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pen))
+            items.append(_seg([x1, x2], [y1, y2], pen=pen))
             if len(pts) >= 3:
                 off = self._channel_offset(pts)
-                items.append(pg.PlotDataItem([x1, x2], [y1 + off, y2 + off], pen=pen))
-                items.append(pg.PlotDataItem([x1, x2], [y1 + off / 2, y2 + off / 2],
+                items.append(_seg([x1, x2], [y1 + off, y2 + off], pen=pen))
+                items.append(_seg([x1, x2], [y1 + off / 2, y2 + off / 2],
                                              pen=pg.mkPen(color, width=1, style=QtCore.Qt.PenStyle.DashLine)))
                 poly = QtWidgets.QGraphicsPolygonItem(QtGui.QPolygonF([QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2),
                                                                        QtCore.QPointF(x2, y2 + off), QtCore.QPointF(x1, y1 + off)]))
@@ -823,14 +838,14 @@ class DrawingLayer(QtCore.QObject):
         elif t == "ext" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             if x2 == x1:
-                items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pen))
+                items.append(_seg([x1, x2], [y1, y2], pen=pen))
             else:
                 ya = y1 + (y2 - y1) * (-5 - x1) / (x2 - x1)
                 yb = y1 + (y2 - y1) * (xmax - x1) / (x2 - x1)
-                items.append(pg.PlotDataItem([-5, xmax], [ya, yb], pen=pen))
+                items.append(_seg([-5, xmax], [ya, yb], pen=pen))
         elif t == "arrow" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
-            items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pen))
+            items.append(_seg([x1, x2], [y1, y2], pen=pen))
             import math as _m
             vb = self.chart.price.vb
             pa = vb.mapViewToScene(QtCore.QPointF(x1, y1)); pb = vb.mapViewToScene(QtCore.QPointF(x2, y2))
@@ -858,10 +873,10 @@ class DrawingLayer(QtCore.QObject):
                 ry1, ry2 = float(self.chart.iy(y1)), float(self.chart.iy(y2))
                 dp = ry2 - ry1
                 txt = f"{dp:+,.2f} ({dp / ry1 * 100 if ry1 else 0:+.2f}%)"
-                items.append(pg.PlotDataItem([(x1 + x2) / 2] * 2, [y1, y2], pen=pg.mkPen(col, width=1.2)))
+                items.append(_seg([(x1 + x2) / 2] * 2, [y1, y2], pen=pg.mkPen(col, width=1.2)))
             else:
                 txt = f"{int(round(x2 - x1))} bars"
-                items.append(pg.PlotDataItem([x1, x2], [(y1 + y2) / 2] * 2, pen=pg.mkPen(col, width=1.2)))
+                items.append(_seg([x1, x2], [(y1 + y2) / 2] * 2, pen=pg.mkPen(col, width=1.2)))
             tx = pg.TextItem(txt, color="#ffffff", anchor=(0.5, 1), fill=pg.mkBrush(col))
             tx.setPos((x1 + x2) / 2, max(y1, y2))
             items.append(tx)
@@ -878,7 +893,7 @@ class DrawingLayer(QtCore.QObject):
                 r.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
                 r.setBrush(QtGui.QBrush(c))
                 items.append(r)
-            items.append(pg.PlotDataItem([xa, xb], [y1, y1], pen=pg.mkPen("#d1d4dc", width=1.2)))
+            items.append(_seg([xa, xb], [y1, y1], pen=pg.mkPen("#d1d4dc", width=1.2)))
             if not preview or len(pts) >= 2:
                 iy = self.chart.iy
                 pe, pt_, ps = float(iy(y1)), float(iy(tgt)), float(iy(stop))
@@ -901,7 +916,7 @@ class DrawingLayer(QtCore.QObject):
         elif t == "fib" and len(pts) == 2:
             (x1, y1), (x2, y2) = pts
             xa, xb = min(x1, x2), max(x1, x2, min(x1, x2) + 1)
-            items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pg.mkPen("#787b86", width=1,
+            items.append(_seg([x1, x2], [y1, y2], pen=pg.mkPen("#787b86", width=1,
                                                                          style=QtCore.Qt.PenStyle.DashLine)))
             prev = None
             for lvl, col in zip(FIB_LEVELS, FIB_COLORS):
@@ -915,7 +930,7 @@ class DrawingLayer(QtCore.QObject):
                     band.setZValue(-2)
                     items.append(band)
                 prev = price
-                items.append(pg.PlotDataItem([xa, xb], [price, price], pen=pg.mkPen(col, width=1)))
+                items.append(_seg([xa, xb], [price, price], pen=pg.mkPen(col, width=1)))
                 tx = pg.TextItem(f"{lvl:g}  ({self.chart.iy(price):,.2f})", color=col, anchor=(0, 1))
                 tx.setPos(xa, price)
                 items.append(tx)
@@ -931,7 +946,7 @@ class DrawingLayer(QtCore.QObject):
             r.setPen(qp)
             r.setBrush(QtGui.QBrush(c))
             items.append(r)
-            items.append(pg.PlotDataItem([x1, x2], [y1, y2], pen=pg.mkPen(col, width=1.2)))
+            items.append(_seg([x1, x2], [y1, y2], pen=pg.mkPen(col, width=1.2)))
             ry1, ry2 = (float(self.chart.iy(y1)), float(self.chart.iy(y2)))
             dp = ry2 - ry1
             pct = dp / ry1 * 100 if ry1 else 0.0

@@ -1150,6 +1150,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setObjectName("leftrail")
         tb.setOrientation(QtCore.Qt.Orientation.Vertical)
         tb.setMovable(False)
+        tb.setFixedWidth(56)                                  # TradingView: 52 px of buttons + the 4 px gutter
         tb.setIconSize(QtCore.QSize(28, 28))                  # TradingView: 52 x 38 buttons, 28 px icons
         self.addToolBar(QtCore.Qt.ToolBarArea.LeftToolBarArea, tb)
         self.draw_group = QtGui.QActionGroup(self)
@@ -1239,6 +1240,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setObjectName("rightrail")
         tb.setOrientation(QtCore.Qt.Orientation.Vertical)
         tb.setMovable(False)
+        tb.setFixedWidth(49)                                  # TradingView: 45 px + the 4 px gutter
         tb.setIconSize(QtCore.QSize(28, 28))
         self.addToolBar(QtCore.Qt.ToolBarArea.RightToolBarArea, tb)
         self.right_docks = [self.watch_dock, self.alerts_dock, self.strategy_dock, self.data_dock, self.chain_dock]
