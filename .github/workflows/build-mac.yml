@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-m1:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Restore folders (files were uploaded flat, @ means folder)
