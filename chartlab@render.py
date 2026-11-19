@@ -199,8 +199,18 @@ class VolumeItem(pg.GraphicsObject):
         if n == 0:
             return QtCore.QRectF()
         if self.overlay is not None:
-            return QtCore.QRectF(-1, -1e9, n + 2, 2e9)
+            # the strip at the bottom of what is on screen. (Not an 'infinite' rect: Qt turns the item's rect into
+            # whole device pixels, and a 2e9-unit rect overflows that on a Retina Mac - the bars were never painted.)
+            (x0, x1), (y0, y1) = self.overlay.viewRange()
+            span = (y1 - y0) or 1.0
+            return QtCore.QRectF(x0 - 2, y0 - span * 0.01, max(x1 - x0, 1.0) + 4, span * 0.2)
         return QtCore.QRectF(-1, 0, n + 2, max(float(np.nanmax(self.v)), 1.0))
+
+    def viewRangeChanged(self):
+        """The ViewBox moved: the bottom strip (= this item's rect) moved with it."""
+        if self.overlay is not None:
+            self.prepareGeometryChange()
+        super().viewRangeChanged()
 
     def last_value(self):
         """(y in the price pane, volume, up) of the newest bar's volume as drawn - where TradingView puts the volume

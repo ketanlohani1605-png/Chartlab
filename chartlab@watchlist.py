@@ -169,16 +169,31 @@ class QuoteDelegate(QtWidgets.QStyledItemDelegate):
         if q:
             col = QtGui.QColor(theme.UP if q[1] >= 0 else theme.DOWN)
             chg = q[0] - q[0] / (1 + q[1]) if q[1] > -1 else 0.0
+            dec = price_decimals_of(sym, q[0])                 # TradingView: each symbol in its own tick
             p.setPen(QtGui.QColor("#dbdbdb"))
-            p.drawText(c_last, al.AlignVCenter | al.AlignRight, f"{q[0]:,.2f}")
+            p.drawText(c_last, al.AlignVCenter | al.AlignRight, f"{q[0]:,.{dec}f}")
             p.setPen(col)
-            p.drawText(c_chg, al.AlignVCenter | al.AlignRight, f"{chg:+,.2f}".replace("+", ""))
-            p.drawText(c_pct, al.AlignVCenter | al.AlignRight, f"{q[1] * 100:+.2f}%".replace("+", ""))
+            p.drawText(c_chg, al.AlignVCenter | al.AlignRight,
+                       f"{chg:+,.{dec}f}".replace("+", "").replace("-", "−"))
+            p.drawText(c_pct, al.AlignVCenter | al.AlignRight,
+                       f"{q[1] * 100:+.2f}%".replace("+", "").replace("-", "−"))
         else:
             p.setPen(QtGui.QColor("#4a4a4a"))
             for c in (c_last, c_chg, c_pct):
                 p.drawText(c, al.AlignVCenter | al.AlignRight, "—")
         p.restore()
+
+
+def price_decimals_of(sym: str, price: float) -> int:
+    """Decimals TradingView writes this symbol's price with: an NSE stock the tick of its price level (RELIANCE
+    1,358.5, HDFCBANK 809.20), anything else two."""
+    try:
+        from .symbols import band_decimals, variable_tick
+        if exchange_of(sym) == "NSE" and variable_tick(sym):
+            return band_decimals(price)
+    except Exception:  # noqa: BLE001
+        pass
+    return 2
 
 
 def market_state(sym: str, now=None) -> tuple[str, str]:
@@ -205,6 +220,27 @@ def market_state(sym: str, now=None) -> tuple[str, str]:
         if _dt.time(9, 0) <= t.time() < _dt.time(9, 15):
             return "pre", "Pre-open session"
     return "closed", "Market closed"
+
+
+def session_close(sym: str, now=None):
+    """The UTC time today's session closes, while it is open - TradingView's countdown on a daily bar runs to it
+    (02:20:43 left at 13:09 IST on NSE). Crypto's daily candle closes at 00:00 UTC. None when closed / unknown."""
+    import datetime as _dt
+    utc = _dt.datetime.now(_dt.timezone.utc) if now is None else now
+    ex = exchange_of(sym)
+    if ex == "CRYPTO":
+        return (utc + _dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if market_state(sym, utc)[0] != "open":
+        return None
+    if ex == "NASDAQ":
+        try:
+            from zoneinfo import ZoneInfo
+            ny = utc.astimezone(ZoneInfo("America/New_York"))
+            return ny.replace(hour=16, minute=0, second=0, microsecond=0).astimezone(_dt.timezone.utc)
+        except Exception:  # noqa: BLE001 - no tz database
+            return None
+    ist = _dt.timedelta(hours=5, minutes=30)
+    return (utc + ist).replace(hour=15, minute=30, second=0, microsecond=0) - ist
 
 
 STATE_COLOR = {"open": "#089981", "pre": "#ff9800", "closed": "#787b86"}
@@ -421,9 +457,11 @@ class SymbolCard(QtWidgets.QFrame):
             return
         col = theme.UP if q[1] >= 0 else theme.DOWN
         chg = q[0] - q[0] / (1 + q[1]) if q[1] > -1 else 0.0
-        self.price.setText(f"<span style='font-size:28px;color:white;font-weight:500'>{q[0]:,.2f}</span>"
+        dec = price_decimals_of(sym, q[0])
+        ctxt = f"{chg:+,.{dec}f}&nbsp;&nbsp;{q[1] * 100:+.2f}%".replace("-", "−")
+        self.price.setText(f"<span style='font-size:28px;color:white;font-weight:500'>{q[0]:,.{dec}f}</span>"
                            f"<span style='font-size:11px;color:{theme.MUTED}'>&nbsp;{cur}&nbsp;&nbsp;</span>"
-                           f"<span style='font-size:16px;color:{col}'>{chg:+,.2f}&nbsp;&nbsp;{q[1] * 100:+.2f}%</span>")
+                           f"<span style='font-size:16px;color:{col}'>{ctxt}</span>")
         ex = ex or {}
         self.when.setText(f"Last update at {ex.get('time', '--:--')}  ({'live' if ex.get('live') else 'delayed'})")
         if "low" in ex:

@@ -226,9 +226,10 @@ class MainWindow(QtWidgets.QMainWindow):
         gd.clicked.connect(self._goto_date)
         h.addWidget(gd)
         h.addStretch(1)
-        self.live_label = QtWidgets.QLabel("")                # live feed / Claude link, next to the clock
+        self.live_label = QtWidgets.QLabel("")                # live feed status, next to the clock
         self.live_label.hide()
-        self.api_label = QtWidgets.QLabel("")
+        self.api_label = QtWidgets.QLabel("")                 # Claude link: TradingView has no such text here -
+        self.api_label.hide()                                 # its state is in the clock's tooltip instead
         for lab in (self.live_label, self.api_label):
             lab.setStyleSheet("color:#b8b8b8; font-size:12px; padding-right:10px;")
             h.addWidget(lab)
@@ -262,10 +263,21 @@ class MainWindow(QtWidgets.QMainWindow):
         return None
 
     def _sync_interval_label(self):
-        self.interval_btn.setText("\u2304")              # the chevron after the favourites opens the full list
+        """TradingView: with favourite intervals the toolbar shows them plus a chevron that opens the full list;
+        without any (its default) one button with the current interval ('D', '5m') opens the list."""
+        if getattr(self, "fav_intervals", None):
+            self.interval_btn.setText("\u2304")
+            self.interval_btn.setMinimumWidth(0)
+        else:
+            cur = next((v for v, b in self.interval_btns.items() if b.isChecked()), "1d")
+            self.interval_btn.setText(self.interval_btns[cur].text())
+            f = QtGui.QFont(self.interval_btn.font())
+            f.setPixelSize(14)
+            self.interval_btn.setMinimumWidth(max(37, QtGui.QFontMetrics(f).horizontalAdvance(
+                self.interval_btn.text()) + 22))            # TradingView: 'D' is a 37 px button
 
     # ---- favourite intervals (TradingView: a star in the interval list puts it on the toolbar)
-    DEFAULT_FAV_INTERVALS = ["1m", "5m", "15m", "1h", "1d"]
+    DEFAULT_FAV_INTERVALS: list = []                     # TradingView's default: none, only the current interval
 
     def _load_fav_intervals(self) -> list:
         import json as _json
@@ -280,8 +292,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_fav_intervals(self):
         """Show the favourite intervals and, like TradingView, the current one even when it is not a favourite."""
         acts = getattr(self, "interval_btn_actions", {})
+        favs = self.fav_intervals
         for v, a in acts.items():
-            a.setVisible(v in self.fav_intervals or self.interval_btns[v].isChecked())
+            a.setVisible(v in favs or (bool(favs) and self.interval_btns[v].isChecked()))
+        if hasattr(self, "interval_btn"):
+            self._sync_interval_label()
         if hasattr(self, "run_btn"):
             self._fit_topbar()
 
@@ -409,22 +424,29 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setIconSize(QtCore.QSize(28, 28))                  # TradingView: 28 px icons in 38 px buttons
         self.topbar = tb
 
-        def vsep():
+        tb.setContentsMargins(0, 0, 0, 0)
+        if tb.layout() is not None:
+            tb.layout().setContentsMargins(0, 0, 0, 0)
+            tb.layout().setSpacing(0)                         # TradingView's buttons touch (gaps are explicit)
+
+        def vsep():                                           # TradingView: 9 px, a 1 x 22 line in the middle
             s = QtWidgets.QFrame()
             s.setObjectName("vsep")
             s.setFixedSize(1, 22)
             w = QtWidgets.QWidget()
             lay = QtWidgets.QHBoxLayout(w)
-            lay.setContentsMargins(5, 0, 5, 0)
+            lay.setContentsMargins(4, 0, 4, 0)
             lay.addWidget(s)
             tb.addWidget(w)
 
-        # ☰ main menu (TradingView keeps every app menu behind this button)
+        # ☰ main menu (TradingView keeps every app menu behind this button, over the 52 px drawing toolbar)
         self.menu_btn = QtWidgets.QToolButton()
         self.menu_btn.setIcon(icons.get("menu"))
         self.menu_btn.setToolTip("Main menu")
         self.menu_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_btn.setProperty("tvkind", "menu")
         tb.addWidget(self.menu_btn)
+        tb.addWidget(self._gap(4))
 
         # symbol pill: a button that opens Symbol Search (typing on the chart does the same)
         self.symbol = QtWidgets.QLineEdit()                 # state holder (also used by the API / tests)
@@ -432,22 +454,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.symbol.returnPressed.connect(self.on_load)
         self.symbol.setVisible(False)
         self._symbol_model = QtCore.QStringListModel(self._suggestions())
+        # TradingView's pill (measured): 128 x 28, #303030, radius 14; the symbol 12 px from the left in 14 px / 600
+        # #b8b8b8; inside it on the right a 32 x 28 'Switch data type' button with an 18 px icon
         pill = QtWidgets.QFrame()
         pill.setObjectName("symbolpill")
+        pill.setFixedSize(128, 28)
         ph = QtWidgets.QHBoxLayout(pill)
         ph.setContentsMargins(0, 0, 0, 0)
         ph.setSpacing(0)
-        self.sym_btn = QtWidgets.QToolButton()
-        self.sym_btn.setObjectName("symbtn")                 # TradingView: the symbol in a #303030 pill, no icon
-        self.sym_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.sym_btn = QtWidgets.QPushButton()
+        self.sym_btn.setObjectName("symbtn")
+        self.sym_btn.setFixedHeight(28)
         self.sym_btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.sym_btn.setToolTip("Symbol Search  (just start typing on the chart)")
+        self.sym_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.sym_btn.clicked.connect(lambda: self.open_symbol_search(""))
-        ph.addWidget(self.sym_btn)
+        ph.addWidget(self.sym_btn, 1)
         ph.addWidget(self.symbol)
-        self.symbol.textChanged.connect(lambda t: self.sym_btn.setText(t.strip().upper() or "Symbol"))
-        self.sym_btn.setText("Symbol")
+        self.src_menu = QtWidgets.QMenu(self)                # data source + history (TradingView: data type)
+        self.src_menu.aboutToShow.connect(self._fill_src_menu)
+        self.dtype_btn = QtWidgets.QToolButton()
+        self.dtype_btn.setObjectName("symact")
+        self.dtype_btn.setFixedSize(32, 28)
+        self.dtype_btn.setIcon(icons.get("datatype", size=18))
+        self.dtype_btn.setIconSize(QtCore.QSize(18, 18))
+        self.dtype_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.dtype_btn.setMenu(self.src_menu)
+        self.dtype_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        ph.addWidget(self.dtype_btn)
+        self.symbol.textChanged.connect(lambda t: self._set_pill_text(t.strip().upper() or "Symbol"))
+        self._set_pill_text("Symbol")
         tb.addWidget(pill)
+        tb.addWidget(self._gap(4))
         cmp_ = QtWidgets.QToolButton()
         cmp_.setIcon(icons.get("compare"))
         cmp_.setToolTip("Add symbol to the watchlist")
@@ -542,11 +580,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ind_actions[key] = a
         self.ind_btn = QtWidgets.QToolButton()
         self.ind_btn.setIcon(icons.get("fx"))
-        self.ind_btn.setText(" Indicators")
+        self.ind_btn.setText("Indicators")
         self.ind_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.ind_btn.setToolTip("Indicators, metrics & strategies  ( / )")
         self.ind_btn.clicked.connect(lambda: self.open_indicators())
         tb.addWidget(self.ind_btn)
+        self.ind_fav_btn = QtWidgets.QToolButton()           # TradingView: a 24 px chevron with the quick list
+        self.ind_fav_btn.setObjectName("chevbtn")
+        self.ind_fav_btn.setIcon(icons.get("chev", size=24))
+        self.ind_fav_btn.setIconSize(QtCore.QSize(24, 24))
+        self.ind_fav_btn.setToolTip("Indicators on this chart: switch on / off")
+        self.ind_fav_btn.setMenu(self.ind_menu)
+        self.ind_fav_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(self.ind_fav_btn)
 
         layout_menu = QtWidgets.QMenu(self)
         self.layout_group = QtGui.QActionGroup(self)
@@ -559,12 +605,12 @@ class MainWindow(QtWidgets.QMainWindow):
             a.triggered.connect(lambda _=False, k=key: self.set_layout(k))
             self.layout_actions[key] = a
         self.layout_actions["1"].setChecked(True)
-        self.layout_btn = self._menu_button(tb, "", layout_menu, icon="layout_icon", tip="Chart layout")
+        self._layout_menu = layout_menu                      # (its button sits on the right, like TradingView)
         vsep()
 
         self.alert_btn = QtWidgets.QToolButton()
         self.alert_btn.setIcon(icons.get("bell"))
-        self.alert_btn.setText(" Alert")
+        self.alert_btn.setText("Alert")
         self.alert_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.alert_btn.setToolTip(f"Create alert  ({theme.sc('Alt+A')})")
         self.alert_btn.clicked.connect(lambda: self.create_alert())
@@ -572,7 +618,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.replay_btn = QtWidgets.QToolButton()
         self.replay_btn.setIcon(icons.get("replay_icon"))
-        self.replay_btn.setText(" Replay")
+        self.replay_btn.setText("Replay")
         self.replay_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.replay_btn.setCheckable(True)
         self.replay_btn.setToolTip("Bar replay: pick a start bar, then play the market bar by bar")
@@ -594,22 +640,29 @@ class MainWindow(QtWidgets.QMainWindow):
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
-        # data source + history: one quiet button, like TradingView's data-type switch
-        self.src_btn = QtWidgets.QToolButton()
+        # data source + history live in the symbol pill's own button (TradingView: 'Switch data type'); this one
+        # only keeps the current choice as text (tooltips, older callers)
+        self.src_btn = QtWidgets.QToolButton(self)
         self.src_btn.setObjectName("srcbtn")
-        self.src_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.src_btn.setToolTip("Data source and history length")
-        self.src_menu = QtWidgets.QMenu(self)
-        self.src_menu.aboutToShow.connect(self._fill_src_menu)
-        self.src_btn.setMenu(self.src_menu)
-        tb.addWidget(self.src_btn)
+        self.src_btn.hide()
         self.source.currentIndexChanged.connect(lambda *_: self._sync_src_btn())
         self.range.currentTextChanged.connect(lambda *_: self._sync_src_btn())
         self._sync_src_btn()
 
+        # TradingView's right side: Layout setup | Quick search, Settings, Fullscreen, Snapshot, then the Trade and
+        # Upgrade pills (here: Accounts and Run)
+        self.layout_btn = self._menu_button(tb, "", self._layout_menu, icon="layout_icon", tip="Chart layout")
+        vsep()
+        tbtn("search", f"Quick search  ({theme.sc('Ctrl+K')})", self.quick_search)
+        tbtn("gear", "Settings", self.open_settings)
+        tbtn("fullscreen", f"Full screen  ({theme.sc('Shift+F')})", self.toggle_fullscreen)
+        tbtn("camera", "Save chart image", self.save_chart_image)
+        tb.addWidget(self._gap(4))
+
         self.acct_btn = QtWidgets.QToolButton()
         self.acct_btn.setObjectName("tradepill")              # styled like TradingView's "Trade" pill
         self.acct_btn.setFixedHeight(28)
+        self.acct_btn.setIconSize(QtCore.QSize(10, 10))        # just the status dot (not a 28 px toolbar icon)
         self.acct_btn.setText("Accounts")
         self.acct_btn.setToolTip("Broker accounts: API data + run one script on many accounts")
         m_ = QtWidgets.QMenu(self.acct_btn)
@@ -628,7 +681,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.acct_btn.setMenu(m_)
         self.acct_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self.acct_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        tb.addWidget(self.acct_btn)
+        holder = QtWidgets.QWidget()                          # (inside a holder: the toolbar would force its 28 px
+        hl = QtWidgets.QHBoxLayout(holder)                    # icon size on it and the pill would grow)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(self.acct_btn)
+        tb.addWidget(holder)
         self.acct_poller = acctmod.StatusPoller(self)
         self.acct_poller.updated.connect(self._acct_status_changed)
         self._acct_timer = QtCore.QTimer(self)
@@ -636,13 +693,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._acct_timer.start(10 * 60 * 1000)
         QtCore.QTimer.singleShot(1500, lambda: self.acct_poller.refresh())
         self._update_acct_dot()
-        vsep()
-
-        tbtn("search", f"Quick search  ({theme.sc('Ctrl+K')})", self.quick_search)
-        tbtn("gear", "Settings", self.open_settings)
-        tbtn("fullscreen", f"Full screen  ({theme.sc('Shift+F')})", self.toggle_fullscreen)
-        tbtn("camera", "Save chart image", self.save_chart_image)
-        tb.addWidget(self._gap(6))
+        tb.addWidget(self._gap(8))
         self.load_btn = QtWidgets.QPushButton("Load", self)   # kept for state; loading happens on Enter / search
         self.load_btn.hide()
         self.upd_btn = QtWidgets.QPushButton("Update")       # appears only when a newer build is published
@@ -651,14 +702,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.upd_btn.clicked.connect(self.start_update)
         self._upd_action = tb.addWidget(self.upd_btn)
         self._upd_action.setVisible(False)
-        tb.addWidget(self._gap(4))
         self.run_btn = QtWidgets.QPushButton("\u25b6  Run")
         self.run_btn.setObjectName("pill")
         self.run_btn.setFixedHeight(28)                       # TradingView: 28 px pills (Upgrade / Trade)
         self.run_btn.setToolTip("Run the strategy / script  (Cmd+R)")
         self.run_btn.clicked.connect(self.run_backtest)
         tb.addWidget(self.run_btn)
-        tb.addWidget(self._gap(6))
+        tb.addWidget(self._gap(4))
+
+    def _set_pill_text(self, text: str):
+        """The symbol in the pill, cut with '\u2026' when it does not fit (the pill keeps TradingView's 128 px)."""
+        b = getattr(self, "sym_btn", None)
+        if b is None:
+            return
+        f = QtGui.QFont(b.font())
+        f.setPixelSize(14)
+        f.setWeight(QtGui.QFont.Weight.DemiBold)
+        room = 128 - 12 - 32 - 4
+        b.setText(QtGui.QFontMetrics(f).elidedText(text, QtCore.Qt.TextElideMode.ElideRight, room))
+        b.setToolTip(f"{text} \u2014 Symbol Search  (just start typing on the chart)")
 
     def _sync_src_btn(self):
         if hasattr(self, "src_btn"):
@@ -666,6 +728,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._src_full = f"{name} \u00b7 {self.range.currentText()}  \u25be"
             self._src_short = f"{name}  \u25be"
             self.src_btn.setText(self._src_full)
+            if hasattr(self, "dtype_btn"):
+                self.dtype_btn.setToolTip(f"Data: {name} \u00b7 {self.range.currentText()} history \u2014 change source")
             self._fit_topbar()
 
     def _fit_topbar(self):
@@ -678,41 +742,82 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             TB = QtCore.Qt.ToolButtonStyle
             on = self.auto.active if hasattr(self, "auto") else False
-            steps = [(self.replay_btn, " Replay"), (self.alert_btn, " Alert"), (self.src_btn, None),
-                     (self.ind_btn, " Indicators"), ("favs", None), (self.run_btn, "\u25b6  Run"), (self.acct_btn, None)]
+            steps = [(self.replay_btn, "Replay"), (self.alert_btn, "Alert"),
+                     (self.ind_btn, "Indicators"), ("favs", None), (self.run_btn, "\u25b6  Run"), (self.acct_btn, None)]
             ivs = getattr(self, "interval_btn_actions", {})
+            favs = getattr(self, "fav_intervals", [])
             for b, full in steps:                                   # everything at full size first
                 if b == "favs":
                     for v, a in ivs.items():
-                        a.setVisible(v in self.fav_intervals or self.interval_btns[v].isChecked())
+                        a.setVisible(v in favs or (bool(favs) and self.interval_btns[v].isChecked()))
                 elif b is self.acct_btn:
                     b.setToolButtonStyle(TB.ToolButtonTextBesideIcon)
                     self._set_folded(b, False)
-                elif b is self.src_btn:
-                    b.setText(getattr(self, "_src_full", b.text()))
                 elif b is self.run_btn:
                     b.setText(full)
                 else:
                     b.setText(full)
                     b.setToolButtonStyle(TB.ToolButtonTextBesideIcon)
+            self._tv_sizes()
             for b, _full in steps:
                 tb.layout().invalidate()
                 if tb.sizeHint().width() <= self.width() - 4:
                     break
                 if b == "favs":                                     # then only the current interval (TradingView)
                     for v, a in ivs.items():
-                        a.setVisible(self.interval_btns[v].isChecked())
-                elif b is self.src_btn:
-                    b.setText(getattr(self, "_src_short", b.text()))
+                        a.setVisible(bool(favs) and self.interval_btns[v].isChecked())
                 elif b is self.run_btn:
                     b.setText("\u25b6")
                 else:
                     b.setToolButtonStyle(TB.ToolButtonIconOnly)
                     if b is self.acct_btn:                          # just the status dot, without the pill outline
                         self._set_folded(b, True)
+                self._tv_sizes()
             del on
         finally:
             self._fitting = False
+
+    def _tv_sizes(self):
+        """TradingView's top-bar buttons, measured on its page: an icon button is 38 x 38 (28 px icon, 5 px each
+        side); icon + text = 5 + 28 + 4 + text + 10 (Alert 77.8, Replay 90.2, Indicators 110.8); a text button =
+        13.5 + text + 13.5 ('D' is 37); the pills are 28 tall, 12 px left / right of the text."""
+        tb = getattr(self, "topbar", None)
+        if tb is None:
+            return
+        TB = QtCore.Qt.ToolButtonStyle
+        f = QtGui.QFont(tb.font())
+        f.setPixelSize(14)
+        fm = QtGui.QFontMetricsF(f)
+        for b in tb.findChildren(QtWidgets.QToolButton):
+            name = b.objectName()
+            if name.startswith("qt_") or (b.parentWidget() is not None
+                                          and b.parentWidget().objectName() == "symbolpill"):
+                continue                                            # Qt's own overflow arrow / the pill's button
+            txt = b.text().strip()
+            if name == "chevbtn":
+                kind, w, h = "chev", 24, 38
+            elif name == "tradepill":
+                if b.toolButtonStyle() == TB.ToolButtonIconOnly:
+                    kind, w, h = "icon", 38, 38
+                else:                                           # (Qt keeps room for its menu arrow: ask it)
+                    b.setMinimumWidth(0)
+                    b.setMaximumWidth(16777215)
+                    kind, w, h = "pill", max(int(round(12 + 10 + 4 + fm.horizontalAdvance(txt) + 12)),
+                                             b.sizeHint().width()), 28
+            elif b.property("tvkind") == "menu":
+                kind, w, h = "menu", 52, 38
+            elif b.toolButtonStyle() == TB.ToolButtonIconOnly or not txt:
+                kind, w, h = "icon", 38, 38
+            elif b.icon().isNull() or b.toolButtonStyle() == TB.ToolButtonTextOnly:
+                kind, w, h = "text", int(round(fm.horizontalAdvance(txt) + 27)), 38
+            else:
+                kind, w, h = "both", int(round(47 + fm.horizontalAdvance(txt))), 38
+            if b.property("tvkind") not in (kind, "menu"):
+                b.setProperty("tvkind", kind)
+                b.style().unpolish(b)
+                b.style().polish(b)
+            if b.minimumWidth() != w or b.maximumWidth() != w or b.height() != h:
+                b.setFixedSize(w, h)
 
     @staticmethod
     def _set_folded(b, on: bool):
@@ -1493,15 +1598,39 @@ class MainWindow(QtWidgets.QMainWindow):
             if manual:
                 self.statusBar().showMessage(f"ChartLab {self.version} is the newest version", 6000)
             return
-        self._upd_info = info
-        self.upd_btn.setText(f"Update to {info['version']}")
-        self._upd_action.setVisible(True)
-        self._fit_topbar()
-        self.statusBar().showMessage(
-            f"ChartLab {info['version']} is ready: press 'Update to {info['version']}' at the top right", 15000)
+        ready = getattr(self, "_upd_ready", None)
+        if ready and ready[0] == info["version"]:              # already fetched: the pill is waiting
+            return
+        self._upd_info, self._upd_ready = info, None
+        # TradingView: the new version is fetched quietly in the background; the button appears once it is ready
+        self._fetch_update(info, quiet=not manual)
+        if manual:
+            self.statusBar().showMessage(f"ChartLab {info['version']} found \u2014 fetching it in the background\u2026",
+                                         6000)
+
+    def _fetch_update(self, info, quiet: bool):
+        from .autotrade import _OrderWorker
+        from . import updater
+        if getattr(self, "_upd_busy", False):
+            return
+        self._upd_busy, self._upd_quiet = True, quiet
+        if not quiet:
+            self.upd_btn.setEnabled(False)
+            self.upd_btn.setText("Downloading 0%")
+            self._upd_action.setVisible(True)
+            self._fit_topbar()
+        self.updProgress.connect(self._update_progress, QtCore.Qt.ConnectionType.UniqueConnection)
+
+        def job():
+            z = updater.download(info, progress=lambda got, total: self.updProgress.emit(int(got), int(total)))
+            self.updProgress.emit(-1, 0)
+            return updater.unpack(z, info["version"])
+        w = self._upd_worker = _OrderWorker(job, self)
+        w.done.connect(self._update_downloaded)
+        w.start()
 
     def start_update(self):
-        from .autotrade import _OrderWorker
+        """The 'Restart to update' button (TradingView): put the fetched version in place and open it."""
         from . import updater
         info = getattr(self, "_upd_info", None)
         if not info or getattr(self, "_upd_busy", False):
@@ -1513,20 +1642,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "auto") and self.auto.active:
             QtWidgets.QMessageBox.information(self, "Update", "Auto-trade is running. Stop it first, then update.")
             return
-        self._upd_busy = True
-        self.upd_btn.setEnabled(False)
-        self.upd_btn.setText("Downloading 0%")
-        self.updProgress.connect(self._update_progress, QtCore.Qt.ConnectionType.UniqueConnection)
-
-        def job():
-            z = updater.download(info, progress=lambda got, total: self.updProgress.emit(int(got), int(total)))
-            self.updProgress.emit(-1, 0)
-            return updater.unpack(z, info["version"])
-        w = self._upd_worker = _OrderWorker(job, self)
-        w.done.connect(self._update_downloaded)
-        w.start()
+        ready = getattr(self, "_upd_ready", None)
+        if ready and ready[0] == info["version"] and Path(ready[1]).exists():
+            self._restart_into(ready[1])
+            return
+        self._upd_restart_after = True                          # fetch first (with progress), then restart
+        self._fetch_update(info, quiet=False)
 
     def _update_progress(self, got: int, total: int):
+        if getattr(self, "_upd_quiet", False):
+            return
         if got < 0:
             self.upd_btn.setText("Checking\u2026")
         elif total > 0:
@@ -1536,23 +1661,80 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.upd_btn.setText(f"Downloading {pct}%")
 
     def _update_downloaded(self, new_app, err):
-        from . import updater
         self._upd_busy = False
+        info = getattr(self, "_upd_info", {}) or {}
         if err or new_app is None:
             self.upd_btn.setEnabled(True)
-            self.upd_btn.setText(f"Update to {self._upd_info['version']}")
-            self.statusBar().showMessage(f"Update failed, nothing was changed: {err}", 15000)
+            self.upd_btn.setText(f"Update to {info.get('version', '')}")
+            self._upd_action.setVisible(True)
+            self._fit_topbar()
+            if not getattr(self, "_upd_quiet", False):
+                self.statusBar().showMessage(f"Update failed, nothing was changed: {err}", 15000)
             logging.error("update failed: %s", err)
+            self._upd_restart_after = False
             return
+        self._upd_ready = (info.get("version", ""), str(new_app))
+        if getattr(self, "_upd_restart_after", False):
+            self._upd_restart_after = False
+            self._restart_into(str(new_app))
+            return
+        self.upd_btn.setEnabled(True)
+        self.upd_btn.setText("Restart to update")
+        self.upd_btn.setToolTip(f"ChartLab {info.get('version', '')} is downloaded and checked \u2014 "
+                                "click to restart into it (your charts and settings stay)")
+        self._upd_action.setVisible(True)
+        self._fit_topbar()
+        self.statusBar().showMessage(f"ChartLab {info.get('version', '')} is ready \u2014 click 'Restart to update' "
+                                     "at the top right", 15000)
+
+    def _restart_into(self, new_app: str):
+        from . import updater
         try:
-            updater.swap_and_restart(new_app)
+            updater.swap_and_restart(Path(new_app), self.version, (self._upd_info or {}).get("version", ""))
         except Exception as e:  # noqa: BLE001
             self.upd_btn.setEnabled(True)
             self.statusBar().showMessage(f"Update failed, nothing was changed: {e}", 15000)
             return
+        self.upd_btn.setEnabled(False)
         self.upd_btn.setText("Restarting\u2026")
         self.statusBar().showMessage("Restarting into the new ChartLab\u2026")
         QtCore.QTimer.singleShot(300, lambda: (self.close(), QtWidgets.QApplication.quit()))
+
+    def report_last_update(self):
+        """After a restart: say 'Updated to \u2026', or - when macOS kept the old app - why, and what to do."""
+        from . import updater
+        res = updater.take_pending(self.version)
+        if not res:
+            return
+        if res.get("ok"):
+            self.statusBar().showMessage(f"Updated to ChartLab {self.version}", 8000)
+            return
+        why = res.get("reason") or "the new app did not replace this one"
+        new_app = res.get("new_app", "")
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Update")
+        box.setText(f"ChartLab {res.get('to', '')} was downloaded and checked, but macOS did not let it replace this "
+                    f"copy, so ChartLab {self.version} opened again.")
+        box.setInformativeText(f"macOS said: {why}\n\nIf macOS asked about letting ChartLab modify apps, allow it in "
+                               "System Settings \u2192 Privacy & Security \u2192 App Management and try the update "
+                               "again. Or drag the new ChartLab (shown in Finder) into Applications yourself.")
+        show = box.addButton("Show the new app", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is show and new_app and Path(new_app).exists():
+            import subprocess
+            subprocess.Popen(["open", "-R", new_app])
+
+    def start_update_checks(self):
+        """The Mac app looks for a newer build 5 s after it opens and every 2 hours (TradingView does it too)."""
+        from . import updater
+        QtCore.QTimer.singleShot(1500, self.report_last_update)
+        if updater.app_bundle() is None:
+            return
+        QtCore.QTimer.singleShot(5000, self.check_updates)
+        self._upd_timer = QtCore.QTimer(self)
+        self._upd_timer.timeout.connect(self.check_updates)
+        self._upd_timer.start(2 * 60 * 60 * 1000)
 
     def perf_test(self):
         """View > Performance test: how long this Mac needs to draw one chart frame while panning / zooming."""
@@ -1823,16 +2005,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_acct_dot(self):
         state, tip = acctmod.overall_state()
-        pm = QtGui.QPixmap(14, 14)
+        pm = QtGui.QPixmap(20, 20)
+        pm.setDevicePixelRatio(2.0)
         pm.fill(QtCore.Qt.GlobalColor.transparent)
         p = QtGui.QPainter(pm)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.setBrush(QtGui.QColor(acctmod.STATE_COLOR.get(state)))
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.drawEllipse(2, 2, 10, 10)
+        p.drawEllipse(QtCore.QRectF(1, 1, 8, 8))
         p.end()
         self.acct_btn.setIcon(QtGui.QIcon(pm))
-        self.acct_btn.setText(" Accounts")
+        self.acct_btn.setText("Accounts")
         self.acct_btn.setToolTip(tip)
         ready = any(a.get("access_token") for a in acctmod.load_accounts())
         for pn in getattr(self, "panels", []):              # Buy / Sell on the chart only once a broker is connected
@@ -2385,6 +2568,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_load_failed(self, panel, msg):
         self.load_btn.setEnabled(True)
+        # the chart still shows the old symbol: so does the pill (TradingView never leaves a symbol it could not open
+        # in the toolbar)
+        if panel is self.active and panel.df is not None and len(panel.df):
+            shown = str(panel.params.get("symbol", "")).strip()
+            if shown and self.symbol.text().strip().upper() != shown.upper():
+                self.symbol.setText(shown)
         src = str(panel.params.get("source", ""))
         if src.startswith("api:") and any(k in msg for k in ("401", "403", "DH-90", "nvalid", "xpired")):
             acct = src.split(":", 1)[1]
@@ -2870,12 +3059,6 @@ def selftest() -> int:
     for k in ("sma20", "bb", "rsi"):
         win.ind_actions[k].setChecked(True)
     win.start_auto_update()
-    from . import updater
-    if updater.app_bundle() is not None:               # the Mac app looks for a newer build by itself
-        QtCore.QTimer.singleShot(5000, win.check_updates)
-        win._upd_timer = QtCore.QTimer(win)
-        win._upd_timer.timeout.connect(win.check_updates)
-        win._upd_timer.start(2 * 60 * 60 * 1000)
     win.set_auto_refresh(0)
     win.set_strategy_code(FALLBACK_STRATEGY)
     win.run_backtest()
@@ -2928,14 +3111,17 @@ def main():
         win.api = ApiServer(win)
         win.api.start()
         win.api_label.setText(f"Claude link: ON (port {win.api.port})  ")
+        win.clock.setToolTip(f"Claude link: ON (port {win.api.port})")
     except Exception as e:  # noqa: BLE001 - the app must still work without the API
         logging.exception("API server failed")
         win.api_label.setText("Claude link: off  ")
+        win.clock.setToolTip("Claude link: off")
         win.add_log(f"Claude link could not start: {e}")
     QtCore.QTimer.singleShot(300, win.on_load)
     if win.source.currentData() in ("yahoo", "auto"):
         QtCore.QTimer.singleShot(2500, win.watchlist.refresh)
     win.start_auto_update()
+    win.start_update_checks()                     # (was only wired into the self-test before: never ran in the app)
     rc = app.exec()
     quit_cleanly(win, rc)
 

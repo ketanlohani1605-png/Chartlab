@@ -376,6 +376,19 @@ def st_hollow(p, r, c):
     candles_icon(p, r, c)
 
 
+def chev(p, r, c):
+    """A small down chevron (8 x 4, TradingView's list arrow next to a toolbar button)."""
+    p.drawPolyline([QtCore.QPointF(8, 10), QtCore.QPointF(12, 14), QtCore.QPointF(16, 10)])
+
+
+def datatype(p, r, c):
+    """Two small outlined candles - the button inside the symbol pill that switches the data feed."""
+    for x, top, bot, b0, b1 in ((8.5, 4.5, 20.5, 8.5, 17.5), (15.5, 3.5, 17.5, 6.5, 14.5)):
+        p.drawLine(QtCore.QPointF(x, top), QtCore.QPointF(x, b0))
+        p.drawLine(QtCore.QPointF(x, b1), QtCore.QPointF(x, bot))
+        p.drawRoundedRect(QtCore.QRectF(x - 2.5, b0, 5, b1 - b0), 1, 1)
+
+
 def st_heikin(p, r, c):
     p.setBrush(c)
     for x, top, bot in ((6, 12, 19), (12, 8, 16), (18, 4, 12)):
@@ -497,7 +510,7 @@ _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
     "latest",
     "undo", "redo", "camera", "fullscreen", "zoom", "plus", "eye", "lock", "menu", "compare", "calendar", "gear", "search", "refresh", "datawin", "chain", "st_bars", "st_candles", "st_hollow", "st_heikin", "st_line",
     "st_linemark", "st_step", "st_area", "st_baseline", "t_ext", "t_arrow", "t_ellipse", "t_long", "t_short",
-    "t_pricerange", "t_daterange", "t_channel", "t_brush", "t_stay")}
+    "t_pricerange", "t_daterange", "t_channel", "t_brush", "t_stay", "datatype", "chev")}
 
 
 def get(name: str, color: str = _COLOR, size: int = _BOX) -> QtGui.QIcon:

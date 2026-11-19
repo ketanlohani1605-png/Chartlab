@@ -167,15 +167,20 @@ assert abs(bb_mid._full[1][-1] - np.log10(bb_mid._raw[-1])) < 1e-9
 ch.set_scale_mode("regular")
 pump(50)
 
-# TradingView details measured on its canvas: every other price label bold (even multiples of the step), the
-# newest bar's volume as a label on the price scale
+# TradingView details measured on its canvas: bold price labels at 5x a 1 / 2 / 4 step and 2x a 2.5 / 5 step
+# (step 20: 1,200 and 1,300 bold), the newest bar's volume as a label on the price scale
+from chartlab.chart import tv_bold_step, tv_price_step
 ax = ch.price.getAxis("right")
 (y0, y1) = ch.price.vb.viewRange()[1]
 spacing, ticks = ax.tickValues(y0, y1, ch.price.vb.height())[0]
 strs = ax.tickStrings(ticks, 1, spacing)
 heavy = [t for t, s_ in zip(ticks, strs) if s_ in ax._bold]
-assert heavy and len(heavy) < len(ticks) and all(round(t / spacing) % 2 == 0 for t in heavy), (ticks, ax._bold)
-assert all(round(t / spacing) % 2 == 1 for t, s_ in zip(ticks, strs) if s_ not in ax._bold)
+bstep = tv_bold_step(spacing)
+assert heavy and len(heavy) < len(ticks) and all(abs(t / bstep - round(t / bstep)) < 1e-6 for t in heavy), (ticks, ax._bold)
+assert all(abs(t / bstep - round(t / bstep)) > 1e-6 for t, s_ in zip(ticks, strs) if s_ not in ax._bold)
+assert [tv_bold_step(s) for s in (0.1, 0.2, 0.5, 1, 2, 2.5, 10, 20, 40, 100)] == [0.5, 1, 1, 5, 10, 5, 50, 100, 200, 500]
+assert [tv_price_step(r) for r in (0.07, 0.15, 0.3, 0.9, 1.7, 2.3, 3.1, 4.5, 11.7, 27.3, 58.5, 124.8)] == \
+    [0.1, 0.2, 0.5, 1, 2, 2.5, 4, 5, 20, 40, 100, 200]          # TradingView's steps (measured), 30 px apart
 ch._place_last_tag()
 vt = ch.vol_tag
 assert vt.isVisible() and vt.text() == theme.fmt_vol(float(ch._vols[ch._n() - 1])), vt.text()
@@ -337,11 +342,13 @@ pump(30)
 assert w.toast.isHidden()
 vis = [v for v, a in w.interval_btn_actions.items() if a.isVisible()]
 cur = next(v for v, b in w.interval_btns.items() if b.isChecked())
-assert set(vis) == set(w.fav_intervals) | {cur}, (vis, w.fav_intervals, cur)
+# TradingView's default: no favourites - one button with the current interval opens the list
+assert w.fav_intervals == [] and vis == [] and w.interval_btn.text() == w.interval_btns[cur].text(), vis
 w.toggle_fav_interval("3m", True)
-assert w.interval_btn_actions["3m"].isVisible() and "3m" in json.loads(w.settings.value("fav_intervals"))
+vis = [v for v, a in w.interval_btn_actions.items() if a.isVisible()]
+assert set(vis) == {"3m", cur} and "3m" in json.loads(w.settings.value("fav_intervals")) and w.interval_btn.text() == "⌄"
 w.toggle_fav_interval("3m", False)
-assert not w.interval_btn_actions["3m"].isVisible() or cur == "3m"
+assert not any(a.isVisible() for a in w.interval_btn_actions.values()) and w.interval_btn.text() != "⌄"
 groups = list(w.tool_groups.items())
 assert [ks[0] for _a, ks in groups][:5] == ["trend", "fib", "long", "brush", "text"], [ks for _a, ks in groups]
 shapes = next(a for a, ks in groups if "rect" in ks)

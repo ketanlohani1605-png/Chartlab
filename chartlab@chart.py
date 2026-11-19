@@ -39,6 +39,7 @@ PRICE_TAG_H = 17                 # last-price / alert labels on the price scale
 XHAIR_TAG_H = 21                 # the crosshair's price label (and the '+' box next to it)
 TIME_TAG_H = 24                  # the crosshair's time label, flush with the top of the time scale
 TIME_TEXT_TOP = 7                # time-scale text sits this far below the top of the scale (labels line up with it)
+TIME_LABEL_PX = 51.2             # time-scale labels: centres at least this far apart (TradingView: 50.8 no, 51.6 yes)
 PRICE_TEXT_LEFT = 10             # price-scale text starts this far right of the scale's edge
 _PEN_STYLES = {"solid": QtCore.Qt.PenStyle.SolidLine, "dash": QtCore.Qt.PenStyle.DashLine,
                "dot": QtCore.Qt.PenStyle.DotLine}
@@ -158,15 +159,90 @@ class _BoldLabelsMixin:
             p.drawText(rect, int(flags), text)
 
 
+def _signed(x: float, decimals: int = 2) -> str:
+    """'+0.61' / '−0.33': TradingView writes changes with a real minus sign (U+2212)."""
+    return f"{x:+,.{decimals}f}".replace("-", "−")
+
+
+def price_decimals(df, default: int = 2) -> int:
+    """How many decimals the symbol's prices have - TradingView shows a symbol in its own tick size (RELIANCE moves in
+    0.10 steps on NSE, so its scale reads 1,358.5 / 1,380.0; an index has two decimals). Read from the newest bars:
+    the fewest decimals that (nearly) all of them fit."""
+    try:
+        tail = df[["Open", "High", "Low", "Close"]].tail(20).to_numpy(float).ravel()
+    except Exception:  # noqa: BLE001
+        return default
+    tail = tail[np.isfinite(tail) & (tail != 0)]
+    if len(tail) < 8:
+        return default
+    big = float(np.nanmedian(np.abs(tail)))
+    top = 2 if big >= 1 else (4 if big >= 0.01 else 8)
+    for d in range(0, top + 1):
+        x = tail * (10 ** d)
+        if np.mean(np.abs(x - np.round(x)) < 0.05) >= 0.9:   # data vendors store prices as floats: allow the noise
+            return d
+    return min(max(default, 0), top) if top <= 2 else top
+
+
+def tv_price_step(raw: float, decimals: int | None = None) -> float:
+    """TradingView's price-scale step: the smallest 'nice' step that keeps labels >= 30 px apart. From 1 up the
+    steps are 1, 2, 2.5, 4, 5 x 10^n (measured on its scale: 0.1 0.2 0.5 1 2 2.5 10 20 40 100 200); below 1 only
+    1, 2, 5 x 10^n, and never finer than the symbol's own tick."""
+    if not np.isfinite(raw) or raw <= 0:
+        return 1.0
+    mag = 10.0 ** np.floor(np.log10(raw))
+    mults = (1.0, 2.0, 2.5, 4.0, 5.0, 10.0) if mag >= 1 else (1.0, 2.0, 5.0, 10.0)
+    step = mag * 10.0
+    for m in mults:
+        s = m * mag
+        if decimals == 0 and abs(s - round(s)) > 1e-9:
+            continue
+        if s >= raw * (1 - 1e-9):
+            step = s
+            break
+    if decimals is not None:
+        step = max(step, 10.0 ** -decimals)
+    return float(step)
+
+
+def tv_bold_step(step: float) -> float:
+    """Which price labels TradingView draws bold (measured): with a 1 / 2 / 4 x 10^n step every 5th one (1,300 and
+    1,200 when the step is 20), with a 2.5 / 5 x 10^n step every 2nd one (1,385 / 1,380 / 1,375 at step 2.5)."""
+    if step <= 0:
+        return 0.0
+    mag = 10.0 ** np.floor(np.log10(step) + 1e-9)
+    m = step / mag
+    return step * (2.0 if min(abs(m - 2.5), abs(m - 5.0)) < 1e-6 else 5.0)
+
+
 class PriceAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
     chart = None
     is_price = True
+    _blocked: tuple = ()          # (top, bottom) strips of this axis covered by a series label (last price, volume)
 
     def tickStrings(self, values, scale, spacing):
         out = self._tick_strings(values, scale, spacing)
-        self._bold = frozenset(s for v, s in zip(values, out)
-                               if s and spacing and int(round(float(v) / float(spacing))) % 2 == 0)
+        ch = self.chart
+        b = tv_bold_step(float(spacing)) if spacing else 0.0
+        if b <= 0 or (ch is not None and self.is_price and ch.scale_mode != "regular"):
+            self._bold = frozenset()
+        else:
+            self._bold = frozenset(s for v, s in zip(values, out)
+                                   if s and abs(float(v) / b - round(float(v) / b)) < 1e-6)
         return out
+
+    def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
+        """TradingView never lets a scale number peek out from under the last-price / volume label: a number that
+        touches one of those labels is not drawn at all."""
+        if self._blocked:
+            keep = []
+            for spec in textSpecs:
+                r = spec[0]
+                top, bot = r.top() + 2.0, r.bottom() - 2.0          # the glyphs, not the line's leading
+                if not any(bot > a and top < b for a, b in self._blocked):
+                    keep.append(spec)
+            textSpecs = keep
+        super().drawPicture(p, axisSpec, tickSpecs, textSpecs)
 
     def _tick_strings(self, values, scale, spacing):
         ch = self.chart
@@ -194,9 +270,11 @@ class PriceAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
         if span <= 0 or size <= 0:
             return super().tickSpacing(minVal, maxVal, size)
         raw = span / max(size / 30.0, 2)        # TradingView: labels at least 2.5 x the font size (30 px) apart
-        mag = 10 ** np.floor(np.log10(raw))
-        step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
-        return [(step, 0)]
+        ch = self.chart
+        dec = None
+        if ch is not None and self.is_price and ch.df is not None and ch.scale_mode == "regular":
+            dec = ch.decimals(max(abs(minVal), abs(maxVal)))
+        return [(tv_price_step(raw, dec), 0)]
 
 
 class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
@@ -211,8 +289,13 @@ class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
         self.dow = True
         self.datefmt = "%d %b '%y"
 
+    # natural weight of a bar as a label place (the most important ones in view are drawn bold)
+    W_YEAR, W_MONTH, W_WEEK, W_DAY = 13, 12, 11, 10
+    TIME_STRIDES = (1, 5, 15, 30, 60, 180, 360, 720)         # minutes: weights 1 .. 8
+
     def set_index(self, index: pd.DatetimeIndex, future: pd.DatetimeIndex | None = None):
         self.intraday = bool(len(index)) and bool(((index.hour != 0) | (index.minute != 0)).any())
+        real = index
         self._future = future if future is not None and len(future) else None
         if self._future is not None:                        # label the empty space right of the newest bar too
             try:
@@ -220,90 +303,143 @@ class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
             except (TypeError, ValueError):                 # (time zones that do not mix): no future labels
                 self._future = None
         self._index = index
-        # how "important" each bar is as a place for a time label (TradingView puts labels ON calendar boundaries:
-        # a new year beats a new month beats a new day beats a round hour ...)
         n = len(index)
+        T = {"n": n}
         w = np.zeros(n, dtype=np.int8)
         if n:
             y, mo, d = index.year.to_numpy(), index.month.to_numpy(), index.day.to_numpy()
-            ch = lambda a: np.r_[True, a[1:] != a[:-1]]  # noqa: E731
+            chg = lambda a: np.r_[True, a[1:] != a[:-1]]  # noqa: E731
+            newyear = chg(y)
+            newmonth = newyear | chg(mo)
+            newday = newmonth | chg(d)
+            # bar interval in minutes (from the real bars, not the projected ones)
+            dd = np.diff(real.values[-300:]).astype("timedelta64[s]").astype(np.int64) if len(real) > 2 else np.array([])
+            dd = dd[dd > 0]
+            T["bar_min"] = max(1, int(round(float(np.median(dd)) / 60))) if len(dd) else 1440
             if self.intraday:
-                h, mi = index.hour.to_numpy(), index.minute.to_numpy()
-                w[mi % 5 == 0] = 1
-                w[mi % 15 == 0] = 2
-                w[mi % 30 == 0] = 3
-                w[ch(h) | (mi == 0)] = 4
-            newday = ch(d) | ch(mo) | ch(y)
-            if self.intraday:
-                w[newday] = 5
-            w[ch(mo) | ch(y)] = 6
-            w[ch(y)] = 7
-            w[0] = max(int(w[0]), 0) if n > 1 else 0
-            if n > 1:                                    # the very first bar is not a real boundary
-                w[0] = 0
+                mins = index.hour.to_numpy().astype(np.int64) * 60 + index.minute.to_numpy()
+                prev = np.r_[-1, mins[:-1]]
+                for k, s in enumerate(self.TIME_STRIDES, start=1):   # the biggest clock boundary crossed
+                    w[(mins // s) != (prev // s)] = k
+                T["mins"] = mins
+                # a new week (TradingView bolds the first day of a week among days); a Sunday session opens the week
+                iso = (index.normalize() + pd.Timedelta(days=1)).isocalendar()
+                wk = iso["year"].to_numpy().astype(np.int64) * 100 + iso["week"].to_numpy().astype(np.int64)
+                newweek = newday & chg(wk)
+                w[newday] = self.W_DAY
+                w[newweek] = self.W_WEEK
+                T["newweek"] = newweek
+            else:
+                w[:] = self.W_DAY                                # every daily / weekly bar is a day label place
+            w[newmonth] = self.W_MONTH
+            w[newyear] = self.W_YEAR
+            if n > 1:                                            # the very first bar is not a real boundary
+                newyear[0] = newmonth[0] = newday[0] = False
+                if "newweek" in T:
+                    T["newweek"][0] = False
+            starts = np.flatnonzero(np.r_[True, (mo[1:] != mo[:-1]) | (y[1:] != y[:-1])])
+            T["pos"] = np.arange(n) - np.repeat(starts, np.diff(np.r_[starts, n]))   # bar number inside its month
+            T.update(newyear=newyear, newmonth=newmonth, newday=newday, year=y, month=mo,
+                     day_id=np.cumsum(chg(d) | chg(mo) | chg(y)), cross={})
         self._weight = w
-        self._levels = {int(k): np.flatnonzero(w >= k) for k in range(1, 8)}
+        self._ti = T
 
     def share_index(self, other):
         self._index, self.intraday = other._index, other.intraday
-        self._weight, self._levels = other._weight, other._levels
+        self._weight, self._ti = other._weight, getattr(other, "_ti", {"n": 0})
         self._future = getattr(other, "_future", None)
 
     def tickValues(self, minVal, maxVal, size):
-        idx = self._index
-        if idx is None or not len(idx) or maxVal <= minVal or size <= 0:
+        """TradingView's time labels (measured on its scale at many zoom levels):
+        - label centres at least ~51 px apart (50.8 px: no, 51.6 px: yes);
+        - years, then months: every month, every 2nd (Jan, Mar, May ...) or only Jan / Jul - the finest step at which
+          3 in 4 gaps fit (months that still do not fit are skipped);
+        - daily / weekly bars: a date every 1, 2, 3 or 4 bars counted from the month's first bar, or no dates at all
+          (at 12.6 px a bar: only months; at 13.5 px: every 4th bar);
+        - intraday: each day's first bar (left to right, skipping days too close), then the clock: every 1, 5, 15,
+          30 min, 1 h (and 3 / 6 / 12 h for bars of 15 min and up) - the finest step that fits; a time too close to a
+          day label is dropped."""
+        idx, T = self._index, getattr(self, "_ti", None)
+        if idx is None or not len(idx) or maxVal <= minVal or size <= 0 or not T or not T.get("n"):
             return super().tickValues(minVal, maxVal, size)
-        n = len(idx)
-        # bars between two labels. TradingView (measured at its default 6 px bars): intraday labels every hour at
-        # 72 px but never the half hours at 36 px; daily charts show only the months ~125 px apart
-        gap_px = 64.0 if self.intraday else 82.0
-        gap = max(1.0, gap_px * (maxVal - minVal) / size)
-        lo, hi = max(int(np.ceil(minVal)), 0), min(int(np.floor(maxVal)), n - 1)
+        n = T["n"]
+        spx = size / (maxVal - minVal)                       # pixels per bar
+        k = TIME_LABEL_PX / spx                              # bars two labels must be apart
+        pad = int(np.ceil(k)) + 2
+        lo, hi = max(int(np.ceil(minVal)) - pad, 0), min(int(np.floor(maxVal)) + pad, n - 1)
         if hi < lo:
             return []
+        span = hi - lo
+        # everything is worked out over a wider stretch than the screen, so the labels stay put while panning
+        elo, ehi = max(lo - max(span, 300), 0), min(hi + max(span, 300), n - 1)
         chosen: list[int] = []
-        for k in range(7, 0, -1):                                 # most important boundaries first
-            cand = self._levels[k]
-            a, b = np.searchsorted(cand, lo), np.searchsorted(cand, hi, side="right")
-            if b - a == 0:
-                continue
-            self._place(chosen, cand[a:b], gap)
-        if not self.intraday or not chosen:                       # fill what is left with ordinary bars
-            self._place(chosen, None, gap, lo, hi)
-        return [(gap, [float(v) for v in chosen])]
-
-    @staticmethod
-    def _place(chosen: list, cand, gap: float, lo: int = 0, hi: int = 0):
-        """Add candidates that keep at least `gap` bars from every label already chosen (chosen stays sorted)."""
         import bisect
-        pos = None
-        j, m = 0, (len(cand) if cand is not None else 0)
-        cur = lo
-        while True:
-            if cand is not None:
-                if pos is not None:
-                    j = int(np.searchsorted(cand, pos + gap))
-                if j >= m:
-                    return
-                x = int(cand[j])
-            else:
-                x = cur if pos is None else int(np.ceil(pos + gap))
-                if x > hi:
-                    return
-            i = bisect.bisect_left(chosen, x)
-            left_ok = i == 0 or x - chosen[i - 1] >= gap
-            right_ok = i == len(chosen) or chosen[i] - x >= gap
-            if left_ok and right_ok:
-                chosen.insert(i, x)
-                pos = x
-            else:                                               # blocked: jump past the label in the way
-                nxt = (chosen[i - 1] if not left_ok else chosen[i]) + gap
-                pos = max(nxt - gap, x + 1 - gap) if nxt > x else x + 1 - gap
-                if cand is not None:
-                    j = int(np.searchsorted(cand, max(nxt, x + 1)))
-                    pos = None
-                    if j >= m:
-                        return
+
+        def free(i):
+            j = bisect.bisect_left(chosen, i)
+            return (j == 0 or i - chosen[j - 1] >= k - 1e-9) and (j == len(chosen) or chosen[j] - i >= k - 1e-9)
+
+        def place(cands):
+            for i in cands:
+                i = int(i)
+                if free(i):
+                    bisect.insort(chosen, i)
+
+        def fits(seq) -> float:
+            seq = np.unique(np.asarray(seq, dtype=np.int64))
+            if len(seq) < 2:
+                return 1.0
+            return float(np.mean(np.diff(seq) >= k - 1e-9))
+
+        def marks(mask, a, b):
+            return np.flatnonzero(mask[a:b + 1]) + a
+
+        # years: every year, every 2nd, 5th ... (the finest step at which 3 in 4 gaps fit)
+        ys_e = marks(T["newyear"], elo, ehi)
+        if len(ys_e):
+            yv = T["year"][ys_e]
+            for s in (1, 2, 5, 10, 25, 50, 100):
+                c = ys_e[yv % s == 0]
+                if fits(c) >= 0.75 or s == 100:
+                    place(c)
+                    break
+        # months (January is the year's label): every month, every 2nd, or Jan / Jul only
+        ms_e = marks(T["newmonth"] & ~T["newyear"], elo, ehi)
+        if len(ms_e):
+            mv = T["month"][ms_e]
+            for s in (1, 2, 6):
+                c = ms_e[(mv - 1) % s == 0]
+                if fits(np.r_[c, ys_e]) >= 0.75:
+                    place(c)
+                    break
+        if not self.intraday:
+            # dates: every 1, 2, 3 or 4 bars from the month's first bar - or none at all
+            stride = next((s for s in (1, 2, 3, 4) if s * spx >= TIME_LABEL_PX - 1e-9), None)
+            if stride is not None:
+                pos = T["pos"][elo:ehi + 1]
+                place(np.flatnonzero((pos > 0) & (pos % stride == 0)) + elo)
+        else:
+            place(marks(T["newday"] & ~T["newmonth"], elo, ehi))      # each day, left to right (a new week is
+            #                                                          only drawn bold, it is not placed first)
+            bm = int(T.get("bar_min", 1))
+            cap = 60 if bm < 15 else 720
+            for s in self.TIME_STRIDES:
+                if s < bm or s % bm or s > cap:
+                    continue
+                cross = T["cross"].get(s)
+                if cross is None:                                        # bars that start a new 5 / 15 / 60 min ...
+                    mins = T["mins"]
+                    cross = T["cross"][s] = ((mins // s) != (np.r_[-1, mins[:-1]] // s)) & ~T["newday"]
+                c = marks(cross, elo, ehi)
+                if not len(c):
+                    continue
+                day = T["day_id"][c]
+                gaps = np.diff(c)[day[1:] == day[:-1]]                   # within a day
+                if not len(gaps) or np.mean(gaps >= k - 1e-9) >= 0.75:
+                    place(c)
+                    break
+        lo_v, hi_v = minVal - 0.5, maxVal + 0.5
+        return [(max(k, 1.0), [float(v) for v in chosen if lo_v <= v <= hi_v])]
 
     def tickStrings(self, values, scale, spacing):
         idx, out, ks = self._index, [], []
@@ -317,18 +453,19 @@ class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
             t = idx[i]
             k = int(w[i]) if w is not None and i < len(w) else 0
             ks.append(k)
-            if k >= 7:
+            if k >= self.W_YEAR:
                 out.append(str(t.year))
-            elif k == 6:
+            elif k == self.W_MONTH:
                 out.append(t.strftime("%b"))
-            elif self.intraday:
-                out.append(str(t.day) if k == 5 else t.strftime("%H:%M" if self.h24 else "%I:%M %p"))
+            elif self.intraday and k < self.W_DAY:
+                out.append(t.strftime("%H:%M" if self.h24 else "%I:%M %p"))
             else:
                 out.append(str(t.day))
-        # TradingView: the most important boundaries in view are bold (a day among hours, a month among days, a
-        # year among months); with only hours and quarter hours in view the round hours are
-        top = max((k for k, s in zip(ks, out) if s), default=-1)
-        self._bold = frozenset(s for k, s in zip(ks, out) if s and k >= top) if top >= 0 else frozenset()
+        # TradingView: the most important boundaries in view are bold - a month among days, a year among months, a
+        # day among hours, the first day of a week among days, every round hour among quarter hours (all hours alike)
+        cls = [min(k, 5) if 0 <= k < self.W_DAY else k for k in ks]
+        top = max((c for c, s in zip(cls, out) if s), default=-1)
+        self._bold = frozenset(s for c, s in zip(cls, out) if s and c >= top) if top >= 0 else frozenset()
         return out
 
 
@@ -1124,11 +1261,12 @@ class ChartWidget(QtWidgets.QWidget):
         if last == getattr(self, "_tb_last", None):
             return
         self._tb_last = last
-        # TradingView without a bid / ask feed (an index, no broker): the last price on both buttons, spread 0.00
+        # TradingView without a bid / ask feed (an index, no broker): the last price on both buttons, no spread
+        # ('0.00' for an index, '0.0' for a 0.10-tick stock - the symbol's own precision)
         fp = self.fp(last)
         for b in (self.sell_btn, self.buy_btn):
             b.price_lbl.setText(fp)
-        self.spread_lbl.setText("<span style='color:#dbdbdb;font-size:10px'>0.00</span>")
+        self.spread_lbl.setText(f"<span style='color:#dbdbdb;font-size:10px'>{self.fp(0.0, ref=last)}</span>")
 
     # ------------------------------------------------------------------ construction helpers
     def _make_plot(self, row) -> pg.PlotItem:
@@ -1678,16 +1816,24 @@ class ChartWidget(QtWidgets.QWidget):
             return (self._base or 1.0) * (1.0 + v / 100.0)
         return v
 
-    def decimals(self) -> int:
+    def decimals(self, at: float | None = None) -> int:
+        """Decimals of a price on this chart. 'Default' = the symbol's own tick, like TradingView: an NSE stock's
+        step depends on its price (RELIANCE 1,358.5, HDFCBANK 809.20, BAJAJ-AUTO 10,587), an index 25,447.92.
+        `at`: the price being written (None: the newest close)."""
         p = settings.get()["precision"]
         if p == "Integer":
             return 0
         if p != "Default":
             return int(p.split()[0])
-        return 2
+        if getattr(self, "_var_tick", False):
+            from .symbols import band_decimals
+            if at is None:
+                at = float(self._closes[self._n() - 1]) if getattr(self, "_closes", None) is not None and self._n() else 0.0
+            return band_decimals(at)
+        return int(getattr(self, "_auto_dec", 2))
 
     def axis_price(self, x: float) -> str:
-        return f"{x:,.{self.decimals()}f}"                 # 25,282.50 like TradingView's scale
+        return f"{x:,.{self.decimals(x)}f}"                # 25,282.50 / 1,358.5 like TradingView's scale
 
     def axis_label(self, v: float) -> str:
         if self.scale_mode == "percent":
@@ -1722,14 +1868,15 @@ class ChartWidget(QtWidgets.QWidget):
         self._update_last_tag()
         self.go_latest()
 
-    def fp(self, x: float) -> str:
-        """Format a price with the precision chosen in Settings."""
-        p = settings.get()["precision"]
-        if p == "Integer":
-            return f"{x:,.0f}"
-        if p != "Default":
-            return f"{x:,.{int(p.split()[0])}f}"
-        return f"{x:,.2f}"
+    def fp(self, x: float, ref: float | None = None) -> str:
+        """Format a price with the precision chosen in Settings (Default: the symbol's own tick at that price;
+        `ref`: write it in the precision of that price instead - a spread, a change)."""
+        return f"{x:,.{self.decimals(x if ref is None else ref)}f}"
+
+    def fd(self, x: float, ref: float | None = None) -> str:
+        """A signed price change in the symbol's precision, with TradingView's real minus sign: '−8.5' / '+7.9' for
+        RELIANCE, '−117.63' for NIFTY."""
+        return f"{x:+,.{self.decimals(ref)}f}".replace("-", "−")
 
     def apply_settings_to_plot(self, pl):
         S = settings.get()
@@ -1905,6 +2052,13 @@ class ChartWidget(QtWidgets.QWidget):
         self._times = df.index.to_numpy().astype("datetime64[s]").astype("int64").astype(float)
 
         self._base = float(df["Close"].iloc[0])
+        self._auto_dec = price_decimals(df)                  # the symbol's tick size, TradingView's precision
+        try:
+            from .symbols import variable_tick
+            self._var_tick = variable_tick(self.ticker()) and not self._option()
+        except Exception:  # noqa: BLE001
+            self._var_tick = False
+        self._tb_last = None                                 # (Buy / Sell prices are re-written in that precision)
         self._fit_axis_width(df)
         for pl in self._plots():
             pl.getAxis("right").setStyle(showValues=True)
@@ -2537,6 +2691,34 @@ class ChartWidget(QtWidgets.QWidget):
                 tg.raise_()
 
     def _place_last_tag(self):
+        try:
+            self._place_last_tag_()
+        finally:
+            self._sync_scale_blocks()
+
+    def _sync_scale_blocks(self):
+        """Tell the price scale where the series labels sit, so the numbers under them are not drawn (TradingView)."""
+        ax = self.price.getAxis("right")
+        spans = []
+        try:
+            inv, ok = self.glw.viewportTransform().inverted()
+            if ok:
+                for tg in (self.last_tag, self.cd_tag, self.vol_tag):
+                    if tg.isHidden() or tg.parent() is None:
+                        continue
+                    g = tg.geometry()
+                    a = ax.mapFromScene(inv.map(QtCore.QPointF(0, g.top()))).y()
+                    b = ax.mapFromScene(inv.map(QtCore.QPointF(0, g.top() + g.height()))).y()
+                    spans.append((float(round(min(a, b))), float(round(max(a, b)))))
+        except RuntimeError:                                   # widgets already gone (closing)
+            return
+        spans = tuple(sorted(spans))
+        if spans != ax._blocked:
+            ax._blocked = spans
+            ax.picture = None
+            ax.update()
+
+    def _place_last_tag_(self):
         self._place_vol_tag()
         if self.df is None or self.last_tag.isHidden():
             return
@@ -2570,22 +2752,36 @@ class ChartWidget(QtWidgets.QWidget):
             return
         import datetime as _dt
         last = self.df.index[-1]
-        end = last + _dt.timedelta(seconds=step)
-        now = _dt.datetime.now(tz=end.tzinfo) if getattr(end, "tzinfo", None) else _dt.datetime.now()
-        left = (end - now).total_seconds()
-        if not 0 <= left <= step:
-            self._cd_hide()
-            return
+        close = self._session_close()                       # when today's session ends (None: market closed)
+        if step >= 86400 * 0.9:
+            # a daily bar closes with the session (TradingView: 02:20:43 left at 13:09 IST on NSE), not at midnight
+            ok = close is not None and pd.Timestamp(last).date() == self._exchange_today()
+            left = (close - _dt.datetime.now(_dt.timezone.utc)).total_seconds() if ok else -1.0
+            if not 0 <= left <= 86400:
+                self._cd_hide()
+                return
+        else:
+            end = last + _dt.timedelta(seconds=step)
+            now = _dt.datetime.now(tz=end.tzinfo) if getattr(end, "tzinfo", None) else _dt.datetime.now()
+            left = (end - now).total_seconds()
+            if close is not None:                            # the day's last bar is cut short by the close
+                left = min(left, (close - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+            if not 0 <= left <= step:
+                self._cd_hide()
+                return
         h, rem = divmod(int(left), 3600)
         m, sec = divmod(rem, 60)
-        self.cd_tag.setText(f" {h:d}:{m:02d}:{sec:02d} " if h else f" {m:02d}:{sec:02d} ")
+        self.cd_tag.setText(f" {h:02d}:{m:02d}:{sec:02d} " if h else f" {m:02d}:{sec:02d} ")   # TV: 02:20:43
         self.last_tag.set_joined(not self.last_tag.isHidden())
         self.cd_tag.setVisible(not self.last_tag.isHidden())
         self._place_last_tag()
 
     def _cd_hide(self):
+        was = not self.cd_tag.isHidden()
         self.cd_tag.hide()
         self.last_tag.set_joined(False)
+        if was:
+            self._sync_scale_blocks()
 
     def _mouse_moved(self, pos, refresh: bool = False):
         if self.df is None:
@@ -2706,7 +2902,7 @@ class ChartWidget(QtWidgets.QWidget):
         menu.addAction(icons.get("hline"), f"Draw horizontal line at {fp}",
                        lambda: self.layer.add("hline", [[self.x_to_time(self._n() - 1), float(price)]]))
         menu.addSeparator()
-        menu.addAction(f"Copy price {fp}", lambda: QtWidgets.QApplication.clipboard().setText(f"{price:.2f}"))
+        menu.addAction(f"Copy price {fp}", lambda: QtWidgets.QApplication.clipboard().setText(fp.replace(",", "")))
         menu.exec(QtGui.QCursor.pos())
 
     def set_alert_lines(self, items):
@@ -2795,9 +2991,10 @@ class ChartWidget(QtWidgets.QWidget):
             menu.addAction("Remove\tDel", self.layer.delete_selected)
             menu.addSeparator()
         price = float(self.iy(mp.y()))
-        menu.addAction(f"Copy price {self.fp(price)}", lambda: QtWidgets.QApplication.clipboard().setText(f"{price:.2f}"))
-        menu.addAction(f"Add alert at {price:,.2f}\t{theme.sc('Alt+A')}", lambda: self.alertRequested.emit(float(price)))
-        menu.addAction(f"Add horizontal line at {price:,.2f}",
+        ptxt = self.fp(price)                                 # in the symbol's own precision (TradingView)
+        menu.addAction(f"Copy price {ptxt}", lambda: QtWidgets.QApplication.clipboard().setText(ptxt.replace(",", "")))
+        menu.addAction(f"Add alert at {ptxt}\t{theme.sc('Alt+A')}", lambda: self.alertRequested.emit(float(price)))
+        menu.addAction(f"Add horizontal line at {ptxt}",
                        lambda: self.layer.add("hline", [[self.x_to_time(mp.x()), price]]))
         menu.addSeparator()
         a = menu.addAction("Auto-scale price")
@@ -2941,7 +3138,7 @@ class ChartWidget(QtWidgets.QWidget):
     def _interval_tag(self) -> str:
         sec = float(np.median(np.diff(self.df.index.values[-50:]).astype("timedelta64[s]").astype(float)))
         if sec < 3600:
-            return f"{max(int(round(sec / 60)), 1)}m"
+            return f"{max(int(round(sec / 60)), 1)}"          # TradingView's legend: 'Reliance … · 5 · NSE'
         if sec < 86400 * 0.9:
             return f"{int(round(sec / 3600))}h"
         if sec < 86400 * 3:
@@ -2975,8 +3172,8 @@ class ChartWidget(QtWidgets.QWidget):
             from .dhan_core import option_name
             return option_name(*o)
         try:
-            from .tvui import NAMES
-            return NAMES.get(t.upper(), t)
+            from .tvui import symbol_name
+            return symbol_name(t) or t
         except Exception:  # noqa: BLE001
             return t
 
@@ -3034,7 +3231,7 @@ class ChartWidget(QtWidgets.QWidget):
         rows = [("Date", df.index[i].strftime(fmt), "#dbdbdb"),
                 ("Open", self.fp(o), ccol), ("High", self.fp(h), ccol), ("Low", self.fp(lo), ccol),
                 ("Close", self.fp(c), ccol),
-                ("Change", f"{d:+,.2f} ({(c / prev - 1) * 100 if prev else 0:+.2f}%)", dcol),
+                ("Change", f"{self.fd(d, ref=c)} ({_signed((c / prev - 1) * 100 if prev else 0)}%)", dcol),
                 ("Volume", vs, "#dbdbdb")]
         title = f"{self.ticker()} \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}"
         sections = [(title, rows)]
@@ -3071,6 +3268,22 @@ class ChartWidget(QtWidgets.QWidget):
         from .watchlist import market_state
         return market_state(probe)[0]
 
+    def _session_close(self):
+        """UTC time the charted market's session ends today (None: closed / unknown)."""
+        probe = {"NSE": "X", "BSE": "BSE:X", "CRYPTO": "X-USD"}.get(self.exchange_tag())
+        if probe is None:
+            return None
+        from .watchlist import session_close
+        return session_close(probe)
+
+    def _exchange_today(self):
+        """Today's date where the charted market trades (a daily bar is dated in exchange time)."""
+        import datetime as _dt
+        utc = _dt.datetime.now(_dt.timezone.utc)
+        if self.exchange_tag() == "CRYPTO":
+            return utc.date()
+        return (utc + _dt.timedelta(hours=5, minutes=30)).date()
+
     def _market_dot(self) -> str:
         """TradingView's market-status pill after the title ('Closed' / 'Pre-market'; nothing while open)."""
         pill = status_pill_html(self.market_status(), settings.get().get("bg", "#000000"))
@@ -3100,7 +3313,8 @@ class ChartWidget(QtWidgets.QWidget):
                  f"{self._market_dot()}&nbsp;&nbsp;&nbsp;") if S["sl_title"] else ""
         vals = (f"{v('O', r['Open'])}&nbsp;&nbsp;{v('H', r['High'])}&nbsp;&nbsp;{v('L', r['Low'])}&nbsp;&nbsp;{v('C', r['Close'])}"
                 if S["sl_values"] else "")
-        chgt = f"&nbsp;&nbsp;<span style='color:{col}'>{d:+,.2f} ({chg:+.2f}%)</span>" if S["sl_change"] else ""
+        chgt = (f"&nbsp;&nbsp;<span style='color:{col}'>{self.fd(d, ref=c)} ({_signed(chg)}%)</span>"
+                if S["sl_change"] else "")
         self.header.setText(title + vals + chgt)
         avail = int(self.price.vb.sceneBoundingRect().width()) - 24
         if avail > 50 and self.header.width() > avail:          # narrow pane: drop parts like TradingView

@@ -115,7 +115,7 @@ STYLESHEET = f"""
 QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; }}
 QMainWindow {{ background: {GUTTER}; }}
 QToolBar {{ background: {BG}; border: 0; spacing: 2px; padding: 3px 6px; }}
-QToolBar#topbar {{ border-bottom: 4px solid {GUTTER}; padding: 0px 4px; }}
+QToolBar#topbar {{ border-bottom: 4px solid {GUTTER}; padding: 0px; }}
 QToolBar#leftrail {{ border-right: 4px solid {GUTTER}; padding: 4px 0px; spacing: 0px; }}
 QToolBar#rightrail {{ border-left: 4px solid {GUTTER}; padding: 4px 0px; spacing: 0px; }}
 QToolBar::separator {{ background: {BORDER}; width: 1px; height: 1px; margin: 6px 6px; }}
@@ -123,7 +123,12 @@ QToolButton {{ background: transparent; border: 0; border-radius: 6px; padding: 
 QToolButton:hover {{ background: {HOVER}; }}
 QToolButton:checked {{ background: {HOVER}; color: white; }}
 QToolButton:pressed {{ background: #3a3e4a; }}
-QToolBar#topbar QToolButton {{ font-size: 14px; font-weight: 400; color: #b8b8b8; padding: 5px 5px; border-radius: 4px; }}
+QToolBar#topbar QToolButton {{ font-size: 14px; font-weight: 400; color: #b8b8b8; padding: 0px 5px; border-radius: 4px; }}
+QToolBar#topbar QToolButton[tvkind="both"] {{ padding: 0px 10px 0px 5px; }}
+QToolBar#topbar QToolButton[tvkind="text"] {{ padding: 0px; }}
+QToolBar#topbar QToolButton[tvkind="menu"] {{ padding: 0px 12px; }}
+QToolBar#topbar QToolButton[tvkind="chev"] {{ padding: 0px; }}
+QToolBar#topbar QToolButton::menu-indicator {{ image: none; width: 0px; }}
 QToolBar#topbar {{ spacing: 0px; }}
 QToolBar#topbar QToolButton:hover {{ background: #2e2e2e; color: #dbdbdb; }}
 QToolBar#topbar QToolButton:checked {{ background: #2e2e2e; color: #fff; }}
@@ -146,10 +151,16 @@ QLabel#chartHeader {{ background: transparent; padding: 0; font-size: 12px; }}
 QFrame#stripbar {{ border-top: 4px solid {GUTTER}; }}
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{ background: {BG}; border: 1px solid {BORDER}; border-radius: 6px; padding: 4px 8px; selection-background-color: {ACCENT}; }}
 QLineEdit:focus {{ border-color: {ACCENT}; }}
-QFrame#symbolpill {{ background: #303030; border-radius: 14px; min-height: 28px; max-height: 28px; min-width: 128px; }}
-QFrame#symbolpill QToolButton#symbtn {{ background: transparent; color: #b8b8b8; font-size: 14px; font-weight: 600;
-    padding: 0px 14px 0px 12px; border-radius: 14px; min-height: 28px; max-height: 28px; text-align: left; }}
-QFrame#symbolpill QToolButton#symbtn:hover {{ background: #3a3a3a; color: #dbdbdb; }}
+QFrame#symbolpill {{ background: #303030; border-radius: 14px; min-height: 28px; max-height: 28px; }}
+QFrame#symbolpill QPushButton#symbtn {{ background: transparent; border: 0; color: #b8b8b8; font-size: 14px;
+    font-weight: 600; text-align: left; padding: 0px 0px 0px 12px; margin: 0px; min-height: 28px; max-height: 28px;
+    border-top-left-radius: 14px; border-bottom-left-radius: 14px; border-top-right-radius: 0px;
+    border-bottom-right-radius: 0px; }}
+QFrame#symbolpill QPushButton#symbtn:hover {{ background: #3a3a3a; color: #dbdbdb; }}
+QFrame#symbolpill QToolButton#symact {{ background: transparent; border: 0; padding: 0px; margin: 0px;
+    border-radius: 14px; }}
+QFrame#symbolpill QToolButton#symact:hover {{ background: #3a3a3a; }}
+QFrame#symbolpill QToolButton#symact::menu-indicator {{ image: none; width: 0px; }}
 QFrame#symbolpill QLabel {{ background: transparent; }}
 QLineEdit#symbolbox {{ background: transparent; border: 0; border-radius: 0; padding: 5px 14px; font-weight: 700; font-size: 14px; color: white; }}
 QComboBox {{ background: transparent; border: 0; padding: 4px 24px 4px 8px; }}
@@ -168,7 +179,8 @@ QPushButton#pill:hover {{ background: #e0e0e0; }}
 QToolBar#topbar QToolButton#tradepill {{ background: transparent; color: #dbdbdb; font-size: 14px;
     border: 1px solid #4a4a4a; border-radius: 14px; padding: 0px 12px; }}
 QToolBar#topbar QToolButton#tradepill:hover {{ background: #2e2e2e; }}
-QToolBar#topbar QToolButton#tradepill[folded="true"] {{ border: 0; padding: 0px 6px; }}
+QToolBar#topbar QToolButton#tradepill::menu-indicator {{ image: none; width: 0px; }}
+QToolBar#topbar QToolButton#tradepill[folded="true"] {{ border: 0; padding: 0px 14px; }}
 QPushButton#updpill {{ background: #2962ff; color: white; font-weight: 600; border-radius: 16px; padding: 6px 14px; }}
 QPushButton#updpill:hover {{ background: #1e53e5; }}
 QPushButton#updpill:disabled {{ background: #1c2f6b; color: #c9d4ff; }}

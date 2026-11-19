@@ -26,22 +26,42 @@ DARK = ("QDialog{background:#1e1e1e;border:1px solid #2e2e2e;border-radius:10px;
 
 CHIPS = ["All", "Stocks", "Indices", "Options", "Crypto", "US"]
 
+# the names TradingView's legend shows (the exchange's own company names: 'Reliance Industries Limited')
 NAMES = {"NIFTY": "Nifty 50 Index", "BANKNIFTY": "Nifty Bank Index", "SENSEX": "S&P BSE Sensex", "FINNIFTY":
-         "Nifty Financial Services", "RELIANCE": "Reliance Industries Ltd", "TCS": "Tata Consultancy Services Ltd",
-         "HDFCBANK": "HDFC Bank Ltd", "INFY": "Infosys Ltd", "ICICIBANK": "ICICI Bank Ltd", "SBIN": "State Bank of India",
-         "ITC": "ITC Ltd", "LT": "Larsen & Toubro Ltd", "BHARTIARTL": "Bharti Airtel Ltd", "TATAMOTORS": "Tata Motors Ltd", "TMPV": "Tata Motors Passenger Vehicles Ltd",
-         "TMCV": "Tata Motors Ltd (Commercial Vehicles)",
-         "TATASTEEL": "Tata Steel Ltd", "AXISBANK": "Axis Bank Ltd", "KOTAKBANK": "Kotak Mahindra Bank Ltd",
-         "HINDUNILVR": "Hindustan Unilever Ltd", "BAJFINANCE": "Bajaj Finance Ltd", "MARUTI": "Maruti Suzuki India Ltd",
-         "SUNPHARMA": "Sun Pharmaceutical Industries", "WIPRO": "Wipro Ltd", "HCLTECH": "HCL Technologies Ltd",
-         "ADANIENT": "Adani Enterprises Ltd", "ADANIPORTS": "Adani Ports & SEZ Ltd", "ONGC": "Oil & Natural Gas Corp",
-         "NTPC": "NTPC Ltd", "POWERGRID": "Power Grid Corp of India", "COALINDIA": "Coal India Ltd",
-         "ASIANPAINT": "Asian Paints Ltd", "ULTRACEMCO": "UltraTech Cement Ltd", "TITAN": "Titan Company Ltd",
-         "M&M": "Mahindra & Mahindra Ltd", "JSWSTEEL": "JSW Steel Ltd", "TECHM": "Tech Mahindra Ltd",
-         "NESTLEIND": "Nestle India Ltd", "DRREDDY": "Dr. Reddy's Laboratories", "CIPLA": "Cipla Ltd",
-         "EICHERMOT": "Eicher Motors Ltd", "HEROMOTOCO": "Hero MotoCorp Ltd", "BPCL": "Bharat Petroleum Corp",
-         "GRASIM": "Grasim Industries Ltd", "AAPL": "Apple Inc", "MSFT": "Microsoft Corp", "NVDA": "NVIDIA Corp",
-         "TSLA": "Tesla Inc", "BTC-USD": "Bitcoin / US Dollar", "ETH-USD": "Ethereum / US Dollar"}
+         "Nifty Financial Services", "RELIANCE": "Reliance Industries Limited",
+         "TCS": "Tata Consultancy Services Limited", "HDFCBANK": "HDFC Bank Limited", "INFY": "Infosys Limited",
+         "ICICIBANK": "ICICI Bank Limited", "SBIN": "State Bank of India", "ITC": "ITC Limited",
+         "LT": "Larsen & Toubro Limited", "BHARTIARTL": "Bharti Airtel Limited", "TATAMOTORS": "Tata Motors Limited",
+         "TMPV": "Tata Motors Passenger Vehicles Limited", "TMCV": "Tata Motors Limited",
+         "TATASTEEL": "Tata Steel Limited", "AXISBANK": "Axis Bank Limited", "KOTAKBANK": "Kotak Mahindra Bank Limited",
+         "HINDUNILVR": "Hindustan Unilever Limited", "BAJFINANCE": "Bajaj Finance Limited",
+         "MARUTI": "Maruti Suzuki India Limited", "SUNPHARMA": "Sun Pharmaceutical Industries Limited",
+         "WIPRO": "Wipro Limited", "HCLTECH": "HCL Technologies Limited", "ADANIENT": "Adani Enterprises Limited",
+         "ADANIPORTS": "Adani Ports and Special Economic Zone Limited",
+         "ONGC": "Oil & Natural Gas Corporation Limited", "NTPC": "NTPC Limited",
+         "POWERGRID": "Power Grid Corporation of India Limited", "COALINDIA": "Coal India Limited",
+         "ASIANPAINT": "Asian Paints Limited", "ULTRACEMCO": "UltraTech Cement Limited", "TITAN": "Titan Company Limited",
+         "M&M": "Mahindra & Mahindra Limited", "JSWSTEEL": "JSW Steel Limited", "TECHM": "Tech Mahindra Limited",
+         "NESTLEIND": "Nestle India Limited", "DRREDDY": "Dr. Reddy's Laboratories Limited", "CIPLA": "Cipla Limited",
+         "EICHERMOT": "Eicher Motors Limited", "HEROMOTOCO": "Hero MotoCorp Limited",
+         "BPCL": "Bharat Petroleum Corporation Limited", "GRASIM": "Grasim Industries Limited", "AAPL": "Apple Inc.",
+         "MSFT": "Microsoft Corporation", "NVDA": "NVIDIA Corporation", "TSLA": "Tesla, Inc.",
+         "BTC-USD": "Bitcoin / US Dollar", "ETH-USD": "Ethereum / US Dollar"}
+
+
+def symbol_name(sym: str) -> str:
+    """The description TradingView shows for a symbol: ChartLab's own list first, then every NSE stock's name."""
+    s = (sym or "").strip()
+    tick = s.split(":")[-1].upper()
+    if tick in NAMES or s.upper() in NAMES:
+        return NAMES.get(tick, NAMES.get(s.upper(), ""))
+    if ":" in s and not s.upper().startswith("NSE:"):
+        return ""
+    try:
+        from .symbols import name_of
+        return name_of(tick)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _opt(sym: str):
@@ -135,7 +155,7 @@ class _SearchDelegate(QtWidgets.QStyledItemDelegate):
             from .dhan_core import option_name
             desc = option_name(*opt)
         else:
-            desc = NAMES.get(tick, NAMES.get(sym, tick))
+            desc = symbol_name(sym) or tick
         fm = p.fontMetrics()
         dy = r.y() + 32 + fm.ascent()
         p.drawText(r.x() + 66, dy, desc)
@@ -171,6 +191,12 @@ class SymbolSearch(QtWidgets.QDialog):
         self.setStyleSheet(DARK)
         self.resize(760, 600)
         self.symbols, self.chosen, self.kind = list(dict.fromkeys(symbols)), None, "All"
+        try:                                                 # every NSE stock, found as you type (TradingView)
+            from .symbols import nse_symbols
+            known = set(s.upper() for s in self.symbols)
+            self.universe = [s for s in nse_symbols() if s not in known]
+        except Exception:  # noqa: BLE001
+            self.universe = []
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(14, 14, 14, 10)
         lay.setSpacing(10)
@@ -238,11 +264,11 @@ class SymbolSearch(QtWidgets.QDialog):
         t = self.edit.text().strip().upper()
         self.lst.clear()
         scored = []
-        for s in self.symbols:
+        pool = self.symbols + (getattr(self, "universe", []) if t else [])   # all NSE stocks once you type
+        for k, s in enumerate(pool):
             if self.kind != "All" and _kind(s) != self.kind:
                 continue
             tick = s.split(":")[-1].upper()
-            name = NAMES.get(tick, "").upper()
             if not t:
                 score = 3
             elif tick == t or s.upper() == t:
@@ -251,12 +277,14 @@ class SymbolSearch(QtWidgets.QDialog):
                 score = 1
             elif t in tick or t in s.upper():
                 score = 2
-            elif t in name:
+            elif len(t) >= 3 and t in symbol_name(s).upper():   # 'BHARAT' finds BEL, BPCL, BHEL ...
                 score = 3
             else:
                 continue
-            scored.append((score, ":" in s, len(tick), s))       # NSE before BSE:/US: on ties
+            listed = 0 if k < len(self.symbols) else 1           # the watchlist / usual names before the rest
+            scored.append((score, listed, ":" in s, len(tick), s))   # NSE before BSE:/US: on ties
         scored.sort()
+        scored = scored[:120]
         opts = self._options(t)
         if self.kind == "Options":
             scored = []
