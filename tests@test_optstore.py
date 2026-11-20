@@ -98,4 +98,85 @@ res = optstore.run(acct, base, ["NIFTY"], width=10, n_exp=2, post=lambda b: (_ f
 assert len(res["errors"]) == 8, len(res["errors"])
 # an unwritable chosen folder falls back to the default one
 assert optstore.root("/proc/nope/x") == optstore.default_root()
+
+# ---- every strike / every expiry on request, the most useful contracts first
+full = optstore.plan(["NIFTY"], {"NIFTY": 25510.0}, width=0, n_exp=0, today=today)
+assert len(full) == 3 * 61 * 2, len(full)
+assert str(full[0]["expiry"]) == "2026-11-24" and full[0]["strike"] == 25500.0 and full[1]["strike"] == 25500.0
+assert {str(c["expiry"]) for c in full[:122]} == {"2026-11-24"} and str(full[-1]["expiry"]) == "2026-12-08"
+dist = [abs(c["strike"] - 25500.0) for c in full[:122]]
+assert dist == sorted(dist)                                   # from the money outwards
+
+# ---- what is stored says what it is: a script picks contracts by expiry / strike / kind
+rows = optstore.contracts(base, "NIFTY", "2026-11-24", "CE")
+assert rows and all(r["und"] == "NIFTY" and r["kind"] == "CE" and r["expiry"] == "2026-11-24" for r in rows)
+assert any(r["symbol"] == "NIFTY261124C25500" and r["strike"] == 25500.0 and r["rows"] > 0 for r in rows)
+assert [r for r in optstore.contracts(base, "NIFTY") if r.get("spot")][0]["symbol"] == "NIFTY"
+assert optstore.describe("SENSEX261126P82000") == {"und": "SENSEX", "expiry": "2026-11-26", "strike": 82000.0, "kind": "PE"}
+
+# ---- several accounts share the work; one whose login is gone hands its contracts to the others
+base2 = Path("/tmp/chartlab_test_opt/archive2")
+shutil.rmtree(base2, ignore_errors=True)
+now[0] = dt.datetime(2026, 11, 19, 15, 30)
+by = {"A": 0, "B": 0, "C": 0}
+
+
+def post_as(name):
+    def go(body):
+        by[name] += 1
+        if name == "C":
+            raise RuntimeError("HTTP 401 DH-901 token expired")
+        return post(body)
+    return go
+
+
+real_fetch = optstore.fetch_minutes
+optstore.fetch_minutes = lambda a, sid, seg, inst, start, end, post=None: real_fetch(
+    a, sid, seg, inst, start, end, post_as(a["name"]))
+three = [{"name": n, "access_token": "T", "client_id": n} for n in "ABC"]
+res = optstore.run(three, base2, ["NIFTY"], width=10, n_exp=2, spot={"NIFTY": 25510.0}, today=today, pause=0,
+                   stamp="2026-11-19")
+assert res["accounts"] == 3 and res["contracts"] == 84 and res["updated"] == 85 and not res["errors"], res
+assert by["A"] > 20 and by["B"] > 20 and 1 <= by["C"] <= 3, by      # the dead one stopped after a few tries
+idx2 = optstore.load_index(base2)
+assert len(idx2) == 85 and all(e.get("stamp") == "2026-11-19" for e in idx2.values())
+e = idx2["NIFTY261124C25500"]
+assert e["und"] == "NIFTY" and e["expiry"] == "2026-11-24" and e["strike"] == 25500.0 and e["kind"] == "CE" and e["lot"] == 75
+# the same pass again (it was cut short, the app was opened again): nothing is asked for twice
+by.update(A=0, B=0, C=0)
+res = optstore.run(three[:2], base2, ["NIFTY"], width=10, n_exp=2, spot={"NIFTY": 25510.0}, today=today, pause=0,
+                   stamp="2026-11-19")
+assert res["skipped"] == 85 and by == {"A": 0, "B": 0, "C": 0} and res["updated"] == 0, (res, by)
+# after the close it is a new pass: everything is brought up to date again
+res = optstore.run(three[:2], base2, ["NIFTY"], width=10, n_exp=2, spot={"NIFTY": 25510.0}, today=today, pause=0,
+                   stamp="2026-11-19-close")
+assert res["skipped"] == 0 and by["A"] + by["B"] == 85, (res, by)
+# every account dead: the errors are reported, nothing hangs
+res = optstore.run([three[2]], base2, ["NIFTY"], width=10, n_exp=2, spot={"NIFTY": 25510.0}, today=today, pause=0)
+assert res["updated"] == 0 and 1 <= len(res["errors"]) <= 8, res
+
+# ---- "too many requests": wait a moment and ask once more instead of losing the contract
+hits = {"n": 0}
+
+
+def busy_once(a, sid, seg, inst, start, end, post=None):
+    hits["n"] += 1
+    if hits["n"] == 1:
+        raise RuntimeError("HTTP 429 DH-904 Rate limit")
+    return real_fetch(a, sid, seg, inst, start, end, post_as("A"))
+
+
+optstore.fetch_minutes = busy_once
+naps = []
+real_sleep = optstore.time.sleep
+optstore.time.sleep = lambda s: naps.append(s)
+try:
+    base3 = Path("/tmp/chartlab_test_opt/archive3")
+    shutil.rmtree(base3, ignore_errors=True)
+    res = optstore.run(three[0], base3, ["NIFTY"], width=0, n_exp=1, spot={"NIFTY": 25510.0},
+                       today=today, pause=0)
+finally:
+    optstore.time.sleep = real_sleep
+    optstore.fetch_minutes = real_fetch
+assert not res["errors"] and res["contracts"] == 122 and res["updated"] == 123 and 1.6 in naps, (res["errors"][:2], naps[:3])
 print("OPTSTORE OK")

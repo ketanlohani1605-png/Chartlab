@@ -71,6 +71,44 @@ platform.machine = lambda: "arm64"
 info = updater.check("0.32.0")
 assert info and info["version"] == "9.9.9" and info["name"].endswith("mac-m1.zip") and info["digest"] == digest
 assert updater.check("9.9.9") is None and updater.check("10.0") is None
+# the code repository can be private: the app then updates from the public builds-only repository
+asked = []
+
+
+class Missing(FakeResp):
+    status_code = 404
+
+
+def two(u, **k):
+    asked.append(u)
+    if updater.REPO in u:
+        return Missing({})                                    # private: GitHub says "not found"
+    if updater.RELEASES in u:
+        return FakeResp(release)
+    return real_get(u, **k)
+
+
+requests.get = two
+info = updater.check("0.32.0")
+assert info and info["version"] == "9.9.9" and info["repo"] == updater.RELEASES and len(asked) == 2, (info, asked)
+assert updater.RELEASES in updater.why_not() or sys.platform != "win32"
+older = dict(release, tag_name="v9.9.8")
+requests.get = lambda u, **k: FakeResp(older if updater.RELEASES in u else release) if "api.github.com" in u else real_get(u, **k)
+assert updater.check("0.32.0")["repo"] == updater.REPO        # the newest build of either one wins
+requests.get = lambda u, **k: Missing({}) if "api.github.com" in u else real_get(u, **k)
+assert updater.check("0.32.0") is None                        # neither has a release: nothing to do, no error
+
+
+def down(u, **k):
+    raise ConnectionError("no internet")
+
+
+requests.get = down
+try:
+    updater.check("0.32.0")
+    raise SystemExit("no internet was reported as 'up to date'")
+except ConnectionError:
+    pass
 requests.get = real_get
 
 # ---- download(): size + SHA-256 must match, a wrong file is thrown away

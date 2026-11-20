@@ -17,8 +17,12 @@ from pathlib import Path
 
 from . import __version__
 
-REPO = "ketanlohani1605-png/Chartlab"
+REPO = "ketanlohani1605-png/Chartlab"                  # where the code lives and is built
+RELEASES = "ketanlohani1605-png/ChartLab-app"          # a public repository with nothing in it but the builds
+SOURCES = (RELEASES, REPO)                              # both are asked; the newest build of either one wins.
+# (So the code repository can be made private: the app then simply stops seeing it and updates from RELEASES.)
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
+_found = {"repo": REPO}                                 # where the last check found a build
 UPDATES = Path.home() / "ChartLab" / "updates"
 PENDING = "pending.json"                 # written just before the swap, read by the app that starts afterwards
 FAILED = "swap_failed.txt"               # the helper writes macOS's reason here when it could not swap
@@ -47,8 +51,8 @@ def why_not() -> str:
     b = app_bundle()
     if b is None:
         if sys.platform == "win32" and getattr(sys, "frozen", False):
-            return (f"On Windows: download ChartLab-<version>-windows.zip from github.com/{REPO}/releases, unzip it "
-                    "and run ChartLab.exe (your charts and settings stay).")
+            return (f"On Windows: download ChartLab-<version>-windows.zip from github.com/{_found['repo']}/releases, "
+                    "unzip it and run ChartLab.exe (your charts and settings stay).")
         return "Updates work in the Mac app (this copy runs from source code)."
     if "/AppTranslocation/" in str(b):
         return ("macOS is running ChartLab from a temporary place. Move ChartLab into the Applications folder, "
@@ -58,26 +62,49 @@ def why_not() -> str:
     return ""
 
 
-def check(current: str = __version__, timeout: float = 12.0) -> dict | None:
-    """-> {"version", "url", "size", "name"} when a newer build is published for this Mac, else None."""
+def _latest(repo: str, timeout: float):
+    """The newest release of one repository, or None when it has none / does not exist / cannot be seen."""
     import requests
-    r = requests.get(API, timeout=timeout, headers={"Accept": "application/vnd.github+json"})
-    r.raise_for_status()
-    rel = r.json()
-    ver = str(rel.get("tag_name", "")).lstrip("vV")
-    if not ver or parse(ver) <= parse(current):
+    r = requests.get(f"https://api.github.com/repos/{repo}/releases/latest", timeout=timeout,
+                     headers={"Accept": "application/vnd.github+json"})
+    if getattr(r, "status_code", 200) == 404:
         return None
+    r.raise_for_status()
+    return r.json()
+
+
+def check(current: str = __version__, timeout: float = 12.0) -> dict | None:
+    """-> {"version", "url", "size", "name"} when a newer build is published for this computer, else None."""
     if sys.platform == "win32":
         want = "windows"
     elif platform.machine().lower() in ("arm64", "aarch64"):
         want = "mac-m1"
     else:                                 # Intel Macs: there has been no Intel build since 0.34.2
         want = "mac-intel"
-    for a in rel.get("assets", []):
-        if want in a.get("name", "") and a.get("name", "").endswith(".zip"):
-            return {"version": ver, "url": a["browser_download_url"], "size": int(a.get("size", 0)), "name": a["name"],
-                    "digest": str(a.get("digest") or ""), "notes": str(rel.get("body") or "")}
-    return None
+    best, errors, answered = None, [], 0
+    for repo in SOURCES:
+        try:
+            rel = _latest(repo, timeout)
+        except Exception as e:  # noqa: BLE001 - the other repository may still answer
+            errors.append(e)
+            continue
+        if rel is None:
+            continue
+        answered += 1
+        ver = str(rel.get("tag_name", "")).lstrip("vV")
+        if not ver or parse(ver) <= parse(current) or (best is not None and parse(ver) <= parse(best["version"])):
+            continue
+        for a in rel.get("assets", []):
+            if want in a.get("name", "") and a.get("name", "").endswith(".zip"):
+                best = {"version": ver, "url": a["browser_download_url"], "size": int(a.get("size", 0)),
+                        "name": a["name"], "digest": str(a.get("digest") or ""), "notes": str(rel.get("body") or ""),
+                        "repo": repo}
+                break
+    if best is None and not answered and errors:
+        raise errors[-1]                  # nobody could be asked (no internet): say so instead of "up to date"
+    if best is not None:
+        _found["repo"] = best["repo"]
+    return best
 
 
 def download(info: dict, progress=None, cancelled=lambda: False) -> Path:

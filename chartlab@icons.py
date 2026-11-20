@@ -526,7 +526,26 @@ def order_add(p, r, c):
     p.drawLine(QtCore.QPointF(9.5, 12), QtCore.QPointF(14.5, 12))
 
 
+def cloud(p, r, c):
+    """The data store: a cloud."""
+    path = QtGui.QPainterPath()
+    path.setFillRule(QtCore.Qt.FillRule.WindingFill)
+    path.addEllipse(QtCore.QPointF(8.0, 14.5), 3.5, 3.5)
+    path.addEllipse(QtCore.QPointF(12.5, 10.8), 4.6, 4.6)
+    path.addEllipse(QtCore.QPointF(16.6, 14.8), 3.2, 3.2)
+    path.addRect(QtCore.QRectF(8.0, 14.0, 8.6, 4.0))
+    p.drawPath(path.simplified())
+
+
+def update_icon(p, r, c):
+    """Updates: an arrow coming down into a tray."""
+    p.drawLine(QtCore.QPointF(12, 4.5), QtCore.QPointF(12, 14.5))
+    p.drawPolyline([QtCore.QPointF(8, 10.5), QtCore.QPointF(12, 14.5), QtCore.QPointF(16, 10.5)])
+    p.drawPolyline([QtCore.QPointF(5, 16), QtCore.QPointF(5, 19.5), QtCore.QPointF(19, 19.5), QtCore.QPointF(19, 16)])
+
+
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
+    "cloud", "update_icon",
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "layout_2h", "layout_2v", "layout_4", "fx", "play",
     "latest",

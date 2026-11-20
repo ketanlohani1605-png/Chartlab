@@ -4,6 +4,8 @@ from __future__ import annotations
 import copy
 import json
 
+from pathlib import Path
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
@@ -69,6 +71,11 @@ def sync_theme():
     theme.UP, theme.DOWN = _cur["up"], _cur["down"]
 
 
+def _default_store() -> Path:
+    from . import optstore
+    return optstore.default_root()
+
+
 def datamod_dir() -> str:
     from . import data as datamod
     return str(datamod.DATA_DIR / "downloads")
@@ -123,6 +130,7 @@ class SettingsDialog(QtWidgets.QDialog):
             "QComboBox QAbstractItemView{background:#1e1e1e;border:1px solid #2e2e2e;selection-background-color:#2e2e2e;} "
             "QPushButton{background:transparent;border:1px solid #6a6d78;border-radius:8px;padding:7px 18px;color:#dbdbdb;"
             "font-size:14px;} QPushButton:hover{background:#2e2e2e;} "
+            "QPushButton[here=\"true\"]{background:#2e2e2e;border-color:#dbdbdb;color:#ffffff;} "
             "QPushButton#ok{background:#ffffff;color:#000;font-weight:600;border-color:#ffffff;} "
             "QPushButton#ok:hover{background:#e0e0e0;} QFrame#footline{background:#2e2e2e;}" % theme.check_icon_path())
         root = QtWidgets.QVBoxLayout(self)
@@ -136,7 +144,7 @@ class SettingsDialog(QtWidgets.QDialog):
         from . import icons
         for name, ico, builder in (("Symbol", "candles_icon", self._symbol), ("Status line", "menu", self._status),
                                    ("Scales and lines", "measure", self._scales), ("Canvas", "rect", self._canvas),
-                                   ("Updates", "gear", self._updates), ("Data", "candles_icon", self._data)):
+                                   ("Updates", "update_icon", self._updates), ("Data", "cloud", self._data)):
             self.tabs.addItem(QtWidgets.QListWidgetItem(icons.get(ico, "#dbdbdb"), "  " + name))
             page = QtWidgets.QWidget()
             lay = QtWidgets.QVBoxLayout(page)
@@ -146,6 +154,7 @@ class SettingsDialog(QtWidgets.QDialog):
             lay.addStretch(1)
             sc = QtWidgets.QScrollArea()
             sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # pages fit the width
             sc.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
             sc.setWidget(page)
             self.stack.addWidget(sc)
@@ -347,14 +356,14 @@ class SettingsDialog(QtWidgets.QDialog):
     DATA_TAB = 5
 
     def _data(self, lay):
-        """What ChartLab does by itself once a broker account is connected: fresh logins, daily data, the option
-        archive. (App settings: saved at once, not part of the chart template.)"""
+        """What ChartLab does by itself: fresh broker logins, and the data store - where it lives (a cloud drive
+        when there is one) and what goes into it. (App settings: saved at once, not part of the chart template.)"""
         win = self.parent()
         qs = getattr(win, "settings", None)
         if qs is None or not hasattr(win, "option_archive_settings"):
             lay.addWidget(QtWidgets.QLabel("Open Settings from the main window to change these."))
             return
-        from . import optstore
+        from . import optstore, store
 
         def flag(key, default, text, after=None):
             c = QtWidgets.QCheckBox(text)
@@ -373,76 +382,188 @@ class SettingsDialog(QtWidgets.QDialog):
             n.setWordWrap(True)
             n.setStyleSheet("color:#787b86;font-size:12px;")
             lay.addWidget(n)
+            return n
 
+        cfg = win.option_archive_settings()
+        # ---- where the data lives
+        self._head(lay, "Data store")
+        self.d_where = QtWidgets.QLabel("")
+        self.d_where.setWordWrap(True)
+        lay.addWidget(self.d_where)
+        self.d_folder = QtWidgets.QLabel(cfg["folder"], self)      # (the plain path: for "Choose folder" and tests)
+        self.d_folder.hide()
+        self.d_size = small("")
+        r = QtWidgets.QHBoxLayout()
+        r.setSpacing(8)
+        self.d_cloud_btns = {}
+        for name, base in store.cloud_folders():
+            b = QtWidgets.QPushButton(name)
+            b.setToolTip(f"Keep the data in {name} \u203a ChartLab: {name} copies it to the cloud by itself")
+            b.clicked.connect(lambda _=False, t=store.cloud_target(base): self._set_data_folder(str(t)))
+            r.addWidget(b)
+            self.d_cloud_btns[name] = b
+        self.d_local = QtWidgets.QPushButton("This computer")
+        self.d_local.setToolTip("Keep the data only on this computer (~/ChartLab)")
+        self.d_local.clicked.connect(lambda: self._set_data_folder(""))
+        choose = QtWidgets.QPushButton("Choose folder\u2026")
+        choose.clicked.connect(lambda: self._set_data_folder(QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Folder for the data store", str(Path(self.d_folder.text()).parent)), ask=True))
+        show = QtWidgets.QPushButton("Show folder")
+        show.setToolTip("Open the folder the data is in")
+        show.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(str(Path(win.option_archive_settings()["folder"]).parent))))
+        r.addWidget(self.d_local)
+        r.addStretch(1)
+        lay.addLayout(r)
+        r1 = QtWidgets.QHBoxLayout()                          # (a second row: the page never gets wider than it is)
+        r1.setSpacing(8)
+        for b in (choose, show):
+            r1.addWidget(b)
+        r1.addStretch(1)
+        lay.addLayout(r1)
+        if not self.d_cloud_btns:
+            small("No cloud drive was found on this computer. Turn on iCloud Drive (System Settings \u203a your name "
+                  "\u203a iCloud \u203a iCloud Drive) or install Google Drive for desktop: the next time ChartLab "
+                  "starts it finds the drive and moves the data there by itself.")
+        # ---- logins
         self._head(lay, "Broker login")
         self.d_renew = flag("auto_renew", "true", "Keep broker logins fresh automatically", win.set_auto_renew)
-        small("Dhan: the token is renewed before its 24 hours end; with PIN + TOTP key saved in the account, ChartLab "
-              "also logs in again by itself after it has ended. Angel One and Fyers the same way. Zerodha and Upstox "
-              "want a login in the browser every morning (their rule).")
-        self._head(lay, "Daily data")
-        self.d_daily = flag("daily_download", "true", "Save daily candles of the whole watchlist every day",
+        small("Dhan tokens are renewed before their 24 hours end; with PIN + TOTP key saved in the account, ChartLab "
+              "also logs in again by itself. Angel One and Fyers the same way; Zerodha and Upstox want a browser "
+              "login every morning (their rule). Chart data comes from every logged-in account in turn: when one "
+              "stops answering, the next one takes over.")
+        # ---- chart data
+        self._head(lay, "Chart data")
+        self.d_daily = flag("daily_download", "true", "Save the whole watchlist every day (daily and 1-minute bars)",
                             lambda on: win._daily_download() if on else None)
-        small(f"Kept in {datamod_dir()} and used first by source Auto.")
+        self.d_daily_last = small("")
+        small("Every chart you open is kept too, so intraday history keeps growing instead of ending at the "
+              "source's last few days. In a script: chartlab.history('RELIANCE', '5m').")
+        # ---- options
         self._head(lay, "Option archive")
-        self.d_opt = flag("opt_archive", "true", "Save every day the 1-minute history of the options around the money")
-        cfg = win.option_archive_settings()
+        self.d_opt = flag("opt_archive", "true", "Save every day the 1-minute history of options, with open interest")
         self.d_unds = QtWidgets.QLineEdit(", ".join(cfg["underlyings"]))
         self.d_unds.setStyleSheet("QLineEdit{background:#1e1e1e;border:1px solid #4a4a4a;border-radius:6px;"
                                   "padding:5px 10px;color:#dbdbdb;font-size:14px;}")
-        self.d_unds.setMinimumWidth(260)
+        self.d_unds.setMinimumWidth(240)
+        self.d_unds.setCursorPosition(0)                      # (show the start of the list, not its end)
+        self.d_unds.setToolTip("Index names whose options are saved, separated by commas")
         self.d_unds.editingFinished.connect(lambda: qs.setValue("opt_underlyings", self.d_unds.text().upper()))
-        self._row(lay, "Names", [self.d_unds])
+        rn = QtWidgets.QHBoxLayout()
+        rn.setSpacing(8)
+        ln = QtWidgets.QLabel("Names")
+        ln.setFixedWidth(190)
+        rn.addWidget(ln)
+        rn.addWidget(self.d_unds, 1)                          # as wide as the page allows
+        lay.addLayout(rn)
+        self.d_stocks = flag("opt_stocks", "true", "Also every stock of my watchlist that has options")
         self.d_width = QtWidgets.QSpinBox()
+        self.d_width.setFixedWidth(72)
         self.d_width.setRange(1, 60)
         self.d_width.setValue(cfg["width"])
         self.d_width.valueChanged.connect(lambda v: qs.setValue("opt_width", int(v)))
-        self._row(lay, "Strikes each side", [self.d_width])
+        self.d_all_strikes = QtWidgets.QCheckBox("All strikes")
+        self.d_all_strikes.setToolTip("Every strike of every followed expiry: thousands of contracts, "
+                                      "the first pass takes a while")
+        self.d_all_strikes.setChecked(cfg["all_strikes"])
+        self.d_all_strikes.toggled.connect(lambda on: (qs.setValue("opt_all_strikes", "true" if on else "false"),
+                                                       self.d_width.setEnabled(not on)))
+        self.d_width.setEnabled(not cfg["all_strikes"])
+        self._row(lay, "Strikes each side", [self.d_width, self.d_all_strikes])
         self.d_exp = QtWidgets.QSpinBox()
+        self.d_exp.setFixedWidth(72)
         self.d_exp.setRange(1, 6)
         self.d_exp.setValue(cfg["expiries"])
         self.d_exp.valueChanged.connect(lambda v: qs.setValue("opt_expiries", int(v)))
-        self._row(lay, "Nearest expiries", [self.d_exp])
-        self.d_folder = QtWidgets.QLabel(cfg["folder"])
-        self.d_folder.setWordWrap(True)
-        self.d_folder.setStyleSheet("color:#9598a1;font-size:12px;")
-        choose = QtWidgets.QPushButton("Choose folder\u2026")
-        cloud = QtWidgets.QPushButton("Use iCloud Drive")
-        cloud.setVisible(optstore.icloud_dir() is not None)
+        self.d_all_exp = QtWidgets.QCheckBox("All listed expiries")
+        self.d_all_exp.setToolTip("Every weekly, monthly and quarterly expiry the exchange lists")
+        self.d_all_exp.setChecked(cfg["all_expiries"])
+        self.d_all_exp.toggled.connect(lambda on: (qs.setValue("opt_all_expiries", "true" if on else "false"),
+                                                   self.d_exp.setEnabled(not on)))
+        self.d_exp.setEnabled(not cfg["all_expiries"])
+        self._row(lay, "Nearest expiries", [self.d_exp, self.d_all_exp])
         now = QtWidgets.QPushButton("Save now")
-        r = QtWidgets.QHBoxLayout()
-        for b in (choose, cloud, now):
-            r.addWidget(b)
-        r.addStretch(1)
-        lay.addLayout(r)
-        lay.addWidget(self.d_folder)
-        self.d_last = QtWidgets.QLabel("")
-        self.d_last.setWordWrap(True)
-        self.d_last.setStyleSheet("color:#9598a1;font-size:12px;")
-        lay.addWidget(self.d_last)
-        small("One file per contract, from its listing day to its expiry, with open interest; files of expired "
-              "contracts stay. A folder inside iCloud Drive, Google Drive or Dropbox is copied to the cloud by that "
-              "service. Needs a connected Dhan account; in a script: chartlab.option_data('NIFTY261124C25000').")
-
-        def set_folder(path):
-            if not path:
-                return
-            qs.setValue("opt_folder", str(path))
-            self.d_folder.setText(win.option_archive_settings()["folder"])
-
-        choose.clicked.connect(lambda: set_folder(QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Folder for the option archive", self.d_folder.text())))
-        cloud.clicked.connect(lambda: set_folder(optstore.icloud_dir() / "ChartLab" / "options"))
-        now.clicked.connect(lambda: win._options_archive(force=True))
+        now.clicked.connect(lambda: (win._options_archive(force=True), win._daily_download(force=True)))
+        r2 = QtWidgets.QHBoxLayout()
+        r2.addWidget(now)
+        r2.addStretch(1)
+        lay.addLayout(r2)
+        self.d_last = small("")
+        small("Weekly and monthly expiries alike. One file per contract, from its listing day to its expiry; expired "
+              "contracts stay and still open as charts. Several Dhan accounts share the work. Needs a connected "
+              "Dhan account. In a script: chartlab.contracts('NIFTY').")
         self._data_timer = QtCore.QTimer(self)
         self._data_timer.timeout.connect(self._data_tick)
         self._data_timer.start(500)
+        self._size_at = 0.0
+        self._data_tick()
+
+    def _set_data_folder(self, path, ask: bool = False):
+        win = self.parent()
+        if ask and not path:
+            return                                           # the folder dialog was cancelled
+        if path and ask:
+            path = str(Path(path) / "options") if Path(path).name.lower() != "options" else path
+        win.set_data_folder(path)
+        self._size_at = 0.0
         self._data_tick()
 
     def _data_tick(self):
+        import time as _t
+        from . import store
         win = self.parent()
+        cfg = win.option_archive_settings()
+        home = Path(cfg["folder"]).parent
+        cloud = cfg.get("cloud") or ""
+        moving = getattr(win, "_store_busy", False)
+        if moving:
+            self.d_where.setText("Moving the data store\u2026")
+        elif cloud:
+            self.d_where.setText(f"In {store.nice_path(home)}  \u2014  {cloud} keeps a copy in the cloud")
+        else:
+            self.d_where.setText(f"On this computer only  ({store.nice_path(home)})")
+        self.d_folder.setText(cfg["folder"])
+        local = not cloud and Path(cfg["folder"]) == _default_store()
+        for name, b in list(self.d_cloud_btns.items()) + [("", self.d_local)]:
+            here = (name == cloud) if name else local
+            b.setEnabled(not moving and not here)
+            if b.property("here") != here:                   # the place the data is in now: shown as the chosen one
+                b.setProperty("here", here)
+                b.style().unpolish(b)
+                b.style().polish(b)
+        if _t.time() - self._size_at > 20 and not getattr(self, "_size_job", None):
+            self._size_at = _t.time()
+            from .panel import LoadWorker
+
+            def job():
+                a, b = store.folder_size(Path(cfg["folder"]))
+                c, d2 = store.folder_size(store.candles_root(cfg["folder"]))
+                return (a + c, b + d2), ""
+            w = self._size_job = LoadWorker(job, self)
+
+            def done(res, _s):
+                self._size_job = None
+                size, files = res
+                self.d_size.setText(f"{store.nice_size(size)} in {files:,} files" if files else "Nothing saved yet.")
+            w.done.connect(done)
+            w.failed.connect(lambda *_: setattr(self, "_size_job", None))
+            w.start()
         busy = getattr(win, "_opt_busy", False)
         last = str(win.settings.value("opt_last", "") or "")
-        self.d_last.setText("Saving now\u2026" if busy else ("Last run: " + last if last else "Not run yet."))
+        if busy:
+            k, n = getattr(win, "_opt_progress", (0, 0))
+            self.d_last.setText(f"Saving now\u2026  {k:,} of {n:,}" if n else "Saving now\u2026")
+        else:
+            self.d_last.setText("Last run: " + last if last else "Not run yet.")
+        dl = str(win.settings.value("daily_last", "") or "")
+        self.d_daily_last.setText("Saving now\u2026" if getattr(win, "_daily_busy", False)
+                                  else ("Last run: " + dl if dl else "Not run yet."))
+
+    def done(self, r):
+        job = getattr(self, "_size_job", None)
+        if job is not None and job.isRunning():
+            job.wait(3000)
+        super().done(r)
 
     def _upd_tick(self):
         win = self.parent()

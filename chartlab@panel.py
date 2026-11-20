@@ -92,25 +92,31 @@ class ChartPanel(QtWidgets.QFrame):
 
     @staticmethod
     def _load_auto(symbol, interval, rng):
+        """Source Auto: your own file, else every logged-in broker account in turn (the healthy ones first, one
+        that just failed last), else Yahoo."""
         from . import accounts
         from .dhan_core import is_option
-        loaders = [(f"API {a['name']}", lambda s, i, r, n=a["name"]: accounts.load_api(n, s, i, r))
-                   for a in accounts.load_accounts() if a.get("broker") == "dhan" and a.get("access_token")]
-        if is_option(symbol):                              # option prices only come from the broker
+        opt = is_option(symbol)                            # option prices only come from a broker
+        loaders = accounts.data_loaders(include_failed=opt)
+        if opt:
             return ChartPanel._load_option(symbol, interval, rng, loaders)
         return datamod.load_auto(symbol, interval, rng, loaders)
 
     @staticmethod
     def _load_option(symbol, interval, rng, loaders):
-        if not loaders:
-            raise RuntimeError("Option charts need a Dhan account: Accounts \u2192 Manage accounts, paste the client id "
-                               "and access token. (Yahoo has no NSE option prices.)")
+        from . import store
         errors = []
         for name, fn in loaders:
             try:
                 return fn(symbol, interval, rng)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{name}: {e}")
+        got = store.option_bars(symbol, interval) if store.active() else None
+        if got is not None:                                # an expired contract (or no broker right now): the archive
+            return got
+        if not loaders:
+            raise RuntimeError("Option charts need a Dhan account: Accounts \u2192 Manage accounts, paste the client id "
+                               "and access token. (Yahoo has no NSE option prices.)")
         raise RuntimeError("  |  ".join(str(x)[:160] for x in errors))
 
     def refresh(self) -> bool:
@@ -128,11 +134,29 @@ class ChartPanel(QtWidgets.QFrame):
     def load(self, source: str, symbol: str, interval: str, rng: str, path: str = "", quiet: bool = False):
         self._prev_params = dict(self.params)
         self.params = {"source": source, "symbol": symbol, "interval": interval, "range": rng, "path": path}
+        from . import store
         from . import timeframes as TF
+        stored = store.active() and source != "file" and not source.startswith("provider:")
+
+        def kept(loader):
+            """The loader, with the data store behind it: what it fetched is kept, and the chart gets the stored
+            older bars in front (a 1-minute chart is not cut to the source's last few days)."""
+            if not stored:
+                return loader
+
+            def run(s, i, r):
+                df, label = loader(s, i, r)
+                if str(label).endswith("my data"):          # your own file is yours: it is shown as it is
+                    return df, label
+                return store.keep(s, i, r, df, label)
+            return run
+
         if source == "file":
             fn = lambda: self._load_local(path, interval)  # noqa: E731
         elif source == "auto" or (source == "yahoo" and self._is_option(symbol)):   # (Yahoo has no NSE options)
-            fn = lambda: TF.load(self._load_auto, symbol, interval, rng)  # noqa: E731
+            fn = lambda: TF.load(kept(self._load_auto), symbol, interval, rng)  # noqa: E731
+        elif source == "yahoo" and stored:
+            fn = lambda: TF.load(kept(datamod.load_yahoo), symbol, interval, rng, TF.YAHOO, TF.YAHOO)  # noqa: E731
         elif source == "yahoo":
             fn = lambda: datamod.load_yahoo(symbol, interval, rng)  # noqa: E731
         elif source.startswith("provider:"):
@@ -141,10 +165,21 @@ class ChartPanel(QtWidgets.QFrame):
         elif source.startswith("api:"):
             from . import accounts
             acct = source.split(":", 1)[1]
-            fn = lambda: TF.load(lambda s, i, r: accounts.load_api(acct, s, i, r), symbol, interval, rng)  # noqa: E731
+            fn = lambda: TF.load(kept(lambda s, i, r: accounts.load_api(acct, s, i, r)), symbol, interval, rng)  # noqa: E731
         else:
             self._fail(f"Unknown data source '{source}'")
             return
+        if stored:
+            fresh = fn
+
+            def fn():                                       # no source answers (offline, login gone): the stored bars
+                try:
+                    return fresh()
+                except Exception:
+                    got = store.saved(symbol, interval, rng)
+                    if got is None:
+                        raise
+                    return got[0], got[1] + " (saved copy)"
         self.loading = True
         self.last_error = ""
         self.load_event.clear()
@@ -156,10 +191,14 @@ class ChartPanel(QtWidgets.QFrame):
         if self._is_option(symbol):
             pass
         elif not quiet and source == "yahoo":
-            early = lambda: datamod.peek_cache(symbol, interval, rng)  # noqa: E731
+            early = lambda: ((store.saved(symbol, interval, rng) if stored else None)  # noqa: E731
+                             or datamod.peek_cache(symbol, interval, rng))
         elif not quiet and source == "auto":
             early = lambda: (None if datamod.find_local(symbol) is not None  # noqa: E731
-                             else datamod.peek_cache(symbol, interval, rng))
+                             else ((store.saved(symbol, interval, rng) if stored else None)
+                                   or datamod.peek_cache(symbol, interval, rng)))
+        elif not quiet and stored and source.startswith("api:"):
+            early = lambda: store.saved(symbol, interval, rng)  # noqa: E731
         self._t0 = time.perf_counter()
         self.load_ms, self.from_cache = None, False
         self._worker = LoadWorker(fn, self, early)
@@ -256,6 +295,8 @@ class ChartPanel(QtWidgets.QFrame):
         except Exception:  # noqa: BLE001
             same = False
         if same or df is None or not len(df) or ch.replay["active"] or ch.layer._drag or ch.layer.pending:
+            if same and label and label != self.label:     # the same bars from somewhere else ("saved copy")
+                self.label = ch.label = label
             self.changed = False
             self.refreshed.emit(self)
             return

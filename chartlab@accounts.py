@@ -434,6 +434,63 @@ def load_api(account: str, symbol: str, interval: str, period: str):
     return datamod.standardise(raw), f"{name} · {interval} · {a['name']}"
 
 
+# ---------------------------------------------------------------------- which account gives the candles
+_DATA_FAIL: dict = {}             # account name -> when a data request on it last failed for the account's own reasons
+DATA_COOLDOWN = 180.0             # ... and for how long charts then go to another account / Yahoo first
+
+
+def _account_trouble(e: Exception) -> bool:
+    """True when the failure is the account's (login gone, no data plan, too many requests, no network), not the
+    symbol's - a symbol this broker does not have says nothing about the next symbol."""
+    m = str(e)
+    return any(k in m for k in ("401", "403", "429", "DH-90", "nvalid", "xpired", "not logged in", "Could not reach",
+                                "timed out", "Rate", "rate limit"))
+
+
+def data_accounts(path: Path | None = None, include_failed: bool = True) -> list[dict]:
+    """The accounts a chart can get candles from, the best first: logged in and not paper; one whose login is known
+    to be gone is left out; one that just failed goes to the back (or is left out: include_failed=False)."""
+    import time as _t
+    now = _t.time()
+    out = []
+    for a in load_accounts(path):
+        b = a.get("broker")
+        if b == "paper":
+            continue
+        try:
+            ok = bool(a.get("access_token")) if b == "dhan" else bool(_brokers.get(a).has_token())
+        except Exception:  # noqa: BLE001
+            ok = False
+        if not ok or (STATUS.get(a["name"]) or {}).get("state") in ("expired", "auth"):
+            continue
+        failed = now - _DATA_FAIL.get(a["name"], 0.0) < DATA_COOLDOWN
+        if failed and not include_failed:
+            continue
+        good = (STATUS.get(a["name"]) or {}).get("state") in ("ok", "expiring")
+        out.append(((1 if failed else 0, 0 if good else 1), a))
+    out.sort(key=lambda x: x[0])                             # (a stable sort: your own order decides between equals)
+    return [a for _k, a in out]
+
+
+def data_loaders(path: Path | None = None, include_failed: bool = True) -> list:
+    """[(label, fn(symbol, interval, range) -> (DataFrame, label)), ...] for the Auto source: every usable account in
+    turn, whatever its broker. The next one is asked when one fails."""
+    import time as _t
+    out = []
+    for a in data_accounts(path, include_failed):
+        def fn(s, i, r, n=a["name"]):
+            try:
+                got = load_api(n, s, i, r)
+            except Exception as e:  # noqa: BLE001
+                if _account_trouble(e):
+                    _DATA_FAIL[n] = _t.time()
+                raise
+            _DATA_FAIL.pop(n, None)
+            return got
+        out.append((f"API {a['name']}", fn))
+    return out
+
+
 # ---------------------------------------------------------------------- UI
 class _AccountCard(QtWidgets.QStyledItemDelegate):
     def sizeHint(self, option, index):

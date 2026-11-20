@@ -2136,10 +2136,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.api.stop()
         self.live.stop()
         self.chain.stop()
-        ow = getattr(self, "_opt_worker", None)
-        if ow is not None and ow.isRunning():                 # the option archive stops between two contracts
-            ow.requestInterruption()
-            ow.wait(4000)
+        for wname in ("_opt_worker", "_daily_worker"):        # the data jobs stop between two contracts / symbols
+            ow = getattr(self, wname, None)
+            if ow is not None and ow.isRunning():
+                ow.requestInterruption()
+                ow.wait(4000)
+        from . import store as _store
+        _store.flush()                                        # bars still waiting to be written to the data store
         super().closeEvent(e)
 
     def _save_watchlist(self):
@@ -2811,22 +2814,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             "Put RELIANCE.csv / NIFTY.parquet here: with source Auto, your own file is used first", 8000)
 
-    def _daily_download(self):
+    def _daily_download(self, force: bool = False):
+        """Once a day, and again after the close: the whole watchlist's daily and 1-minute bars go into the data
+        store (while the store is off - tests - the daily bars go to ~/ChartLab/data/downloads as before)."""
         import datetime as _dt
+        from . import store
+        now = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=5, minutes=30)))
         today = _dt.date.today().isoformat()
-        if (self.settings.value("daily_download", "true") != "true"
-                or self.settings.value("daily_done", "") == today or getattr(self, "_daily_busy", False)):
+        after_close = store.active() and now.weekday() < 5 and now.time() >= _dt.time(15, 35)
+        stamp = today + ("-close" if after_close else "")
+        done_stamp = str(self.settings.value("daily_done", "") or "")
+        if getattr(self, "_daily_busy", False) or getattr(self, "_store_busy", False):
+            return
+        if not force and (self.settings.value("daily_download", "true") != "true"
+                          or done_stamp == stamp or done_stamp == today + "-close"):
             return
         syms = list(self.watchlist.symbols())
         if not syms:
             return
         self._daily_busy = True
         from .panel import ChartPanel, LoadWorker
+        api = bool(acctmod.data_accounts(include_failed=False))
 
         def job():
+            th = QtCore.QThread.currentThread()
+            if store.active():
+                res = store.save_watchlist(syms, ChartPanel._load_auto, stop=th.isInterruptionRequested,
+                                           intraday_range="3mo" if api else "5d")
+                return res, stamp
             ok = 0
             for s in syms:
-                if QtCore.QThread.currentThread().isInterruptionRequested():
+                if th.isInterruptionRequested():
                     break
                 try:
                     df, _lab = ChartPanel._load_auto(s, "1d", "2y")
@@ -2834,22 +2852,112 @@ class MainWindow(QtWidgets.QMainWindow):
                     ok += 1
                 except Exception:  # noqa: BLE001 - one bad symbol must not stop the rest
                     logging.exception("daily download %s", s)
-            return ok, str(len(syms))
+            return {"symbols": len(syms), "saved": ok, "bars": 0, "errors": [], "old": True}, stamp
         w = self._daily_worker = LoadWorker(job, self)
 
-        def done(ok, total):
+        def done(res, st_):
             self._daily_busy = False
+            ok, total = res["saved"], res["symbols"]
             if ok:
-                self.settings.setValue("daily_done", today)
-            self.add_log(f"[daily download] saved {ok} of {total} watchlist symbols to {datamod.DATA_DIR / 'downloads'}")
+                self.settings.setValue("daily_done", st_)
+            if res.get("old"):
+                where = str(datamod.DATA_DIR / "downloads")
+                text = f"saved {ok} of {total} watchlist symbols to {where}"
+            else:
+                where = store.nice_path(store.candles_root(store.STATE["root"])) if store.active() else ""
+                text = (f"{ok} of {total} watchlist symbols, {res['bars']:,} new bars (daily + 1-minute)"
+                        + (f", {len(res['errors'])} could not be read ({res['errors'][0]})" if res["errors"] else "")
+                        + f"  ->  {where}")
+                self.settings.setValue("daily_last", _dt.datetime.now().strftime("%d %b %H:%M") + ": " + text)
+            self.add_log(f"[daily download] {text}")
             self.statusBar().showMessage(f"Daily data saved for {ok} of {total} watchlist symbols", 5000)
         w.done.connect(done)
         w.failed.connect(lambda *_: setattr(self, "_daily_busy", False))
         w.start()
 
+    # ------------------------------------------------------------------ the data store (Settings -> Data)
+    def start_store(self):
+        """Switch the data store on: from now on whatever a chart or the daily jobs download is kept. (The real app
+        calls this; a test that only builds a window leaves no files behind.) When no folder was ever chosen and a
+        cloud drive is on this computer - iCloud Drive, Google Drive, Dropbox, OneDrive - the store moves into it by
+        itself, so the data is in the cloud without a single click."""
+        from . import optstore, store
+        st = self.settings
+        chosen = str(st.value("opt_folder", "") or "")
+        store.enable(optstore.root(chosen))
+        if chosen or st.value("data_autocloud", "true") != "true" or getattr(self, "_store_busy", False):
+            return
+        from .panel import LoadWorker
+        self._store_busy = True
+
+        def job():                                           # (off the main thread: macOS may ask for permission)
+            return store.pick_cloud(), ""
+        w = self._store_worker = LoadWorker(job, self)
+
+        def done(hit, _s):
+            self._store_busy = False
+            if hit is None or str(st.value("opt_folder", "") or ""):
+                QtCore.QTimer.singleShot(1000, self._daily_download)      # (the daily jobs waited for this answer)
+                QtCore.QTimer.singleShot(6000, self._options_archive)
+                return
+            name, target = hit
+            self.set_data_folder(str(target), note=f"{name} keeps a copy of it in the cloud")
+        w.done.connect(done)
+        w.failed.connect(lambda *_: setattr(self, "_store_busy", False))
+        w.start()
+
+    def set_data_folder(self, path: str, note: str = ""):
+        """Move the data store to another folder ('' = this computer, ~/ChartLab): the files already saved go along,
+        in the background."""
+        from . import optstore, store
+        if getattr(self, "_store_busy", False) or getattr(self, "_opt_busy", False) or getattr(self, "_daily_busy", False):
+            self.statusBar().showMessage("The data store is busy right now - try again in a minute", 6000)
+            return False
+        old = Path(self.option_archive_settings()["folder"])
+        new = optstore.root(path) if path else optstore.default_root()
+        if path and new.resolve() != Path(path).expanduser().resolve():
+            self.statusBar().showMessage(f"ChartLab cannot write to {path} - the data store stays where it is", 8000)
+            return False
+        self.settings.setValue("opt_folder", str(new) if path else "")
+        if not path:
+            self.settings.setValue("data_autocloud", "false")      # "This computer" was chosen: stay there
+        if old.resolve() == new.resolve():
+            store.enable(new) if store.active() else None
+            return True
+        from .panel import LoadWorker
+        self._store_busy = True
+        was_on = store.active()
+        store.flush()
+
+        def job():
+            n = store.move_into(old, new) + store.move_into(store.candles_root(old), store.candles_root(new))
+            return n, ""
+        w = self._store_worker = LoadWorker(job, self)
+
+        def done(n, _s):
+            self._store_busy = False
+            if was_on:
+                store.enable(new)
+            text = (f"the data store is now in {store.nice_path(new.parent)}"
+                    + (f" ({note})" if note else "") + (f"; {n:,} saved files moved there" if n else ""))
+            self.add_log(f"[data] {text}")
+            self.statusBar().showMessage(text[0].upper() + text[1:], 8000)
+            QtCore.QTimer.singleShot(3000, self._daily_download)
+            QtCore.QTimer.singleShot(8000, self._options_archive)
+
+        def failed(msg):
+            self._store_busy = False
+            if was_on:
+                store.enable(new)
+            self.add_log(f"[data] moving the data store failed: {msg}")
+        w.done.connect(done)
+        w.failed.connect(failed)
+        w.start()
+        return True
+
     # ------------------------------------------------------------------ the option archive (Settings -> Data)
     def option_archive_settings(self) -> dict:
-        from . import optstore
+        from . import optstore, store
         st = self.settings
         unds = [u.strip().upper() for u in str(st.value("opt_underlyings", ",".join(optstore.DEFAULT_UNDERLYINGS))).split(",")
                 if u.strip()]
@@ -2858,17 +2966,38 @@ class MainWindow(QtWidgets.QMainWindow):
             n_exp = max(1, min(6, int(st.value("opt_expiries", optstore.DEFAULT_EXPIRIES))))
         except (TypeError, ValueError):
             width, n_exp = optstore.DEFAULT_WIDTH, optstore.DEFAULT_EXPIRIES
+        folder = optstore.root(str(st.value("opt_folder", "") or ""))
         return {"on": st.value("opt_archive", "true") == "true", "underlyings": unds, "width": width, "expiries": n_exp,
-                "folder": str(optstore.root(str(st.value("opt_folder", "") or ""))),
+                "all_strikes": st.value("opt_all_strikes", "false") == "true",
+                "all_expiries": st.value("opt_all_expiries", "false") == "true",
+                "stocks": st.value("opt_stocks", "true") == "true",
+                "folder": str(folder), "cloud": store.cloud_of(folder),
                 "last": str(st.value("opt_last", "") or "")}
+
+    def _archive_names(self, cfg: dict) -> list:
+        """The names whose options are saved: the chosen ones, and (when ticked) every watchlist stock that has
+        options."""
+        from . import dhan_core
+        names = list(cfg["underlyings"])
+        if cfg.get("stocks"):
+            try:
+                have = set(dhan_core.underlyings()) if dhan_core.options_ready() else set()
+            except Exception:  # noqa: BLE001
+                have = set()
+            for s in self.watchlist.symbols():
+                u = str(s).split(":")[-1].strip().upper()
+                if u in have and u not in names:
+                    names.append(u)
+        return names
 
     def _options_archive(self, force: bool = False):
         """Once a day (and again after the close), while a Dhan account is connected: save the 1-minute history of
-        the option contracts around the money. Runs in the background; never places anything."""
+        the option contracts - every index, the watchlist's stocks, weekly and monthly expiries. Several Dhan
+        accounts share the work. Runs in the background; never places anything."""
         import datetime as _dt
         from . import optstore
         cfg = self.option_archive_settings()
-        if getattr(self, "_opt_busy", False) or not (cfg["on"] or force):
+        if getattr(self, "_opt_busy", False) or getattr(self, "_store_busy", False) or not (cfg["on"] or force):
             return
         now = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=5, minutes=30)))
         after_close = now.weekday() < 5 and now.time() >= _dt.time(15, 35)
@@ -2876,31 +3005,39 @@ class MainWindow(QtWidgets.QMainWindow):
         done_stamp = str(self.settings.value("opt_done", "") or "")
         if not force and (done_stamp == stamp or done_stamp == now.date().isoformat() + "-close"):
             return
-        acct = next((a for a in acctmod.load_accounts() if a.get("broker") == "dhan" and a.get("access_token")
-                     and (acctmod.STATUS.get(a["name"]) or {}).get("state") in ("ok", "expiring")), None)
-        if acct is None:
+        accts = [a for a in acctmod.load_accounts() if a.get("broker") == "dhan" and a.get("access_token")
+                 and (acctmod.STATUS.get(a["name"]) or {}).get("state") in ("ok", "expiring")]
+        accts.sort(key=lambda a: 0 if (acctmod.STATUS.get(a["name"]) or {}).get("data") else 1)   # data plan first
+        if not accts:
             if force:
                 self.statusBar().showMessage("The option archive needs a connected Dhan account (Accounts)", 8000)
             return
         self._opt_busy = True
+        self._opt_progress = (0, 0)
         base = Path(cfg["folder"])
+        names = self._archive_names(cfg)
+        width = 0 if cfg["all_strikes"] else cfg["width"]
+        n_exp = 0 if cfg["all_expiries"] else cfg["expiries"]
         from .panel import LoadWorker
 
         def job():
             th = QtCore.QThread.currentThread()
-            res = optstore.run(acct, base, cfg["underlyings"], cfg["width"], cfg["expiries"],
-                               stop=th.isInterruptionRequested)
+            res = optstore.run(accts, base, names, width, n_exp, stop=th.isInterruptionRequested,
+                               progress=lambda k, n: setattr(self, "_opt_progress", (k, n)),
+                               stamp="" if force else stamp)
             return res, stamp
         w = self._opt_worker = LoadWorker(job, self)
 
         def done(res, st_):
             self._opt_busy = False
             when = _dt.datetime.now().strftime("%d %b %H:%M")
-            text = (f"{when}: {res['contracts']} contracts followed, {res['updated']} files grew by {res['rows']} rows"
+            text = (f"{when}: {res['contracts']:,} contracts followed, {res['updated']:,} files grew by {res['rows']:,} rows"
+                    + (f" (on {res['accounts']} accounts)" if res.get("accounts", 1) > 1 else "")
                     + (f", {len(res['errors'])} could not be read ({res['errors'][0]})" if res["errors"] else ""))
             self.settings.setValue("opt_last", text)
-            if res["updated"] or not res["errors"]:
-                self.settings.setValue("opt_done", st_)
+            k, n = getattr(self, "_opt_progress", (0, 0))
+            if (res["updated"] or res.get("skipped") or not res["errors"]) and (not n or k >= n):
+                self.settings.setValue("opt_done", st_)        # (a pass that was cut short runs on next time)
             self.add_log(f"[option archive] {text}  ->  {res['folder']}")
             self.statusBar().showMessage(f"Option archive: {res['updated']} contracts updated", 6000)
 
@@ -3469,6 +3606,21 @@ def selftest() -> int:
     tick = p.on_tick(px, None) == "same" and abs(float(p.df["Close"].iloc[-1]) - px) < 1e-6
     print(f"live: websockets={ws} tls={tls} tick={tick}", flush=True)
     ok = ok and ws and tls and tick
+    # the data store: the built app must be able to write and read its files (parquet) and to hand back history
+    kept = False
+    try:
+        from . import store
+        sdir = Path(tempfile.mkdtemp()) / "ChartLab" / "options"
+        store.enable(sdir)
+        store.merge("SELFTEST", "1d", df.iloc[:300], force=True)
+        got, _lab = store.keep("SELFTEST", "1d", "max", df.iloc[250:], "x")
+        kept = (len(got) == len(df) and (sdir.parent / "candles" / "SELFTEST" / "1d" / "all.parquet").exists()
+                and store.saved("SELFTEST", "1d", "max") is not None)
+        store.disable()
+    except Exception as e:  # noqa: BLE001
+        print(f"store: {e}", flush=True)
+    print(f"store: kept={kept}", flush=True)
+    ok = ok and kept
     print(("SELFTEST OK " if ok else "SELFTEST FAILED ") + win.version, flush=True)
     quit_cleanly(win, 0 if ok else 1)
     return 0 if ok else 1
@@ -3497,7 +3649,10 @@ def main():
         app.setWindowIcon(QtGui.QIcon(str(_ic)))
     theme.check_icon_path()                       # tick / chevron images the style sheet points at
     app.setStyleSheet(theme.STYLESHEET)
-    win = MainWindow()
+    from . import optstore as _optstore, store as _store
+    _store.enable(_optstore.root(str(QtCore.QSettings("ChartLab", "ChartLab").value("opt_folder", "") or "")))
+    win = MainWindow()                            # (the store is on before the first chart loads)
+    win.start_store()                             # from here on everything downloaded is kept (Settings -> Data)
     geo = app.primaryScreen().availableGeometry()
     win.resize(min(1680, int(geo.width() * 0.96)), min(980, int(geo.height() * 0.94)))
     win.setWindowOpacity(0.0)

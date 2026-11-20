@@ -3,6 +3,8 @@ process with THEIR Python, and bring its trades / equity back into the chart.
 
 Inside the script:  import chartlab
     df = chartlab.data()                     # the OHLCV of the active chart (DataFrame), optional
+    df = chartlab.history("NIFTY", "5m")     # anything in the data store: any symbol, any interval, option contracts
+    chartlab.contracts("NIFTY")              # the option archive as a table; chartlab.option_data(symbol) reads one
     chartlab.report(trades=trades_df, equity=equity_series, plots={"EMA": series})
 If the script never calls report(), a DataFrame that looks like trades (has entry/exit time + pnl) and a Series/
 DataFrame called equity/equity_curve are picked up automatically from the script's globals."""
@@ -51,6 +53,135 @@ def option_index():
     except Exception:
         return {}
 
+def contracts(underlying="", expiry=None, kind=""):
+    """The option archive as a table (one row per stored contract): symbol, und, expiry, strike, kind, first, last,
+    rows. contracts("NIFTY"), contracts("NIFTY", "2026-11-24", "CE"). Feed a symbol to option_data()."""
+    import re
+    import pandas as pd
+    und = str(underlying).strip().upper()
+    exp = str(pd.Timestamp(expiry).date()) if expiry else ""
+    k = {"C": "CE", "P": "PE", "CALL": "CE", "PUT": "PE"}.get(str(kind).strip().upper(), str(kind).strip().upper())
+    pat = re.compile(r"^([A-Z][A-Z0-9&\\-]*?)(\\d{2})(\\d{2})(\\d{2})([CP])(\\d+(?:\\.\\d+)?)$")
+    rows = []
+    for name, e in sorted(option_index().items()):
+        m = pat.match(name)
+        if e.get("spot") or not (m or e.get("expiry")):
+            continue
+        d = {"symbol": name, "und": e.get("und") or m[1], "expiry": str(e.get("expiry") or f"20{m[2]}-{m[3]}-{m[4]}"),
+             "strike": float(e.get("strike") or m[6]), "kind": e.get("kind") or ("CE" if m[5] == "C" else "PE"),
+             "first": e.get("first"), "last": e.get("last"), "rows": e.get("rows")}
+        if (und and d["und"] != und) or (exp and d["expiry"] != exp) or (k and d["kind"] != k):
+            continue
+        rows.append(d)
+    return pd.DataFrame(rows, columns=["symbol", "und", "expiry", "strike", "kind", "first", "last", "rows"])
+
+def expiries(underlying):
+    """The expiries of this name that the option archive holds (expired ones too), oldest first."""
+    return sorted(set(contracts(underlying)["expiry"]))
+
+_IDX = {"NIFTY50": "NIFTY", "^NSEI": "NIFTY", "NIFTYBANK": "BANKNIFTY", "^NSEBANK": "BANKNIFTY", "^BSESN": "SENSEX",
+        "^INDIAVIX": "INDIAVIX"}
+
+def _key(symbol):
+    import re
+    s = str(symbol).strip().upper().replace(" ", "")
+    ex, s = (s.split(":", 1) if ":" in s else ("", s))
+    if s.endswith(".NS"):
+        s = s[:-3]
+    elif s.endswith(".BO"):
+        s, ex = s[:-3], "BSE"
+    s = _IDX.get(s, s)
+    if ex == "BSE":
+        s = "BSE_" + s
+    elif ex and ex != "NSE":
+        s = ex + "_" + s
+    return re.sub(r"[^A-Z0-9&_.\\-]", "_", s.lstrip("^")) or "_"
+
+def _bars(folder):
+    import glob
+    import pandas as pd
+    parts = [pd.read_parquet(f) for f in sorted(glob.glob(os.path.join(folder, "*.parquet")))]
+    if not parts:
+        return pd.DataFrame()
+    df = pd.concat(parts)
+    if "Date" in df.columns:
+        df = df.set_index("Date")
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+def _resample(df, interval):
+    """Bigger bars from smaller ones; minutes / hours start at each day's first bar (09:15 on NSE)."""
+    import re
+    import numpy as np
+    import pandas as pd
+    m = re.fullmatch(r"(\\d+)(m|h|d)", str(interval).strip().lower())
+    if not m or not len(df):
+        return df
+    n, u = int(m[1]), m[2]
+    how = {c: a for c, a in (("Open", "first"), ("High", "max"), ("Low", "min"), ("Close", "last"),
+                             ("Volume", "sum"), ("OI", "last")) if c in df.columns}
+    day = df.index.normalize()
+    if u == "d":
+        key = day
+    else:
+        step = n * (3600 if u == "h" else 60)
+        tod = (df.index - day).total_seconds().values
+        a = float(tod.min())
+        key = day + pd.to_timedelta(a + np.floor((tod - a) / step) * step, unit="s")
+    out = df.groupby(np.asarray(key)).agg(how)
+    out.index = pd.DatetimeIndex(out.index, name="Date")
+    return out
+
+def history(symbol, interval="1m", start=None, end=None):
+    """Bars from ChartLab's data store (Settings -> Data): everything the charts, the watchlist's daily job and the
+    option archive have saved - usually far more than a broker or Yahoo hands out in one go.
+        history("RELIANCE", "5m")                       any interval: built from the saved 1-minute bars
+        history("NIFTY", "1d", start="2025-01-01")
+        history("NIFTY261124C25000")                    an option contract (with OI), expired ones too
+    -> DataFrame: Date index, Open, High, Low, Close, Volume (and OI for options). KeyError when nothing is saved."""
+    import re
+    import pandas as pd
+    name = str(symbol).strip().upper()
+    iv = str(interval).strip()
+    saved = option_index()
+    if name in saved and re.match(r"^[A-Z][A-Z0-9&\\-]*?\\d{6}[CP]\\d", name):      # a contract of the option archive
+        df = option_data(name)
+        if iv != "1m":
+            df = _resample(df, iv)
+    else:
+        root = os.environ.get("CHARTLAB_CANDLES", "")
+        folder = os.path.join(root, _key(symbol))
+        df = _bars(os.path.join(folder, iv))
+        if iv != "1m" and iv[-1:] in ("m", "h", "d"):
+            one = _bars(os.path.join(folder, "1m"))
+            if len(one) and iv[-1:] != "d":
+                built = _resample(one, iv)
+                df = built if not len(df) else pd.concat([built[built.index < df.index[0]], df])
+            elif len(one) and not len(df):
+                df = _resample(one, iv)
+        if not len(df) and name in saved:                    # an index the option archive follows: its 1-minute bars
+            df = _resample(option_data(name), iv) if iv != "1m" else option_data(name)
+        if not len(df):
+            raise KeyError(f"{symbol} ({iv}) is not in ChartLab's data store ({root}). Open its chart once or put it "
+                           "in the watchlist: it is saved from then on.")
+    if start is not None:
+        df = df[df.index >= pd.Timestamp(start)]
+    if end is not None:
+        df = df[df.index <= pd.Timestamp(end)]
+    return df
+
+def stored():
+    """What the data store holds: {'candles': {symbol: [intervals]}, 'options': number of contracts and indices}."""
+    root = os.environ.get("CHARTLAB_CANDLES", "")
+    out = {}
+    if os.path.isdir(root):
+        for k in sorted(os.listdir(root)):
+            d = os.path.join(root, k)
+            if os.path.isdir(d):
+                ivs = sorted(i for i in os.listdir(d) if os.path.isdir(os.path.join(d, i)))
+                if ivs:
+                    out[k] = ivs
+    return {"candles": out, "options": len(option_index())}
+
 def account():
     """Credentials of the broker account this copy of the script runs on (separate-copies mode), or {}."""
     if not os.environ.get("CHARTLAB_ACCOUNT"):
@@ -58,7 +189,7 @@ def account():
     return {k[len("CHARTLAB_"):].lower(): v for k, v in os.environ.items()
             if k.startswith("CHARTLAB_") and k not in ("CHARTLAB_OUT", "CHARTLAB_DATA", "CHARTLAB_PYTHON",
                                                      "CHARTLAB_ACCOUNTS_FILE", "CHARTLAB_OPTIONS",
-                                                     "CHARTLAB_HOME")}
+                                                     "CHARTLAB_CANDLES", "CHARTLAB_HOME")}
 
 def accounts():
     """All accounts this run trades on: every ticked account (one-script mode) or just this one."""
@@ -245,10 +376,15 @@ def environment(workdir: Path, df) -> dict:
     env["PYTHONUNBUFFERED"] = "1"
     try:
         from PySide6 import QtCore as _qc
-        from . import optstore
-        env["CHARTLAB_OPTIONS"] = str(optstore.root(str(_qc.QSettings("ChartLab", "ChartLab").value("opt_folder", "") or "")))
+        from . import optstore, store
+        store.flush()                                        # the script reads the files: write what is still waiting
+        opts = store.STATE["root"] or optstore.root(
+            str(_qc.QSettings("ChartLab", "ChartLab").value("opt_folder", "") or ""))
+        env["CHARTLAB_OPTIONS"] = str(opts)
+        env["CHARTLAB_CANDLES"] = str(store.candles_root(opts))
     except Exception:  # noqa: BLE001
         env["CHARTLAB_OPTIONS"] = str(Path.home() / "ChartLab" / "options")
+        env["CHARTLAB_CANDLES"] = str(Path.home() / "ChartLab" / "candles")
     return env
 
 
