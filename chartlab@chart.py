@@ -2677,6 +2677,27 @@ class ChartWidget(QtWidgets.QWidget):
             self.price.removeItem(item)
         self._marker_items = []
 
+    def _on_bars(self, series) -> np.ndarray:
+        """A strategy line laid on the bars the chart has now. A candle can have formed (or older history arrived)
+        since the test ran: the line keeps its place by date and the bars it has no value for stay empty."""
+        n = len(self.df)
+        if len(series) == n:
+            return np.asarray(series, float)
+        out = None
+        if isinstance(series, pd.Series) and not isinstance(series.index, pd.RangeIndex):
+            try:
+                out = series.reindex(self.df.index).to_numpy(float)
+                if not np.isfinite(out).any():              # no date in common: by position below
+                    out = None
+            except Exception:  # noqa: BLE001 - dates that cannot be matched (repeated, another kind)
+                out = None
+        if out is None:
+            a = np.asarray(series, float)
+            out = np.full(n, np.nan)
+            m = min(n, len(a))
+            out[:m] = a[:m]
+        return out
+
     def set_strategy_overlays(self, overlays: dict):
         for item, _ in self._strategy_items:
             self.price.removeItem(item)
@@ -2687,10 +2708,11 @@ class ChartWidget(QtWidgets.QWidget):
         x = np.arange(len(self.df))
         for i, (name, series) in enumerate(overlays.items()):
             color = theme.LINE_COLORS[(i + 2) % len(theme.LINE_COLORS)]
-            sy = self.ty(series.to_numpy(float))
+            raw = self._on_bars(series)
+            sy = self.ty(raw)
             item = pg.PlotDataItem(x=x, y=sy, pen=pg.mkPen(color, width=1.4), connect="finite", antialias=True)
             item._full = (x, sy)
-            item._raw = series.to_numpy(float)
+            item._raw = raw
             self.price.addItem(item)
             if self._limit is not None:
                 item.setData(x[:self._limit], item._full[1][:self._limit])

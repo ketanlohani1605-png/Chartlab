@@ -123,22 +123,27 @@ class SettingsDialog(QtWidgets.QDialog):
             "QCheckBox::indicator{width:16px;height:16px;border:1px solid #6a6d78;border-radius:4px;background:#1e1e1e;} "
             "QCheckBox::indicator:checked{background:#ffffff;border-color:#ffffff;image:url(%s);} "
             "QListWidget{border:0;outline:0;} "
-            "QListWidget::item{padding:9px 12px;color:#dbdbdb;border-radius:6px;margin:1px 0;} "
-            "QListWidget::item:selected{background:#2e2e2e;color:#fff;} QListWidget::item:hover{background:#262626;} "
+            "QListWidget::item{padding:0 12px;min-height:39px;color:#b8b8b8;border-radius:8px;margin:0;} "
+            "QListWidget::item:selected{background:#222222;color:#ffffff;font-weight:600;} "
+            "QListWidget::item:hover{background:#1c1c1c;} "
             "QComboBox,QSpinBox{background:#1e1e1e;border:1px solid #4a4a4a;border-radius:6px;padding:5px 10px;"
             "min-height:22px;color:#dbdbdb;font-size:14px;} QComboBox:hover,QSpinBox:hover{border-color:#6a6d78;} "
             "QComboBox QAbstractItemView{background:#1e1e1e;border:1px solid #2e2e2e;selection-background-color:#2e2e2e;} "
-            "QPushButton{background:transparent;border:1px solid #6a6d78;border-radius:8px;padding:7px 18px;color:#dbdbdb;"
-            "font-size:14px;} QPushButton:hover{background:#2e2e2e;} "
-            "QPushButton[here=\"true\"]{background:#2e2e2e;border-color:#dbdbdb;color:#ffffff;} "
-            "QPushButton#ok{background:#ffffff;color:#000;font-weight:600;border-color:#ffffff;} "
-            "QPushButton#ok:hover{background:#e0e0e0;} QFrame#footline{background:#2e2e2e;}" % theme.check_icon_path())
+            # TradingView's buttons: 33 px high, 8 px corners; "Ok" #f2f2f2 with black text, "Cancel" a white
+            # outline, the others (its "Template") a #303030 outline with #b8b8b8 text
+            "QPushButton{background:transparent;border:1px solid #303030;border-radius:8px;padding:0 11px;"
+            "min-height:31px;color:#b8b8b8;font-size:14px;} QPushButton:hover{background:#222222;} "
+            "QPushButton[here=\"true\"]{background:#222222;border-color:#b8b8b8;color:#ffffff;} "
+            "QPushButton#cancel{border-color:#ffffff;color:#ffffff;} "
+            "QPushButton#ok{background:#f2f2f2;color:#000000;border-color:#f2f2f2;} "
+            "QPushButton#ok:hover{background:#dbdbdb;border-color:#dbdbdb;} QFrame#footline{background:transparent;}"
+            % theme.check_icon_path())
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         body = QtWidgets.QHBoxLayout()
-        body.setContentsMargins(16, 16, 0, 0)
+        body.setContentsMargins(19, 14, 0, 0)
         self.tabs = QtWidgets.QListWidget()
-        self.tabs.setFixedWidth(210)
+        self.tabs.setFixedWidth(200)
         self.tabs.setIconSize(QtCore.QSize(20, 20))
         self.stack = QtWidgets.QStackedWidget()
         from . import icons
@@ -168,7 +173,8 @@ class SettingsDialog(QtWidgets.QDialog):
         fl.setFixedHeight(1)
         root.addWidget(fl)
         foot = QtWidgets.QHBoxLayout()
-        foot.setContentsMargins(20, 12, 20, 14)
+        foot.setContentsMargins(20, 16, 20, 16)
+        foot.setSpacing(11)
         tpl = QtWidgets.QPushButton("Template ▾")
         m = QtWidgets.QMenu(tpl)
         m.addAction("Reset settings", self._reset)
@@ -176,6 +182,7 @@ class SettingsDialog(QtWidgets.QDialog):
         foot.addWidget(tpl)
         foot.addStretch(1)
         cancel = QtWidgets.QPushButton("Cancel")
+        cancel.setObjectName("cancel")
         cancel.clicked.connect(self.reject)
         ok = QtWidgets.QPushButton("Ok")
         ok.setObjectName("ok")

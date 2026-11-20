@@ -2,6 +2,7 @@
 position lines on the chart: cancel with x, drag to a new price, close a position), the LIVE confirmation, browser
 login through the local redirect catcher, a non-Dhan live feed over a WebSocket, candles from a non-Dhan broker and
 a script order on a non-Dhan account. Nothing real is contacted."""
+import os as _os; _os.environ["CHARTLAB_OFFLINE"] = "1"      # no public price feed: a live tick during market hours would change the test's prices
 import http.server
 import json
 import os

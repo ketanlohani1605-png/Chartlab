@@ -106,49 +106,49 @@ def _is_option_text(t: str) -> bool:
 
 
 class _SearchDelegate(QtWidgets.QStyledItemDelegate):
-    """Row like TradingView: logo · TICKER (typed part highlighted) / description + badge · exchange."""
+    """A row as TradingView's symbol search draws it (measured on its page): 58 px high, 20 px of padding left and
+    right, a 36 px logo, the ticker 16 px at x = 72 (the typed part in #2962ff), under it the description 13 px and
+    an 8 px bold type badge on rgba(184,184,184,0.2), the exchange 13 px on the right; the row under the mouse / the
+    chosen row is 5 % white, edge to edge."""
+    ROW = 58
 
     def __init__(self, dlg):
         super().__init__(dlg.lst)
         self.dlg = dlg
 
     def sizeHint(self, option, index):
-        return QtCore.QSize(option.rect.width(), 56)
+        return QtCore.QSize(option.rect.width(), self.ROW)
 
     def paint(self, p, option, index):
         from .watchlist import draw_logo
         p.save()
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         r = option.rect
-        if option.state & QtWidgets.QStyle.StateFlag.State_Selected:
-            p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.setBrush(QtGui.QColor("#2e2e2e"))
-            p.drawRoundedRect(QtCore.QRectF(r).adjusted(6, 1, -6, -1), 8, 8)
-        elif option.state & QtWidgets.QStyle.StateFlag.State_MouseOver:
-            p.fillRect(r.adjusted(6, 1, -6, -1), QtGui.QColor("#262626"))
+        if option.state & (QtWidgets.QStyle.StateFlag.State_Selected | QtWidgets.QStyle.StateFlag.State_MouseOver):
+            p.fillRect(r, QtGui.QColor(255, 255, 255, 13))
         sym = index.data(ROLE)
         typed = index.data(ROLE + 1)
         tick = sym.split(":")[-1]
         opt = None if typed else _opt(sym)
-        draw_logo(p, QtCore.QRectF(r.x() + 20, r.center().y() - 15, 30, 30), opt[0] if opt else sym, option.font)
+        draw_logo(p, QtCore.QRectF(r.x() + 20, r.y() + 11, 36, 36), opt[0] if opt else sym, option.font)
         f = QtGui.QFont(option.font)
         f.setPixelSize(16)
-        f.setWeight(QtGui.QFont.Weight.Medium)
-        p.setFont(f)
-        x, y = r.x() + 66, r.y() + 8
-        q = (self.dlg.edit.text().strip().upper() if not typed else "")
-        i = tick.find(q) if q else -1
-        parts = [(tick, "#dbdbdb")] if i < 0 else [(tick[:i], "#dbdbdb"), (tick[i:i + len(q)], "#3179f5"),
-                                                    (tick[i + len(q):], "#dbdbdb")]
-        fm = p.fontMetrics()
-        for txt, col in parts:
-            p.setPen(QtGui.QColor(col))
-            p.drawText(x, y + fm.ascent(), txt)
-            x += fm.horizontalAdvance(txt)
-        f.setPixelSize(12)
         f.setWeight(QtGui.QFont.Weight.Normal)
         p.setFont(f)
-        p.setPen(QtGui.QColor("#9598a1"))
+        x = r.x() + 72
+        q = (self.dlg.edit.text().strip().upper() if not typed else "")
+        i = tick.find(q) if q else -1
+        parts = [(tick, "#b8b8b8")] if i < 0 else [(tick[:i], "#b8b8b8"), (tick[i:i + len(q)], "#2962ff"),
+                                                    (tick[i + len(q):], "#b8b8b8")]
+        fm = p.fontMetrics()
+        base = r.y() + 8 + (24 - fm.height()) / 2.0 + fm.ascent()         # the 24 px title line starts 8 px down
+        for txt, col in parts:
+            p.setPen(QtGui.QColor(col))
+            p.drawText(QtCore.QPointF(x, base), txt)
+            x += fm.horizontalAdvance(txt)
+        f.setPixelSize(13)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("#b8b8b8"))
         if typed:
             desc = "Nearest expiry of this option" if " " in sym or _is_option_text(sym) else "Use the typed symbol"
         elif opt:
@@ -157,25 +157,30 @@ class _SearchDelegate(QtWidgets.QStyledItemDelegate):
         else:
             desc = symbol_name(sym) or tick
         fm = p.fontMetrics()
-        dy = r.y() + 32 + fm.ascent()
-        p.drawText(r.x() + 66, dy, desc)
+        dbase = r.y() + 32 + (18 - fm.height()) / 2.0 + fm.ascent()       # the 18 px description line under it
+        room = r.width() - 72 - 150
+        desc = fm.elidedText(desc, QtCore.Qt.TextElideMode.ElideRight, int(room))
+        p.drawText(QtCore.QPointF(r.x() + 72, dbase), desc)
         badge = ("SYMBOL" if typed else _kind(sym).upper().replace("STOCKS", "STOCK").replace("INDICES", "INDEX")
                  .replace("OPTIONS", "OPTION").replace("US", "STOCK"))
-        bx = r.x() + 66 + fm.horizontalAdvance(desc) + 8
-        f.setPixelSize(9)
+        bx = r.x() + 72 + fm.horizontalAdvance(desc) + 6
+        f.setPixelSize(8)
         f.setWeight(QtGui.QFont.Weight.Bold)
+        f.setLetterSpacing(QtGui.QFont.SpacingType.AbsoluteSpacing, 0.5)
         p.setFont(f)
-        bw = p.fontMetrics().horizontalAdvance(badge) + 10
+        bw = p.fontMetrics().horizontalAdvance(badge) + 12
+        box = QtCore.QRectF(bx, r.y() + 35, bw, 12)
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(QtGui.QColor("#2e2e2e"))
-        p.drawRoundedRect(QtCore.QRectF(bx, r.y() + 33, bw, 14), 3, 3)
-        p.setPen(QtGui.QColor("#b2b5be"))
-        p.drawText(QtCore.QRectF(bx, r.y() + 33, bw, 14), QtCore.Qt.AlignmentFlag.AlignCenter, badge)
+        p.setBrush(QtGui.QColor(184, 184, 184, 51))
+        p.drawRoundedRect(box, 3, 3)
+        p.setPen(QtGui.QColor("#b8b8b8"))
+        p.drawText(box, QtCore.Qt.AlignmentFlag.AlignCenter, badge)
+        f.setLetterSpacing(QtGui.QFont.SpacingType.AbsoluteSpacing, 0.0)
         f.setPixelSize(13)
         f.setWeight(QtGui.QFont.Weight.Normal)
         p.setFont(f)
-        p.setPen(QtGui.QColor("#9598a1"))
-        p.drawText(r.adjusted(0, 0, -24, 0), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignRight,
+        p.setPen(QtGui.QColor("#b8b8b8"))
+        p.drawText(r.adjusted(0, 0, -20, 0), QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignRight,
                    "" if typed else _exch(sym))
         p.restore()
 
@@ -188,8 +193,24 @@ class SymbolSearch(QtWidgets.QDialog):
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("Symbol Search")
         self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
-        self.setStyleSheet(DARK)
-        self.resize(760, 600)
+        self.setProperty("chromeScrim", True)                # TradingView dims the page behind this dialog (only)
+        # TradingView's own measures (its page, 1440 x 900): the card is 840 x 680 with a 20 px radius; the search
+        # line 16 px at x = 52 in a 60 px band, icon 28 px at x = 20; chips 28 px high, radius 14, 4 px apart,
+        # #f2f2f2 / black when chosen and #222 / #b8b8b8 otherwise; the list starts at y = 113; no dividing lines.
+        self.setStyleSheet(
+            DARK + " QDialog{border:0;border-radius:20px;background:#131313;}"
+            " QPushButton#chip{background:#222222;border:1px solid #222222;border-radius:14px;padding:0 11px;"
+            "color:#b8b8b8;font-size:14px;min-height:26px;max-height:26px;}"
+            " QPushButton#chip:hover{background:#303030;border-color:#303030;}"
+            " QPushButton#chip:checked{background:#f2f2f2;border-color:#f2f2f2;color:#000000;}"
+            " QPushButton#clear{background:transparent;border:1px solid transparent;border-radius:8px;padding:0 7px;"
+            "color:#707070;font-size:14px;min-height:26px;max-height:26px;}"
+            " QPushButton#clear:hover{color:#b8b8b8;background:#222222;}"
+            " QListWidget{background:transparent;border:0;outline:0;}"
+            " QScrollBar:vertical{background:transparent;width:5px;margin:0;}"
+            " QScrollBar::handle:vertical{background:#464646;border-radius:2px;min-height:24px;margin:0;}")
+        ph = parent.height() if parent is not None else 900
+        self.resize(840, max(420, min(680, ph - 180)))
         self.symbols, self.chosen, self.kind = list(dict.fromkeys(symbols)), None, "All"
         try:                                                 # every NSE stock, found as you type (TradingView)
             from .symbols import nse_symbols
@@ -198,41 +219,54 @@ class SymbolSearch(QtWidgets.QDialog):
         except Exception:  # noqa: BLE001
             self.universe = []
         lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(14, 14, 14, 10)
-        lay.setSpacing(10)
-        top = QtWidgets.QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        band = QtWidgets.QWidget()
+        band.setFixedHeight(60)
+        top = QtWidgets.QHBoxLayout(band)
+        top.setContentsMargins(20, 0, 20, 0)
+        top.setSpacing(4)
         ic = QtWidgets.QLabel()
-        ic.setPixmap(icons.get("search", "#dbdbdb").pixmap(22, 22))
+        ic.setFixedSize(28, 28)
+        ic.setPixmap(icons.get("search", "#8c8c8c").pixmap(28, 28))
         top.addWidget(ic)
-        self.edit = QtWidgets.QLineEdit(text)
+        self.edit = QtWidgets.QLineEdit(text.upper())
         self.edit.setPlaceholderText("Symbol, ISIN or company")
-        self.edit.setStyleSheet("QLineEdit{background:transparent;border:0;font-size:18px;padding:6px 4px;color:#fff;}")
+        self.edit.setStyleSheet("QLineEdit{background:transparent;border:0;border-radius:0;font-size:16px;"
+                                "padding:0;color:#b8b8b8;selection-background-color:#143eb3;selection-color:#ffffff;}")
+        self.edit.textEdited.connect(self._upper)            # typed letters stand in capitals, as on TradingView
         top.addWidget(self.edit, 1)
-        clr = QtWidgets.QToolButton()
-        clr.setIcon(icons.get("close", "#9598a1"))
-        clr.setToolTip("Clear")
-        clr.setStyleSheet("QToolButton{border:0;background:transparent;}")
+        clr = QtWidgets.QPushButton("Clear")
+        clr.setObjectName("clear")
+        clr.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        clr.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        clr.setAutoDefault(False)
         clr.clicked.connect(lambda: (self.edit.clear(), self.edit.setFocus()))
+        clr.setVisible(bool(text))
+        self.edit.textChanged.connect(lambda t: clr.setVisible(bool(t)))
+        self.clear_btn = clr
         top.addWidget(clr)
-        lay.addLayout(top)
-        line = QtWidgets.QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet("background:#2e2e2e;")
-        lay.addWidget(line)
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(6)
+        lay.addWidget(band)
+        chips = QtWidgets.QWidget()
+        chips.setFixedHeight(44)
+        row = QtWidgets.QHBoxLayout(chips)
+        row.setContentsMargins(20, 8, 20, 8)
+        row.setSpacing(4)
         self.chips = []
         for c in CHIPS:
             b = QtWidgets.QPushButton(c)
+            b.setObjectName("chip")
             b.setCheckable(True)
             b.setChecked(c == "All")
+            b.setAutoDefault(False)
             b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(lambda _=False, c=c: self._set_kind(c))
             b.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
             row.addWidget(b)
             self.chips.append(b)
         row.addStretch(1)
-        lay.addLayout(row)
+        lay.addWidget(chips)
+        lay.addSpacing(9)                                    # (the list starts at y = 113)
         self.lst = QtWidgets.QListWidget()
         self.lst.setItemDelegate(_SearchDelegate(self))
         self.lst.setMouseTracking(True)
@@ -240,18 +274,30 @@ class SymbolSearch(QtWidgets.QDialog):
         self.lst.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.lst.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         lay.addWidget(self.lst, 1)
-        hint = QtWidgets.QLabel("")
-        hint.setStyleSheet("color:#6a6d78;font-size:11px;padding:2px 6px;")
+        hint = QtWidgets.QLabel("")                          # only the Options tab has something to say here
+        hint.setStyleSheet("color:#8c8c8c;font-size:12px;padding:6px 20px 10px 20px;")
+        hint.setWordWrap(True)
+        hint.hide()
         lay.addWidget(hint)
+        lay.addSpacing(8)                                    # the list ends before the card's round corners
         self.hint = hint
         self.edit.textChanged.connect(self._fill)
         self.edit.returnPressed.connect(self._accept)
         self.lst.itemClicked.connect(lambda *_: self._accept())
         self._fill()
-        if parent is not None:
+        if parent is not None:                               # TradingView centres it on the page
             g = parent.geometry()
-            self.move(g.x() + (g.width() - self.width()) // 2, g.y() + 90)
-        QtCore.QTimer.singleShot(0, lambda: (self.edit.setFocus(), self.edit.setCursorPosition(len(self.edit.text()))))
+            self.move(g.x() + (g.width() - self.width()) // 2, g.y() + max(40, (g.height() - self.height()) // 2))
+        # the letter typed on the chart that opened this is the start of the name: the next key goes after it
+        QtCore.QTimer.singleShot(0, lambda: (self.edit.setFocus(), self.edit.deselect(),
+                                             self.edit.setCursorPosition(len(self.edit.text()))))
+
+    def _upper(self, t):
+        up = t.upper()
+        if up != t:
+            pos = self.edit.cursorPosition()
+            self.edit.setText(up)
+            self.edit.setCursorPosition(pos)
 
     def _set_kind(self, k):
         self.kind = k
@@ -371,6 +417,7 @@ class SymbolSearch(QtWidgets.QDialog):
                 base = ("Type like  NIFTY 25000 CE  \u00b7  BANKNIFTY NOV 52000 PE  \u00b7  RELIANCE 27NOV 1300 CE"
                         "  \u00b7  no date = nearest expiry  \u00b7  prices need a Dhan account")
         self.hint.setText(base)
+        self.hint.setVisible(self.kind == "Options")         # (TradingView's dialog has no line of hints)
 
     def keyPressEvent(self, ev):
         K = QtCore.Qt.Key
@@ -659,55 +706,68 @@ class IndicatorsDialog(QtWidgets.QDialog):
     def __init__(self, parent, items: list, toggle, run_strategy, text: str = ""):
         super().__init__(parent)
         self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
-        self.setStyleSheet(DARK + " QListWidget#cats::item{padding:8px 12px;border-radius:6px;color:#dbdbdb;}"
-                           " QListWidget#cats::item:selected{background:#2e2e2e;color:#ffffff;}"
-                           " QListWidget#cats::item:hover{background:#262626;}"
-                           " QToolButton{background:transparent;border:0;border-radius:6px;padding:4px;}"
-                           " QToolButton:hover{background:#2e2e2e;}")
-        self.resize(760, 520)
+        self.setProperty("chromeRadius", 12)                 # TradingView: this dialog's corners are 12 px
+        # TradingView's measures: 815 x 619; title 20 px semi-bold #b8b8b8 at x = 19 in a 60 px band, close button
+        # 33 x 33; the search field a bordered line under it; categories 39 px high, the chosen one #222 with
+        # 8 px corners; no dividing lines anywhere.
+        self.setStyleSheet(DARK + " QDialog{border:0;border-radius:12px;background:#131313;}"
+                           " QListWidget#cats::item{padding:0 12px;min-height:39px;border-radius:8px;color:#b8b8b8;"
+                           "font-size:14px;}"
+                           " QListWidget#cats::item:selected{background:#222222;color:#ffffff;font-weight:600;}"
+                           " QListWidget#cats::item:hover{background:#1c1c1c;}"
+                           " QToolButton{background:transparent;border:0;border-radius:8px;padding:4px;}"
+                           " QToolButton:hover{background:#222222;}"
+                           " QFrame#searchbox{border:1px solid #464646;border-radius:8px;background:transparent;}"
+                           " QFrame#searchbox:hover{border-color:#636363;}")
+        ph = parent.height() if parent is not None else 900
+        self.resize(815, max(420, min(619, ph - 180)))
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.items, self._toggle, self._run = items, toggle, run_strategy
         lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(16, 12, 12, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(19, 0, 17, 14)
+        lay.setSpacing(0)
         head = QtWidgets.QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
         title = QtWidgets.QLabel("Indicators, metrics & strategies")
-        title.setStyleSheet("font-size:17px;font-weight:600;color:#ffffff;")
+        title.setFixedHeight(60)
+        title.setStyleSheet("font-size:20px;font-weight:600;color:#b8b8b8;")
         head.addWidget(title, 1)
         close = QtWidgets.QToolButton()
-        close.setIcon(icons.get("close", "#b2b5be"))
+        close.setFixedSize(33, 33)
+        close.setIconSize(QtCore.QSize(22, 22))
+        close.setIcon(icons.get("close", "#b8b8b8", 22))
         close.setToolTip("Close  (Esc)")
         close.clicked.connect(self.reject)
         head.addWidget(close)
         lay.addLayout(head)
-        top = QtWidgets.QHBoxLayout()
+        box = QtWidgets.QFrame()
+        box.setObjectName("searchbox")
+        box.setFixedHeight(40)
+        top = QtWidgets.QHBoxLayout(box)
+        top.setContentsMargins(8, 0, 8, 0)
+        top.setSpacing(4)
         ic = QtWidgets.QLabel()
-        ic.setPixmap(icons.get("search", "#9598a1").pixmap(18, 18))
+        ic.setFixedSize(28, 28)
+        ic.setPixmap(icons.get("search", "#8c8c8c").pixmap(28, 28))
+        ic.setStyleSheet("border:0;")
         top.addWidget(ic)
         self.edit = QtWidgets.QLineEdit(text)
         self.edit.setPlaceholderText("Search")
-        self.edit.setStyleSheet("QLineEdit{background:transparent;border:0;font-size:16px;padding:6px 4px;color:#fff;}")
+        self.edit.setStyleSheet("QLineEdit{background:transparent;border:0;font-size:16px;padding:0;color:#b8b8b8;}")
         top.addWidget(self.edit, 1)
-        lay.addLayout(top)
-        line = QtWidgets.QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet("background:#2e2e2e;")
-        lay.addWidget(line)
+        lay.addWidget(box)
+        lay.addSpacing(8)
         body = QtWidgets.QHBoxLayout()
-        body.setSpacing(10)
+        body.setSpacing(14)
         self.cats = QtWidgets.QListWidget()
         self.cats.setObjectName("cats")
-        self.cats.setFixedWidth(190)
+        self.cats.setFixedWidth(200)
         self.cats.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         cats = [self.ALL] + list(dict.fromkeys(it["category"] for it in items))
         for c in cats:
             self.cats.addItem(c)
         self.cats.setCurrentRow(0)
         body.addWidget(self.cats)
-        sep = QtWidgets.QFrame()
-        sep.setFixedWidth(1)
-        sep.setStyleSheet("background:#2e2e2e;")
-        body.addWidget(sep)
         self.lst = QtWidgets.QListWidget()
         self.lst.setItemDelegate(_QuickDelegate(self.lst))
         self.lst.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
@@ -715,9 +775,7 @@ class IndicatorsDialog(QtWidgets.QDialog):
         self.lst.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body.addWidget(self.lst, 1)
         lay.addLayout(body, 1)
-        hint = QtWidgets.QLabel("Click to add or remove  ·  ↑↓ Enter  ·  Esc to close")
-        hint.setStyleSheet("color:#6a6d78;font-size:12px;")
-        lay.addWidget(hint)
+        self.lst.setToolTip("Click to add or remove  \u00b7  \u2191\u2193 Enter  \u00b7  Esc to close")
         self.edit.textChanged.connect(self._fill)
         self.edit.returnPressed.connect(self._go)
         self.cats.currentRowChanged.connect(self._fill)

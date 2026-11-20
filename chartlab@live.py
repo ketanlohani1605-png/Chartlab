@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import time
 
 from PySide6 import QtCore, QtNetwork, QtWidgets
@@ -368,20 +369,61 @@ YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m
 YAHOO_EVERY = 3.0            # seconds between price checks per symbol (Yahoo allows roughly 2000 requests an hour)
 
 
+_YS: dict = {}
+
+
+def _yahoo_meta(sym: str, timeout: float) -> dict:
+    """The 'meta' block of Yahoo's chart answer for one symbol. Three ways to ask, because each one fails somewhere:
+    requests (brings its own certificates - inside the built Mac app Python's own HTTPS has none and every urllib
+    request died with 'certificate verify failed', which is why candles did not move), then plain urllib, then
+    yfinance's own session (Yahoo sometimes refuses plain clients)."""
+    import urllib.parse
+    url = YAHOO_URL.format(sym=urllib.parse.quote(sym, safe=""))
+    head = {"User-Agent": "Mozilla/5.0 (Macintosh) ChartLab", "Accept": "application/json"}
+    errors = []
+    try:
+        import requests
+        if _YS.get("s") is None:
+            _YS["s"] = requests.Session()                    # one connection kept open: a poll every few seconds
+        r = _YS["s"].get(url, headers=head, timeout=timeout)
+        r.raise_for_status()
+        d = r.json()
+        res = (d.get("chart") or {}).get("result") or []
+        if res:
+            return res[0].get("meta") or {}
+        errors.append(((d.get("chart") or {}).get("error") or {}).get("description") or "no data")
+    except Exception as e:  # noqa: BLE001
+        _YS["s"] = None
+        errors.append(f"{type(e).__name__}: {e}")
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers=head)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        res = (d.get("chart") or {}).get("result") or []
+        if res:
+            return res[0].get("meta") or {}
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"{type(e).__name__}: {e}")
+    try:
+        import yfinance as yf
+        m = dict(yf.Ticker(sym).get_history_metadata() or {})
+        t = m.get("regularMarketTime")
+        if hasattr(t, "timestamp"):                          # (yfinance hands the time over as a date)
+            m["regularMarketTime"] = float(t.timestamp())
+        if m.get("previousClose"):                           # (its chart spans several days: yesterday's close
+            m["chartPreviousClose"] = m["previousClose"]     # is the other field)
+        if m.get("regularMarketPrice"):
+            return m
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"{type(e).__name__}: {e}")
+    raise RuntimeError("Yahoo: " + "; ".join(str(x)[:90] for x in errors[:2]))
+
+
 def yahoo_quote(sym: str, timeout: float = 8.0) -> dict:
     """The newest price Yahoo has for one symbol: {'price', 'time' (Unix), 'offset' (exchange's seconds from UTC),
     'volume' (today's), 'prev' (yesterday's close)}."""
-    import urllib.parse
-    import urllib.request
-    url = YAHOO_URL.format(sym=urllib.parse.quote(sym, safe=""))
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh) ChartLab", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        d = json.loads(r.read().decode("utf-8", "replace"))
-    res = (d.get("chart") or {}).get("result") or []
-    if not res:
-        err = ((d.get("chart") or {}).get("error") or {}).get("description") or "no data"
-        raise RuntimeError(f"Yahoo: {err}")
-    m = res[0].get("meta") or {}
+    m = _yahoo_meta(sym, timeout)
     price = m.get("regularMarketPrice")
     if not price:
         raise RuntimeError("Yahoo: no price")
@@ -739,7 +781,7 @@ class LiveController(QtCore.QObject):
         from . import data as datamod
         from .dhan_core import is_option
         routes: dict = {}
-        if self.enabled:
+        if self.enabled and not os.environ.get("CHARTLAB_OFFLINE"):      # (tests switch the public feed off)
             for p in self.win.panels:
                 if not p.isVisible():
                     continue

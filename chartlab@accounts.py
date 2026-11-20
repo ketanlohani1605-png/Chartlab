@@ -1607,7 +1607,7 @@ class PickAccountsDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, accts: list[dict]):
         super().__init__(parent)
-        self.setWindowTitle("Run on accounts")
+        self.setWindowTitle("Run script on accounts")
         self.setMinimumWidth(560)
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(22, 18, 22, 16)

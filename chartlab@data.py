@@ -24,6 +24,34 @@ OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 USER_DIR = Path.home() / "ChartLab"
 
+
+def use_certifi() -> str:
+    """Python's own HTTPS (urllib: the Dhan API, the brokers, live prices) checks certificates against a store that
+    a built app does not have - the paths it knows are the build machine's. Point it at the certificate bundle that
+    ships inside the app (certifi, the one 'requests' uses). Without this every such request fails with
+    'certificate verify failed' in the built app while the same code works from source.
+    -> 'env' (already set), 'system' (the computer's own store works), 'certifi', or '' (nothing could be done)."""
+    import ssl
+    cur = os.environ.get("SSL_CERT_FILE", "")
+    if cur and os.path.exists(cur):
+        return "env"
+    try:
+        if not getattr(sys, "frozen", False):
+            v = ssl.get_default_verify_paths()
+            if (v.cafile and os.path.exists(v.cafile)) or (v.capath and os.path.isdir(v.capath) and os.listdir(v.capath)):
+                return "system"
+        import certifi
+        f = certifi.where()
+        if os.path.exists(f):
+            os.environ["SSL_CERT_FILE"] = f
+            return "certifi"
+    except Exception:  # noqa: BLE001 - leave things as they are
+        pass
+    return ""
+
+
+CERTS = use_certifi()             # (before anything opens a connection)
+
 _TIME_NAMES = ("datetime", "date", "time", "timestamp", "date_time", "dt")
 _ALIASES = {
     "open": "Open", "o": "Open",

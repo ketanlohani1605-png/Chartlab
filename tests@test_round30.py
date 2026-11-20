@@ -1,5 +1,6 @@
 """v0.30: indicator library with panes (MACD, Stochastic, ADX ...), TradingView crosshair (Retina-thick dashed lines,
 labels, '+' that never blocks, future time), frozen-bar cleanup, renamed symbols, watchlist follows the chart."""
+import os as _os; _os.environ["CHARTLAB_OFFLINE"] = "1"      # no public price feed: a live tick during market hours would change the test's prices
 import os, sys, json, math, tempfile, time
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ".")

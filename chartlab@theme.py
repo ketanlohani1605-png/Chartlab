@@ -122,6 +122,8 @@ def make_style():
     """The app's style: Fusion, with TradingView's menu rows (Qt style sheets cannot give a shortcut its own colour
     and size, or put the icon in TradingView's box)."""
     from PySide6 import QtCore, QtGui, QtWidgets
+    from . import chrome
+    chrome.install()                 # every dialog is a glass card (chrome.py)
 
     S = QtWidgets.QStyle
 
@@ -143,24 +145,33 @@ def make_style():
 
         def polish(self, w):
             if isinstance(w, QtWidgets.QMenu):
+                # a menu is a small glass card with round corners: its window has to be see-through for that
+                w.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
                 w.installEventFilter(painter)
                 return
             super().polish(w)
+
+        def styleHint(self, hint, opt=None, w=None, ret=None):
+            if hint == S.StyleHint.SH_DialogButtonLayout:     # Cancel on the left, the main button at the right
+                return int(QtWidgets.QDialogButtonBox.ButtonLayout.MacLayout.value)      # edge - in every dialog
+            return super().styleHint(hint, opt, w, ret)
 
     class MenuPaint(QtCore.QObject):
         """Paints a whole menu the TradingView way. (With a style sheet on the app Qt draws menu rows itself and
         never asks the style, so the menu's paint event is taken over; sizes still come from TVStyle.)"""
 
         def eventFilter(self, m, ev):
-            if ev.type() != QtCore.QEvent.Type.Paint or not isinstance(m, QtWidgets.QMenu):
+            t = ev.type()
+            if t in (QtCore.QEvent.Type.Show, QtCore.QEvent.Type.Hide) and isinstance(m, QtWidgets.QMenu):
+                chrome.menu_closed(m)                        # a fresh card (what is behind it now) the next time
+                return False
+            if t != QtCore.QEvent.Type.Paint or not isinstance(m, QtWidgets.QMenu):
                 return False
             p = QtGui.QPainter(m)
-            p.fillRect(m.rect(), QtGui.QColor("#161616"))
-            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-            p.setPen(QtGui.QPen(QtGui.QColor("#262626"), 1))
-            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(QtCore.QRectF(m.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
-            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            try:
+                p.drawImage(0, 0, chrome.menu_image(m))      # dark glass, round corners, hairline edge
+            except Exception:  # noqa: BLE001 - never a menu without a background
+                p.fillRect(m.rect(), QtGui.QColor("#1c1c1e"))
             act = m.activeAction()
             for a in m.actions():
                 r = m.actionGeometry(a)
@@ -327,7 +338,7 @@ QRadioButton::indicator {{ border: 1px solid #6a6d78; border-radius: 7px; backgr
 QRadioButton::indicator:checked {{ border: 4px solid #ffffff; background: #121212; width: 8px; height: 8px; }}
 QListWidget::indicator, QTableWidget::indicator {{ width: 15px; height: 15px; border: 1px solid #6a6d78; border-radius: 4px; background: #121212; }}
 QListWidget::indicator:checked, QTableWidget::indicator:checked {{ background: #ffffff; border-color: #ffffff; image: url({CHECK_PNG}); }}
-QDialog {{ background: #1e1e1e; }}
+QDialog {{ background: #131313; }}
 QDialog QWidget {{ background: transparent; }}
 QDialog QLineEdit, QDialog QComboBox, QDialog QDoubleSpinBox, QDialog QSpinBox, QDialog QDateTimeEdit,
 QDialog QPlainTextEdit, QDialog QTextEdit {{ background: #121212; border: 1px solid #3a3a3a; border-radius: 6px;
@@ -339,10 +350,11 @@ QDialog QLineEdit:focus, QDialog QPlainTextEdit:focus {{ border-color: #6a6d78; 
 QDialog QAbstractSpinBox QLineEdit, QDialog QComboBox QLineEdit, QDialog QDateTimeEdit QLineEdit {{ padding: 0; border: 0; background: transparent; }}
 QDialog QListWidget, QDialog QTableWidget {{ background: #121212; border: 1px solid #2e2e2e; border-radius: 6px; }}
 QDialog QComboBox QAbstractItemView {{ background: #1e1e1e; border: 1px solid #2e2e2e; selection-background-color: #2e2e2e; }}
-QDialog QPushButton {{ background: transparent; border: 1px solid #5a5a5a; border-radius: 8px; padding: 7px 16px; color: #dbdbdb; }}
-QDialog QPushButton:hover {{ background: #2e2e2e; }}
-QDialog QPushButton#primary, QDialog QPushButton:default {{ background: #ffffff; color: #000000; border-color: #ffffff; font-weight: 600; }}
-QDialog QPushButton#primary:hover, QDialog QPushButton:default:hover {{ background: #e3e3e3; }}
+QDialog QPushButton {{ background: transparent; border: 1px solid #303030; border-radius: 8px; padding: 0 11px; min-height: 31px; color: #b8b8b8; }}
+QDialog QPushButton:hover {{ background: #222222; }}
+QDialog QPushButton#tvSecondary {{ border-color: #ffffff; color: #ffffff; }}
+QDialog QPushButton#primary, QDialog QPushButton:default {{ background: #f2f2f2; color: #000000; border-color: #f2f2f2; font-weight: 400; }}
+QDialog QPushButton#primary:hover, QDialog QPushButton:default:hover {{ background: #dbdbdb; border-color: #dbdbdb; }}
 QDialog QCheckBox, QDialog QRadioButton, QDialog QLabel {{ color: #dbdbdb; }}
 QListWidget {{ outline: 0; }}
 QPushButton#primary:pressed {{ background: #1e53e5; }}
@@ -352,5 +364,25 @@ QToolButton#srcbtn {{ color: #b8b8b8; font-size: 14px; padding: 5px 8px; }}
 QMenu {{ background: #161616; border: 1px solid #262626; border-radius: 6px; padding: 6px 0; font-size: 14px; }}
 QMenu::separator {{ height: 1px; background: #303030; margin: 6px 0; }}
 QStatusBar {{ background: {BG}; color: {MUTED}; border-top: 4px solid {GUTTER}; min-height: 20px; font-size: 12px; }}
-QToolTip {{ background: #1a1a1a; color: {TEXT}; border: 1px solid {BORDER}; padding: 4px 6px; }}
+QToolTip {{ background: #26262a; color: #ececec; border: 1px solid #3c3c40; border-radius: 4px; padding: 5px 8px; font-size: 12px; }}
+QTableView, QTreeView {{ alternate-background-color: #0d0d0d; outline: 0; }}
+QDialog QTableView, QDialog QTreeView, QDialog QTreeWidget {{ background: rgba(0, 0, 0, 0.28); border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 8px; alternate-background-color: rgba(255, 255, 255, 0.035); gridline-color: rgba(255, 255, 255, 0.06);
+    selection-background-color: #2a2e39; selection-color: #ffffff; }}
+QDialog QListWidget, QDialog QTableWidget {{ background: rgba(0, 0, 0, 0.28); border: 1px solid rgba(255, 255, 255, 0.09); border-radius: 8px;
+    alternate-background-color: rgba(255, 255, 255, 0.035); }}
+QDialog QTreeView::item:selected, QDialog QTableView::item:selected {{ background: #2a2e39; color: #ffffff; }}
+QDialog QTreeView::item:hover {{ background: rgba(255, 255, 255, 0.05); }}
+QDialog QHeaderView::section {{ background: transparent; color: #9598a1; border: 0; border-bottom: 1px solid rgba(255, 255, 255, 0.09); padding: 7px 6px; }}
+QDialog QTableCornerButton::section {{ background: transparent; border: 0; }}
+QComboBox {{ combobox-popup: 0; }}
+QComboBoxPrivateContainer, QDialog QComboBoxPrivateContainer {{ background: #1c1c1e; border: 1px solid #38383c; margin: 0; padding: 0; }}
+QComboBox QAbstractItemView, QDialog QComboBox QAbstractItemView {{ background: #1c1c1e; border: 0; padding: 4px 0; outline: 0; color: #dbdbdb;
+    selection-background-color: #2a2e39; selection-color: #ffffff; }}
+QComboBox QAbstractItemView::item {{ min-height: 28px; padding: 0 10px; }}
+QComboBox QAbstractItemView::item:selected, QComboBox QAbstractItemView::item:hover {{ background: #2a2e39; color: #ffffff; }}
+QCalendarWidget QTableView {{ background: transparent; border: 0; border-radius: 0; alternate-background-color: transparent; }}
+QCalendarWidget QTableView::item:selected {{ background: #2962ff; color: #ffffff; }}
+QDateEdit::up-button, QDateEdit::down-button, QTimeEdit::up-button, QTimeEdit::down-button,
+QDateTimeEdit::up-button, QDateTimeEdit::down-button {{ width: 0; height: 0; border: 0; }}
 """

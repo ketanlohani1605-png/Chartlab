@@ -84,6 +84,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, settings: QtCore.QSettings | None = None):
         super().__init__()
         from . import __version__
+        from . import gcguard
+        gcguard.install()                             # garbage is collected on this thread only (see gcguard)
         self.version = __version__
         self.setWindowTitle(f"ChartLab {__version__}")      # so it is always clear which build is running
         self.setUnifiedTitleAndToolBarOnMac(True)
@@ -3606,6 +3608,20 @@ def selftest() -> int:
     tick = p.on_tick(px, None) == "same" and abs(float(p.df["Close"].iloc[-1]) - px) < 1e-6
     print(f"live: websockets={ws} tls={tls} tick={tick}", flush=True)
     ok = ok and ws and tls and tick
+    # Python's own HTTPS (the Dhan API, brokers, Yahoo's live price): it needs certificates inside the built app
+    import ssl
+    try:
+        cas = int(ssl.create_default_context().cert_store_stats().get("x509_ca", 0))
+    except Exception:  # noqa: BLE001
+        cas = 0
+    print(f"https: certificates={cas} from={datamod.CERTS or 'nowhere'}", flush=True)
+    ok = ok and cas > 20
+    try:                                                  # (told, not required: the build machine may be offline)
+        import time as _time
+        q = live.yahoo_quote("RELIANCE.NS", timeout=6)
+        print(f"yahoo live: price={q['price']} age={_time.time() - q['time']:.0f}s", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"yahoo live: not reachable from here ({str(e)[:120]})", flush=True)
     # the data store: the built app must be able to write and read its files (parquet) and to hand back history
     kept = False
     try:
@@ -3708,4 +3724,16 @@ def quit_cleanly(win, rc: int = 0, exit_process: bool = True):
         except Exception:  # noqa: BLE001
             pass
     if exit_process:
+        if sys.platform == "win32":
+            # Windows' ordinary exit runs every DLL's shutdown code, and one of them crashes when worker threads were
+            # cut off mid-flight (the build's self-test said OK and then died with an access violation). Ending the
+            # process outright skips that code.
+            try:
+                import ctypes
+                k = ctypes.windll.kernel32
+                k.GetCurrentProcess.restype = ctypes.c_void_p
+                k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                k.TerminateProcess(k.GetCurrentProcess(), int(rc) & 0xFFFFFFFF)
+            except Exception:  # noqa: BLE001
+                pass
         os._exit(rc)
