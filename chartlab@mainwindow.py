@@ -3474,14 +3474,26 @@ def selftest() -> int:
     return 0 if ok else 1
 
 
+def app_icon_path():
+    """The picture for the Dock / taskbar while the app runs. On a Mac every app's picture sits inside a margin
+    (Apple's icon grid: an 824 body in a 1024 square), so the Mac one is the padded picture - the plain logo fills
+    the whole tile and looks a size bigger than its neighbours in the Dock."""
+    names = ("icon_mac.png", "logo.png") if sys.platform == "darwin" else ("logo.png",)
+    for n in names:
+        p = datamod.ROOT / "assets" / n
+        if p.exists():
+            return p
+    return None
+
+
 def main():
     _setup_logging()
     theme.apply_pg_config()
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle(theme.make_style())
     app.setApplicationName("ChartLab")
-    _ic = datamod.ROOT / "assets" / "logo.png"
-    if _ic.exists():
+    _ic = app_icon_path()
+    if _ic is not None:
         app.setWindowIcon(QtGui.QIcon(str(_ic)))
     theme.check_icon_path()                       # tick / chevron images the style sheet points at
     app.setStyleSheet(theme.STYLESHEET)
