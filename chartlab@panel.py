@@ -69,6 +69,18 @@ class ChartPanel(QtWidgets.QFrame):
         self.chart.drawingsChanged.connect(lambda: self.drawingsChanged.emit(self))
         self.chart.toolChanged.connect(lambda t: self.toolChanged.emit(self, t))
         self.set_active(False)
+        # TradingView: scroll to the oldest bar and the older history comes in front of it
+        self._older_job = None
+        self._older_tried: set = set()
+        self._older_timer = QtCore.QTimer(self)
+        self._older_timer.setSingleShot(True)
+        self._older_timer.setInterval(250)
+        self._older_timer.timeout.connect(self.maybe_older)
+        self.chart.price.vb.sigXRangeChanged.connect(lambda *_: self._older_timer.start())
+        from .fx import EmptyState, LoadBar
+        self.loadbar = LoadBar(self)                         # the thin line that runs while bars are on their way
+        self.empty = EmptyState(self.chart)                  # ... and what a chart says when they did not come
+        self.empty.retry.connect(self._retry)
 
     multi = False
 
@@ -77,8 +89,8 @@ class ChartPanel(QtWidgets.QFrame):
         if not self.multi:
             self.setStyleSheet("ChartPanel { border: 0; }")
         else:
-            col = "#d1d4dc" if on else theme.BORDER
-            self.setStyleSheet(f"ChartPanel {{ border: 1px solid {col}; }}")
+            col = theme.ACCENT if on else "#262626"           # the chart you work on: a blue edge
+            self.setStyleSheet(f"ChartPanel {{ border: 1px solid {col}; border-radius: 4px; }}")
 
     @property
     def symbol_key(self) -> str:
@@ -119,6 +131,105 @@ class ChartPanel(QtWidgets.QFrame):
                                "and access token. (Yahoo has no NSE option prices.)")
         raise RuntimeError("  |  ".join(str(x)[:160] for x in errors))
 
+    OLDER = {"5d": "1mo", "1mo": "3mo", "3mo": "6mo", "6mo": "1y", "1y": "2y", "2y": "5y", "5y": "10y", "10y": "max"}
+    OLDER_EDGE = 3.0                   # bars: the oldest bar this close to the left edge of the view
+
+    def _older_range(self) -> str | None:
+        """The next longer history this chart can still get, or None (Yahoo: intraday bars only go back so far -
+        29 days of 1-minute bars, 60 of 5-minute, two years of hours - and that much is loaded already)."""
+        prm = self.params
+        iv, rng = str(prm.get("interval", "")), str(prm.get("range", ""))
+        now = datamod.clamp_period(iv, rng)
+        nxt = self.OLDER.get(rng)
+        while nxt is not None and datamod.clamp_period(iv, nxt) == now:
+            nxt = self.OLDER.get(nxt)
+        return nxt
+
+    def maybe_older(self) -> bool:
+        """The oldest bar came into view: fetch the next longer history and put it in front (the bars on screen and
+        the drawings stay where they are). False when there is nothing to do."""
+        ch, prm = self.chart, self.params
+        if (self.loading or self.df is None or len(self.df) < 20 or self._older_job is not None
+                or ch.replay["active"] or ch._limit is not None):
+            return False
+        if prm.get("source") not in ("yahoo", "auto") or self._is_option(prm.get("symbol", "")):
+            return False
+        if ch.price.vb.viewRange()[0][0] > self.OLDER_EDGE:
+            return False
+        nxt = self._older_range()
+        key = (str(prm.get("symbol", "")).upper(), str(prm.get("interval", "")), nxt)
+        if nxt is None or key in self._older_tried:
+            return False
+        self._older_tried.add(key)
+        sym, iv, src = prm["symbol"], prm["interval"], prm["source"]
+        from . import store
+        from . import timeframes as TF
+        stored = store.active()
+
+        def kept(loader):                                     # (as load(): the store keeps what comes)
+            if not stored:
+                return loader
+
+            def run(s, i, r):
+                d, lab = loader(s, i, r)
+                return (d, lab) if str(lab).endswith("my data") else store.keep(s, i, r, d, lab)
+            return run
+        if src == "auto":
+            fn = lambda: TF.load(kept(self._load_auto), sym, iv, nxt)  # noqa: E731
+        elif stored:
+            fn = lambda: TF.load(kept(datamod.load_yahoo), sym, iv, nxt, TF.YAHOO, TF.YAHOO)  # noqa: E731
+        else:
+            fn = lambda: datamod.load_yahoo(sym, iv, nxt)  # noqa: E731
+        job = LoadWorker(fn, self)
+        job.done.connect(lambda df, label, k=key: self._older_in(df, label, k))
+        job.failed.connect(lambda _m: setattr(self, "_older_job", None))
+        self._older_job = job
+        self.loadbar.start()
+        job.finished.connect(self.loadbar.stop)
+        job.start()
+        return True
+
+    def _older_in(self, df, label, key):
+        self._older_job = None
+        old, ch, prm = self.df, self.chart, self.params
+        if (old is None or df is None or not len(df) or self.loading or ch.replay["active"]
+                or (str(prm.get("symbol", "")).upper(), str(prm.get("interval", ""))) != key[:2]):
+            return                                            # another symbol / interval meanwhile
+        try:
+            older = df[df.index < old.index[0]]
+            older = older[[c for c in old.columns if c in older.columns]]
+        except Exception:  # noqa: BLE001 - bars of another kind
+            return
+        prm["range"] = key[2]                                 # (the next scroll asks for the one after)
+        if not len(older):
+            return
+        new = pd.concat([older, old])
+        new.attrs.update(getattr(old, "attrs", {}) or {})
+        added = len(older)
+        (x0, x1), auto_y = ch.price.vb.viewRange()[0], ch.auto_y
+        yr = ch.price.vb.viewRange()[1]
+        drawings, sel = ch.layer.to_json(), ch.layer.selected
+        self.df = new
+        self.result, self.signals = None, None
+        ch.set_data(new, self.label)
+        ch.layer.load_json(drawings)
+        ch.layer.selected = sel
+        ch.price.setXRange(x0 + added, x1 + added, padding=0)
+        ch.auto_y = auto_y
+        if auto_y:
+            ch._autoscale()
+        else:
+            ch.price.setYRange(yr[0], yr[1], padding=0)
+        self.changed = True
+        self.refreshed.emit(self)
+
+    def _retry(self):
+        prm = self.params
+        self.empty.hide()
+        if prm.get("symbol"):
+            self.load(prm.get("source", "yahoo"), prm["symbol"], prm.get("interval", "1d"), prm.get("range", "2y"),
+                      prm.get("path", ""))
+
     def refresh(self) -> bool:
         """Quietly fetch the same symbol again (live / daily auto update). The view, drawings and zoom stay put;
         nothing happens on screen unless new bars or a changed last bar arrive."""
@@ -132,6 +243,8 @@ class ChartPanel(QtWidgets.QFrame):
         return True
 
     def load(self, source: str, symbol: str, interval: str, rng: str, path: str = "", quiet: bool = False):
+        if not quiet:
+            self._older_tried = set()                         # (a fresh chart may scroll back again)
         self._prev_params = dict(self.params)
         self.params = {"source": source, "symbol": symbol, "interval": interval, "range": rng, "path": path}
         from . import store
@@ -186,6 +299,7 @@ class ChartPanel(QtWidgets.QFrame):
         self._quiet = quiet
         if not quiet:
             self.chart.header.setText(f"Loading {symbol} …")
+            self.loadbar.start()
             self.loadStarted.emit(self)
         early = None
         if self._is_option(symbol):
@@ -258,6 +372,8 @@ class ChartPanel(QtWidgets.QFrame):
         if self._stale():
             return
         self.loading = False
+        self.loadbar.stop()
+        self.empty.hide()
         if getattr(self, "_quiet", False) and self.df is not None:
             self._quiet = False
             self.load_event.set()
@@ -420,19 +536,25 @@ class ChartPanel(QtWidgets.QFrame):
         if self._stale():
             return
         self.loading = False
+        self.loadbar.stop()
         if getattr(self, "_quiet", False):                 # a background refresh that failed: keep the chart as is
             self._quiet = False
             self.load_event.set()
             return
         self.last_error = msg
+        from .fx import human
+        failed_sym = str(self.params.get("symbol", "") or "")
         if self.df is not None:
             self.params = getattr(self, "_prev_params", self.params)   # keep describing what is on screen
             self.chart._update_header(len(self.df) - 1)
         else:
             self.chart.header.setText("Could not load data")
-        short = msg if len(msg) < 160 else msg[:157] + "\u2026"
+        short = human(msg)
+        short = short if len(short) < 160 else short[:157] + "\u2026"
         self.chart.header.setText(
             f"<span style='color:{theme.DOWN}'>\u26a0 {short}</span> &nbsp; "
             f"<span style='color:{theme.MUTED}'>{self.chart.label}</span>")
+        if self.df is None:                                  # nothing to show: say so in the middle, with a way on
+            self.empty.show_error(failed_sym, msg)
         self.load_event.set()
         self.loadFailed.emit(self, msg)

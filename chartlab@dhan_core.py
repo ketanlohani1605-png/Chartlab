@@ -14,6 +14,21 @@ INDEX_IDS = {"NIFTY": "13", "NIFTY50": "13", "BANKNIFTY": "25", "NIFTYBANK": "25
              "SENSEX": "51", "MIDCPNIFTY": "442"}
 
 
+def _all_index_ids() -> None:
+    """Every index Dhan has a security id for, under each name it is typed by (chartlab/indices.py: NIFTYIT 29,
+    NIFTYAUTO 14, NIFTYPVTBANK 15 ... from Dhan's scrip master)."""
+    try:
+        from . import indices as _ix
+        for k, ix in _ix._BY.items():
+            if ix.dhan:
+                INDEX_IDS.setdefault(k, ix.dhan)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_all_index_ids()
+
+
 def _http(url: str, body: dict | None, headers: dict, timeout=30) -> bytes:
     req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json", **headers},

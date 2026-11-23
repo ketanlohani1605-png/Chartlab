@@ -30,6 +30,7 @@ MENU_BLUR = 11.0
 MENU_SATURATE = 0.25
 MENU_RADIUS = 6.0
 SCRIM = (26, 26, 26, 102)          # rgba(26,26,26,0.4): the window behind the symbol search
+CATCH = (0, 0, 0, 3)               # an overlay without dimming: not seen, but it takes the click that closes it
 HEADER = 60                        # height of a card's header
 TITLE_PX = 20
 FADE_MS = 200
@@ -106,6 +107,44 @@ def card_image(size: QtCore.QSize, dpr: float, backdrop: QtGui.QImage | None, at
     p.drawPath(edge)
     p.end()
     return img
+
+
+def paint_shadow(p: QtGui.QPainter, rect: QtCore.QRectF, radius: float):
+    """TradingView's card shadow, `0 0 2px #000, 0 3px 9px #000`, as rings that fade out (an overlay dialog has
+    no system shadow: it would trace the whole window)."""
+    import math
+    p.save()
+    p.setPen(QtCore.Qt.PenStyle.NoPen)
+    for dy, sigma, strength in ((3.0, 4.5, 0.55), (0.0, 1.0, 0.7)):
+        n = max(2, int(math.ceil(sigma * 2.6)))
+        prof = [strength * math.exp(-(d * d) / (2.0 * sigma * sigma)) for d in range(n + 1)]
+        for i in range(n, 0, -1):
+            a = max(0.0, prof[i - 1] - prof[i])
+            if a <= 0.002:
+                continue
+            r = rect.translated(0, dy).adjusted(-i, -i, i, i)
+            path = QtGui.QPainterPath()
+            path.addRoundedRect(r, radius + i, radius + i)
+            p.fillPath(path, QtGui.QColor(0, 0, 0, int(round(255 * a))))
+    p.restore()
+
+
+class _HostWatch(QtCore.QObject):
+    """Keeps an overlay dialog over its window when the window moves or changes size."""
+
+    def __init__(self, glass_):
+        super().__init__(glass_)
+        self.glass = glass_
+
+    def eventFilter(self, host, ev):
+        if ev.type() in (QtCore.QEvent.Type.Move, QtCore.QEvent.Type.Resize):
+            for w in list(self.glass._over_dialogs(host)):
+                try:
+                    self.glass._place_overlay(w, host)
+                    w.update()
+                except RuntimeError:
+                    pass
+        return False
 
 
 # ------------------------------------------------------------------ the dimmed window behind a dialog
@@ -241,11 +280,26 @@ class Glass(QtCore.QObject):
         self._timers: dict = {}
         self._fades: dict = {}
         self._dimmed: dict = {}      # id(dialog) -> Scrim it switched on
+        self._over: dict = {}        # id(overlay dialog) -> (dialog, host, the card's rect in it)
+        self._watch = _HostWatch(self)
+
+    def _over_dialogs(self, host):
+        return [d for d, h, _r in self._over.values() if h is host]
+
+    def card_rect(self, w) -> QtCore.QRect | None:
+        """Where an overlay dialog's card is (in the dialog); None for an ordinary card."""
+        hit = self._over.get(id(w))
+        return QtCore.QRect(hit[2]) if hit else None
 
     def eventFilter(self, w, ev):
         t = ev.type()
         E = QtCore.QEvent.Type
         try:
+            hit = self._over.get(id(w)) if t in (E.MouseButtonPress, E.MouseButtonDblClick, E.Wheel) else None
+            if hit is not None and not hit[2].contains(ev.position().toPoint()):
+                if t == E.MouseButtonPress and ev.button() == QtCore.Qt.MouseButton.LeftButton:
+                    w.reject()                              # a click beside the card closes it (TradingView)
+                return True                                 # (and nothing behind it scrolls)
             if t == E.Paint:
                 self._paint(w)
             elif t == E.Show:
@@ -294,15 +348,79 @@ class Glass(QtCore.QObject):
 
     def _paint(self, w):
         hit = self._card.get(id(w))
-        img = hit[1] if hit and hit[0] == w.size() else self._make(w)
+        img = hit[1] if hit and hit[0] == w.size() else (self._make_overlay(w) if id(w) in self._over
+                                                          else self._make(w))
         p = QtGui.QPainter(w)
         p.drawImage(0, 0, img)
         p.end()
+
+    # -- an overlay dialog: as big as its window, the card in the middle, the rest dims (and closes it when clicked)
+    def _place_overlay(self, w, host):
+        cs = w.property("_chromeCardSize")
+        if not isinstance(cs, QtCore.QSize) or cs.isEmpty():
+            cs = QtCore.QSize(w.size())
+            w.setProperty("_chromeCardSize", cs)
+        W, H = host.width(), host.height()
+        cw, ch = min(cs.width(), max(200, W - 16)), min(cs.height(), max(160, H - 16))
+        cx = max(0, (W - cw) // 2)
+        cy = max(8, (H - ch) // 2) if H - ch >= 16 else max(0, (H - ch) // 2)
+        top = w.property("chromeTop")                       # a dialog that sits near the top (quick search)
+        if isinstance(top, int) and top >= 0:
+            cy = max(0, min(top, H - ch))
+        card = QtCore.QRect(cx, cy, cw, ch)
+        w.setMinimumSize(0, 0)
+        w.setMaximumSize(16777215, 16777215)
+        w.setGeometry(QtCore.QRect(host.mapToGlobal(QtCore.QPoint(0, 0)), QtCore.QSize(W, H)))
+        lay = w.layout()
+        if lay is not None:
+            own = w.property("_chromeMargins")              # the dialog's own padding stays inside the card
+            if not isinstance(own, QtCore.QMargins):
+                own = QtCore.QMargins(lay.contentsMargins())
+                w.setProperty("_chromeMargins", own)
+            lay.setContentsMargins(cx + own.left(), cy + own.top(), W - cx - cw + own.right(),
+                                   H - cy - ch + own.bottom())
+        self._over[id(w)] = (w, host, card)
+        self._card.pop(id(w), None)
+
+    def _make_overlay(self, w):
+        _d, host, card = self._over[id(w)]
+        dpr = w.devicePixelRatioF()
+        back, at = None, None
+        try:
+            got = card.intersected(host.rect())
+            if got.width() > 8 and got.height() > 8:
+                back = frosted(host.grab(got))
+                at = got.topLeft() - card.topLeft()
+        except Exception:  # noqa: BLE001 - no backdrop then: a solid card
+            back = None
+        rad = w.property("chromeRadius")
+        rad = float(rad) if rad else RADIUS
+        cimg = card_image(card.size(), dpr, back, at, rad)
+        img = QtGui.QImage(max(1, int(w.width() * dpr)), max(1, int(w.height() * dpr)),
+                           QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(QtGui.QColor(*(SCRIM if w.property("chromeScrim") else CATCH)))
+        p = QtGui.QPainter(img)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        paint_shadow(p, QtCore.QRectF(card), rad)
+        p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_Source)   # the glass, not glass+dim
+        clip = QtGui.QPainterPath()
+        clip.addRoundedRect(QtCore.QRectF(card), rad, rad)
+        p.setClipPath(clip)
+        p.drawImage(card.topLeft(), cimg)
+        p.end()
+        self._card[id(w)] = (w.size(), img)
+        return img
 
     # -- life
     def _shown(self, w):
         self._card.pop(id(w), None)
         host = self._host(w)
+        if host is not None and w.property("chromeOverlay"):
+            self._place_overlay(w, host)
+            host.installEventFilter(self._watch)
+            w.setProperty("_chromePlaced", True)
+            w.setProperty("_chromeSized", True)
         if not w.property("_chromeLaid"):
             w.setProperty("_chromeLaid", True)
             # lists that laid their rows out while the content was being moved under the header did so at a
@@ -323,7 +441,7 @@ class Glass(QtCore.QObject):
                 x = g.x() + (g.width() - w.width()) // 2
                 y = g.y() + max(24, int((g.height() - w.height()) * 0.42))
                 w.move(x, y)
-        if host is not None and w.property("chromeScrim") and id(w) not in self._dimmed:
+        if host is not None and w.property("chromeScrim") and id(w) not in self._dimmed and id(w) not in self._over:
             self._make(w)                                   # look through the glass before the window dims
             s = scrim_of(host)                              # (TradingView dims the page only behind its symbol
             s.come()                                        # search; its other dialogs float on the chart as it is)
@@ -356,6 +474,12 @@ class Glass(QtCore.QObject):
             pass
 
     def _hidden(self, w):
+        hit = self._over.pop(id(w), None)
+        if hit is not None and not self._over_dialogs(hit[1]):
+            try:
+                hit[1].removeEventFilter(self._watch)
+            except RuntimeError:
+                pass
         s = self._dimmed.pop(id(w), None)
         if s is not None:
             try:
@@ -551,6 +675,8 @@ def dress(dlg) -> bool:
     own_frame = not bool(dlg.windowFlags() & QtCore.Qt.WindowType.FramelessWindowHint)
     plain = isinstance(dlg, QtWidgets.QMessageBox)          # it rebuilds its own layout: no header, just the card
     dlg.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint, True)
+    if dlg.property("chromeOverlay"):                       # (its card draws its own: the system's would trace the
+        dlg.setWindowFlag(QtCore.Qt.WindowType.NoDropShadowWindowHint, True)          # whole window)
     dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
     if plain:
         try:

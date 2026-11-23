@@ -166,6 +166,7 @@ def on_conn():
 srv.newConnection.connect(on_conn)
 
 w = MainWindow(QtCore.QSettings(str(tmp / "s.ini"), QtCore.QSettings.Format.IniFormat))
+w._chart_market_closed = lambda: False                       # (any hour: the badge tells the feed's state)
 w.resize(1500, 900)
 w.show()
 pump(100)

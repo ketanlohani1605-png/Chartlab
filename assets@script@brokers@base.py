@@ -582,6 +582,25 @@ INDEX_ALIASES = {
     "INDIAVIX": "INDIAVIX", "INDIA VIX": "INDIAVIX", "VIX": "INDIAVIX",
 }
 BSE_INDICES = {"SENSEX", "BANKEX", "SENSEX50"}
+
+
+def _more_index_aliases() -> None:
+    """Every index in chartlab/indices.py parses as an index under each of its names (NIFTY IT, CNXIT, NIFTYIT ...),
+    keeping the names above for the brokers' own lookups."""
+    try:
+        from .. import indices as _ix
+        for ix in _ix.INDICES:
+            for k in (ix.sym, ix.tv, *ix.aliases):
+                if k:
+                    INDEX_ALIASES.setdefault(k.upper(), ix.sym)
+                    INDEX_ALIASES.setdefault(k.upper().replace(" ", ""), ix.sym)
+            if ix.exchange == "BSE":
+                BSE_INDICES.add(ix.sym)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_more_index_aliases()
 MCX_NAMES = {"CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI", "GOLD", "GOLDM", "GOLDGUINEA", "GOLDPETAL", "GOLDTEN",
              "SILVER", "SILVERM", "SILVERMIC", "COPPER", "ZINC", "ZINCMINI", "ALUMINIUM", "ALUMINI", "LEAD", "LEADMINI",
              "NICKEL", "COTTONCNDY", "MENTHAOIL", "ELECDMBL"}
@@ -743,6 +762,23 @@ def lookup(m: pd.DataFrame, text: str, broker: str, index_names: dict | None = N
     if sp.kind == "IDX":
         want = (index_names or {}).get(sp.name, sp.name)
         cand = m[(m["kind"] == "IDX") & ((m["tsym"].str.upper() == str(want).upper()) | (m["name"] == str(want).upper()))]
+        if cand.empty:
+            # the broker writes it its own way ('NIFTY AUTO', 'Nifty Auto', 'NIFTY PVT BANK'): every name of the
+            # index, without spaces, against the list's names without spaces; Dhan by its security id
+            try:
+                from .. import indices as _ix
+                ix = _ix.get(sp.name)
+            except Exception:  # noqa: BLE001
+                ix = None
+            if ix is not None:
+                idx_rows = m[m["kind"] == "IDX"]
+                if str(broker).lower().startswith("dhan") and ix.dhan:
+                    cand = idx_rows[idx_rows["token"].astype(str) == ix.dhan]
+                if cand.empty:
+                    keys = {_ix._norm(k) for k in (ix.sym, ix.tv, ix.name, ix.name.replace(" Index", ""), *ix.aliases) if k}
+                    hit = idx_rows["tsym"].astype(str).map(_ix._norm).isin(keys) | \
+                        idx_rows["name"].astype(str).map(_ix._norm).isin(keys)
+                    cand = idx_rows[hit]
         if sp.exchange:
             c2 = cand[cand["exchange"] == sp.exchange]
             cand = c2 if len(c2) else cand

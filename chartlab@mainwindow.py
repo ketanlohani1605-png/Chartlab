@@ -42,6 +42,8 @@ RANGES = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
 from . import studies as STUDY
 INDICATORS = {k: STUDY.STUDIES[k].legend(STUDY.defaults(k)) + ("  —  separate pane" if STUDY.STUDIES[k].pane else "")
               for k in STUDY.KEYS}
+WATCH_LIVE_MS = 5000                     # watchlist rows: newest prices this often while the market is open
+MARKET_MS = 10000                        # the Market panel: this often
 LAYOUTS = {"1": "Single chart", "2h": "Two charts — side by side", "2v": "Two charts — stacked",
            "4": "Four charts"}
 LAYOUT_COUNT = {"1": 1, "2h": 2, "2v": 2, "4": 4}
@@ -86,6 +88,9 @@ class MainWindow(QtWidgets.QMainWindow):
         from . import __version__
         from . import gcguard
         gcguard.install()                             # garbage is collected on this thread only (see gcguard)
+        self._day_prevs: dict = {}                    # symbol -> previous session's close (legend's day change)
+        self._day_prev_asked: set = set()
+        self._day_prev_jobs: set = set()
         self.version = __version__
         self.setWindowTitle(f"ChartLab {__version__}")      # so it is always clear which build is running
         self.setUnifiedTitleAndToolBarOnMac(True)
@@ -111,15 +116,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_alerts_dock()
         self._build_data_dock()
         self._build_chain_dock()
+        self._build_market_dock()
         self._build_results_dock()
         self._build_trading()
         self._build_right_rail()
         self._build_menu()
-        hm = QtWidgets.QMenu(self)
-        for act in self.menuBar().actions():
-            if act.menu():
-                hm.addMenu(act.menu())
-        self.menu_btn.setMenu(hm)
+        self.menu_btn.setMenu(self._main_menu())
         # TradingView has no status bar: messages show as a small toast over the chart instead, and the live-feed /
         # Claude-link labels sit in the bottom bar next to the clock
         self.setStatusBar(QtWidgets.QStatusBar())
@@ -164,6 +166,7 @@ class MainWindow(QtWidgets.QMainWindow):
             p.loadStarted.connect(self._on_load_started)
             p.loadFinished.connect(self._on_loaded)
             p.loadFailed.connect(self._on_load_failed)
+            p.empty.search.connect(lambda p=p: (self.set_active(p), self.open_symbol_search("")))
             p.refreshed.connect(self._on_refreshed)
             p.drawingsChanged.connect(self._save_drawings)
             p.toolChanged.connect(lambda panel, tool: self._tool_changed(tool))
@@ -233,12 +236,13 @@ class MainWindow(QtWidgets.QMainWindow):
         gd.clicked.connect(self._goto_date)
         h.addWidget(gd)
         h.addStretch(1)
-        self.live_label = QtWidgets.QLabel("")                # live feed status, next to the clock
-        self.live_label.hide()
+        from .fx import LiveBadge
+        self.live_label = LiveBadge()                         # live feed status, next to the clock (its dot
+        self.live_label.hide()                                # breathes while prices stream in)
         self.api_label = QtWidgets.QLabel("")                 # Claude link: TradingView has no such text here -
         self.api_label.hide()                                 # its state is in the clock's tooltip instead
+        self.api_label.setStyleSheet("color:#b8b8b8; font-size:12px; padding-right:10px;")
         for lab in (self.live_label, self.api_label):
-            lab.setStyleSheet("color:#b8b8b8; font-size:12px; padding-right:10px;")
             h.addWidget(lab)
         self.clock = QtWidgets.QLabel("")
         self.clock.setStyleSheet("color:#b8b8b8; font-size:13px; padding-right:10px;")
@@ -247,15 +251,39 @@ class MainWindow(QtWidgets.QMainWindow):
         sep.setObjectName("vsep")
         sep.setFixedSize(1, 18)
         h.addWidget(sep)
-        adj = QtWidgets.QLabel("  ADJ")
-        adj.setToolTip("Prices are adjusted for splits / dividends")
-        adj.setStyleSheet("color:#b8b8b8; font-size:13px;")
+        # TradingView's ADJ: 'Adjust data for dividends' - off by default (prices adjusted for splits only)
+        adj = self.adj_btn = QtWidgets.QToolButton()
+        adj.setText("ADJ")
+        adj.setCheckable(True)
+        adj.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        adj.setStyleSheet("QToolButton{color:#787b86;font-size:13px;border:0;border-radius:4px;padding:2px 8px;"
+                          "background:transparent;} QToolButton:hover{background:#2a2a2a;color:#dbdbdb;}"
+                          f"QToolButton:checked{{color:{theme.ACCENT};}}")
+        on = self.settings.value("adj_dividends", "false") == "true"
+        adj.setChecked(on)
+        datamod.ADJUST_DIVIDENDS = on
+        self._adj_tip()
+        adj.toggled.connect(self.set_adjust_dividends)
         h.addWidget(adj)
         self._clock_timer = QtCore.QTimer(self)
         self._clock_timer.timeout.connect(self._tick_clock)
         self._clock_timer.start(1000)
         self._tick_clock()
         return bar
+
+    def _adj_tip(self):
+        on = self.adj_btn.isChecked()
+        self.adj_btn.setToolTip("Adjust data for dividends: " + ("on - prices before each dividend are lowered by it"
+                                if on else "off - prices are adjusted for splits only, as TradingView shows them"))
+
+    def set_adjust_dividends(self, on: bool):
+        """TradingView's ADJ button: prices adjusted for dividends too, or for splits only (its default)."""
+        datamod.ADJUST_DIVIDENDS = bool(on)
+        self.settings.setValue("adj_dividends", "true" if on else "false")
+        self._adj_tip()
+        for p in self.panels:                                   # every chart again, from the source
+            if p.df is not None and p.params.get("source") in ("yahoo", "auto"):
+                p.load(p.params["source"], p.params["symbol"], p.params["interval"], p.params["range"])
 
     @staticmethod
     def _tv_interval(text: str) -> str:
@@ -494,6 +522,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trade_dock.hide()
         self.trade_dock.visibilityChanged.connect(lambda on: on and self.trader.refresh())
         self.live.tickPrice.connect(self.trader.on_price)
+        self.live.tickPrice.connect(self._watch_live_tick)
         self.live.tickPrice.connect(self._ticket_price)
         self.live.feed.order.connect(lambda _d: self.trader.refresh())
         self.live.wanted_symbols = self._trade_symbols
@@ -660,6 +689,8 @@ class MainWindow(QtWidgets.QMainWindow):
         hh, mm = int(abs(off)), int(round((abs(off) % 1) * 60))
         zone = "UTC" if not (hh or mm) else f"UTC{sign}{hh}" + (f":{mm:02d}" if mm else "")   # TradingView: "UTC"
         self.clock.setText(f"{now:%H:%M:%S} {zone}")
+        if getattr(self, "_live_mode", None):
+            self._paint_live_badge()                          # the market opens / closes, another chart in front
 
     def _build_toolbar(self):
         tb = self.addToolBar("Data")
@@ -698,11 +729,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.symbol.returnPressed.connect(self.on_load)
         self.symbol.setVisible(False)
         self._symbol_model = QtCore.QStringListModel(self._suggestions())
-        # TradingView's pill (measured): 128 x 28, #303030, radius 14; the symbol 12 px from the left in 14 px / 600
-        # #b8b8b8; inside it on the right a 32 x 28 'Switch data type' button with an 18 px icon
+        # TradingView's pill (measured): 28 high, #303030, radius 14; the symbol 12 px from the left in 14 px / 600
+        # #b8b8b8, then 34 px for the 32 x 28 'Switch data type' button with an 18 px icon - as wide as the symbol
+        # needs (RELIANCE: 128 px; nothing is cut short)
         pill = QtWidgets.QFrame()
         pill.setObjectName("symbolpill")
         pill.setFixedSize(128, 28)
+        self.sym_pill = pill
         ph = QtWidgets.QHBoxLayout(pill)
         ph.setContentsMargins(0, 0, 0, 0)
         ph.setSpacing(0)
@@ -937,17 +970,30 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.run_btn)
         tb.addWidget(self._gap(4))
 
+    PILL_PAD = (12, 34)                 # TradingView: padding 0 34px 0 12px around the symbol
+    PILL_MAX = 260                      # (a very long name - an option contract - is cut with '...' here)
+
     def _set_pill_text(self, text: str):
-        """The symbol in the pill, cut with '\u2026' when it does not fit (the pill keeps TradingView's 128 px)."""
+        """The symbol in the pill, which is as wide as the symbol needs (TradingView: 'RELIANCE' 128 px,
+        'BANKNIFTY' wider); only a name longer than the widest pill is cut with '\u2026'."""
         b = getattr(self, "sym_btn", None)
         if b is None:
             return
         f = QtGui.QFont(b.font())
         f.setPixelSize(14)
         f.setWeight(QtGui.QFont.Weight.DemiBold)
-        room = 128 - 12 - 32 - 4
-        b.setText(QtGui.QFontMetrics(f).elidedText(text, QtCore.Qt.TextElideMode.ElideRight, room))
+        fm = QtGui.QFontMetrics(f)
+        pad = sum(self.PILL_PAD)
+        shown = fm.elidedText(text, QtCore.Qt.TextElideMode.ElideRight, self.PILL_MAX - pad)
+        b.setText(shown)
         b.setToolTip(f"{text} \u2014 Symbol Search  (just start typing on the chart)")
+        pill = getattr(self, "sym_pill", None)
+        if pill is not None:
+            w = min(self.PILL_MAX, pad + fm.horizontalAdvance(shown) + 2)
+            if pill.width() != w:
+                pill.setFixedWidth(w)
+                if hasattr(self, "run_btn"):
+                    self._fit_topbar()
 
     def _sync_src_btn(self):
         if hasattr(self, "src_btn"):
@@ -1245,9 +1291,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setFixedWidth(49)                                  # TradingView: 45 px + the 4 px gutter
         tb.setIconSize(QtCore.QSize(28, 28))
         self.addToolBar(QtCore.Qt.ToolBarArea.RightToolBarArea, tb)
-        self.right_docks = [self.watch_dock, self.alerts_dock, self.strategy_dock, self.data_dock, self.chain_dock]
+        self.right_docks = [self.watch_dock, self.market_dock, self.alerts_dock, self.strategy_dock, self.data_dock,
+                            self.chain_dock]
         self.rail_actions = {}
         for dock, ico, tip in ((self.watch_dock, "watchlist", "Watchlist"),
+                               (self.market_dock, "market", "Market: NIFTY 50 gainers, losers, heatmap"),
                                (self.alerts_dock, "bell", "Alerts"),
                                (self.strategy_dock, "code", "Python strategy editor"),
                                (self.data_dock, "datawin", f"Data window  ({theme.sc('Alt+D')})"),
@@ -1292,6 +1340,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.data_dock)
         self.data_dock.hide()
 
+    def _build_market_dock(self):
+        """Market: the NIFTY 50's gainers, losers and heatmap (click one: its chart)."""
+        from .market import MarketPanel
+        self.market = MarketPanel()
+        self.market.chosen.connect(self.open_symbol)
+        self.market_dock = QtWidgets.QDockWidget("Market", self)
+        self.market_dock.setObjectName("market_dock")
+        self.market_dock.setWidget(self.market)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.market_dock)
+        self.market_dock.hide()
+        self.market_dock.visibilityChanged.connect(lambda on: on and QtCore.QTimer.singleShot(
+            200, lambda: self._market_poll(force=True)))
+        self._market_timer = QtCore.QTimer(self)
+        self._market_timer.timeout.connect(self._market_poll)
+        self._market_timer.start(MARKET_MS)
+
+    def _market_poll(self, force: bool = False):
+        """Fresh prices for the Market panel while it is on screen: every few seconds in market hours, once when
+        it opens otherwise."""
+        import os as _os
+        from .live import market_open
+        if _os.environ.get("CHARTLAB_OFFLINE") or not self.market_dock.isVisible() or not self.isVisible():
+            return
+        if force or market_open() or not self.market.data:
+            self.market.refresh()
+
     def _build_chain_dock(self):
         from .live import LiveController
         from .optionchain import OptionChain
@@ -1328,27 +1402,55 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live.sync()
         if not on:
             self.live_label.hide()
+            self._live_mode, self._badge_state = None, None
 
     def _live_status(self, mode: str, detail: str):
-        lab = self.live_label
-        text, col = {"live": ("\u25cf Live", theme.UP), "polling": ("\u25cf Live (1.5 s)", "#f7a600"),
-                     "yahoo": ("\u25cf Live (3 s)", "#f7a600"),
-                     "connecting": ("\u25cb Connecting\u2026", theme.MUTED),
-                     "error": ("\u25cf Live prices off", theme.DOWN)}.get(mode, ("", theme.MUTED))
-        lab.setVisible(bool(text))
-        lab.setText(text + "  ")
-        lab.setStyleSheet(f"color:{col};")
-        bn = self.live.feed.broker_name if hasattr(self, "live") else "the broker"
-        tip = {"live": f"Real-time prices from {bn}'s live market feed: every trade moves the chart.",
-               "polling": f"Prices are fetched from {bn} every 1.5 seconds (the live socket is not connected).",
-               "yahoo": "The candle follows Yahoo's newest price, checked every 3 seconds. Yahoo can be delayed for "
-                        "some exchanges and is not tick by tick: log in a broker account (Accounts) for real-time prices.",
-               "connecting": f"Connecting to {bn}'s live market feed\u2026",
-               "error": "Live prices are not running: " + (detail or "")}.get(mode, "")
-        lab.setToolTip(tip)
+        self._live_mode = (mode, detail)
+        self._badge_state = None                              # a new state from the feed: always drawn
+        self._paint_live_badge()
         if mode == "error" and detail and getattr(self, "_live_err", "") != detail:
             self.statusBar().showMessage("Live prices: " + detail, 9000)
         self._live_err = detail if mode == "error" else ""
+
+    def _chart_market_closed(self) -> bool:
+        """True while the market of the chart in front is closed (NSE / BSE / US hours; crypto never closes)."""
+        p = self.active
+        if p is None or p.params.get("source") == "file":
+            return False
+        try:
+            from .watchlist import market_state
+            return market_state(str(p.params.get("symbol", "")))[0] == "closed"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _paint_live_badge(self):
+        """The bottom bar's live dot. While the chart's market is closed nothing streams, so it says so (grey, still)
+        instead of 'Live (3 s)'; checked again every second, so it turns live at 09:15 by itself."""
+        mode, detail = getattr(self, "_live_mode", ("", ""))
+        bn = self.live.feed.broker_name if hasattr(self, "live") else "the broker"
+        if mode in ("live", "polling", "yahoo") and self._chart_market_closed():
+            state = ("Market closed", theme.MUTED, False, False, False,
+                     "This chart's market is closed: the chart shows the last session. Prices move again by "
+                     "themselves when it opens (NSE / BSE 09:15 IST).")
+        else:
+            text, col = {"live": ("Live", theme.UP), "polling": ("Live (1.5 s)", "#f7a600"),
+                         "yahoo": ("Live (3 s)", "#f7a600"),
+                         "connecting": ("Connecting\u2026", theme.MUTED),
+                         "error": ("Live prices off", theme.DOWN)}.get(mode, ("", theme.MUTED))
+            tip = {"live": f"Real-time prices from {bn}'s live market feed: every trade moves the chart.",
+                   "polling": f"Prices are fetched from {bn} every 1.5 seconds (the live socket is not connected).",
+                   "yahoo": "The candle follows Yahoo's newest price, checked every 3 seconds. Yahoo can be delayed "
+                            "for some exchanges and is not tick by tick: log in a broker account (Accounts) for "
+                            "real-time prices.",
+                   "connecting": f"Connecting to {bn}'s live market feed\u2026",
+                   "error": "Live prices are not running: " + (detail or "")}.get(mode, "")
+            state = (text, col, mode in ("live", "polling", "yahoo"), mode == "connecting", mode == "error", tip)
+        if state == getattr(self, "_badge_state", None):
+            return
+        self._badge_state = state
+        text, col, breathe, ring, loud, tip = state
+        self.live_label.set_state(text, col, breathe=breathe, ring=ring, loud=loud)
+        self.live_label.setToolTip(tip)
 
     def on_live_price(self, panel, ltp: float, new_bar: bool):
         """A live trade reached a chart: alerts fire at once; a freshly opened bar is checked against the broker's
@@ -1411,6 +1513,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.watchlist = WatchlistWidget()
         self.watchlist.symbolChosen.connect(self._watchlist_chosen)
         self.watchlist.changed.connect(self._save_watchlist)
+        self.watchlist.sortChanged.connect(lambda spec: self.settings.setValue("watch_sort", spec))
         self.watchlist.changed.connect(lambda: self.live_sync())
         self.watchlist.addRequested.connect(self._watchlist_add_search)
         self.watch_dock = QtWidgets.QDockWidget("Watchlist", self)
@@ -1478,6 +1581,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_results_dock(self):
         self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)   # (not the #222 gutter)
         # Overview: TradingView's headline numbers + equity curve
         ov = QtWidgets.QWidget()
         ovl = QtWidgets.QVBoxLayout(ov)
@@ -1497,7 +1601,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cards.addStretch(1)
         ovl.addLayout(cards)
         self.equity_axis = DateAxis("bottom")
-        self.equity_plot = pg.PlotWidget(axisItems={"bottom": self.equity_axis})
+        self.equity_plot = pg.PlotWidget(axisItems={"bottom": self.equity_axis, "right": _MoneyAxis("right")})
         self.equity_plot.setBackground(theme.BG)
         self.equity_plot.showGrid(x=False, y=True, alpha=0.15)
         self.equity_plot.hideButtons()
@@ -1508,9 +1612,21 @@ class MainWindow(QtWidgets.QMainWindow):
             ax = self.equity_plot.getAxis(a)
             ax.setTextPen(pg.mkPen("#b2b5be"))
             ax.setPen(pg.mkPen("#2a2a2a"))
-        self.equity_plot.addLegend(offset=(10, 6), labelTextColor="#b2b5be", brush=pg.mkBrush(0, 0, 0, 0),
-                                   pen=pg.mkPen(None))
-        ovl.addWidget(self.equity_plot, 1)
+        self.equity_plot.addLegend(offset=(10, 6), labelTextColor="#b2b5be", brush=pg.mkBrush(0, 0, 0, 200),
+                                   pen=pg.mkPen(None))       # (the curves pass under it, not through the words)
+        from .fx import EmptyHint, Placeholder
+        # before the first run: what will be here and how to get it, not an empty plot with a 0.2 - 0.8 scale
+        self.ov_empty = Placeholder(
+            "code", "No backtest yet",
+            "Pick a template or write your rules in the Strategy editor, then press "
+            f"<b style='color:#dbdbdb'>Run</b> ({theme.sc('Ctrl+Return')}): the equity curve and every trade "
+            "appear here.",
+            (("Run backtest", lambda: self.run_backtest()),
+             ("Open Strategy editor", lambda: self.show_right_panel(self.strategy_dock))), compact=True)
+        self.ov_stack = QtWidgets.QStackedWidget()
+        self.ov_stack.addWidget(self.ov_empty)
+        self.ov_stack.addWidget(self.equity_plot)
+        ovl.addWidget(self.ov_stack, 1)
         self.tabs.addTab(ov, "Overview")
         self._clear_overview()
 
@@ -1521,6 +1637,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.summary.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.summary.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.summary.setShowGrid(False)
+        self._summary_hint = EmptyHint(self.summary, "Run a backtest to see its full performance summary here.")
         self.tabs.addTab(self.summary, "Performance Summary")
 
         cols = ["#", "Type", "Signal", "Entry time", "Exit time", "Entry", "Exit", "Qty", "P&L", "P&L %",
@@ -1542,6 +1659,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trades_tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.trades_tbl.setAlternatingRowColors(True)
         self.trades_tbl.cellClicked.connect(self._trade_clicked)
+        self._trades_hint = EmptyHint(self.trades_tbl, "No trades yet. Every entry and exit of a backtest is listed "
+                                                       "here; click one to see it on the chart.")
         self.tabs.addTab(self.trades_tbl, "List of Trades")
 
         self.log_view = QtWidgets.QPlainTextEdit()
@@ -1554,12 +1673,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
         # TradingView: one side panel at a time, chosen from the right icon rail; no tabs
         self.watch_dock.setTitleBarWidget(QtWidgets.QWidget())          # the watchlist draws its own header
+        self.market_dock.setTitleBarWidget(QtWidgets.QWidget())         # ... and so does the Market panel
         for d, title in ((self.strategy_dock, "Strategy (Python)"), (self.alerts_dock, "Alerts"),
                          (self.data_dock, "Data window"), (self.chain_dock, "Option chain")):
             lab = QtWidgets.QLabel(title)
             lab.setObjectName("panelTitle")
             d.setTitleBarWidget(lab)
-        for d in (self.watch_dock, self.strategy_dock, self.alerts_dock, self.data_dock, self.chain_dock):
+        for d in (self.watch_dock, self.market_dock, self.strategy_dock, self.alerts_dock, self.data_dock,
+                  self.chain_dock):
             d.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
             d.setMinimumWidth(340)
         self.chain_dock.setMinimumWidth(430)                 # seven columns need a little more room
@@ -1605,6 +1726,7 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addAction("Performance test", self.perf_test)
         v.addAction("Reset layout", self.reset_layout)
         v.addAction("Watchlist", lambda: self.show_right_panel(self.watch_dock))
+        v.addAction("Market (NIFTY 50)", lambda: self.show_right_panel(self.market_dock))
         v.addAction("Alerts", lambda: self.show_right_panel(self.alerts_dock))
         v.addAction("Strategy editor", lambda: self.show_right_panel(self.strategy_dock))
         v.addAction("Data window\t" + theme.sc("Alt+D"), lambda: self.show_right_panel(self.data_dock))
@@ -1615,8 +1737,81 @@ class MainWindow(QtWidgets.QMainWindow):
         c = mb.addMenu("Claude")
         c.addAction("Connect to Claude…", self.show_connect_dialog)
 
+    def _main_menu(self) -> QtWidgets.QMenu:
+        """The ☰ menu: the app and its version on top, the things people look for most, then File / Strategy /
+        View / Claude, then Quit."""
+        hm = QtWidgets.QMenu(self)
+        hm.setObjectName("mainMenu")
+        head = QtWidgets.QWidget()
+        head.setObjectName("menuHead")
+        head.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        head.setStyleSheet("QWidget#menuHead{background:transparent;}")
+        hl = QtWidgets.QHBoxLayout(head)
+        hl.setContentsMargins(14, 6, 16, 8)
+        hl.setSpacing(10)
+        logo = QtWidgets.QLabel()
+        ic = QtWidgets.QApplication.windowIcon()
+        if ic.isNull():
+            ic = icons.get("market", theme.ACCENT, 28)
+        logo.setPixmap(ic.pixmap(28, 28))
+        logo.setFixedSize(28, 28)
+        logo.setStyleSheet("background:transparent;")
+        hl.addWidget(logo)
+        txt = QtWidgets.QLabel(f"<span style='color:#ffffff;font-size:14px;font-weight:600'>ChartLab</span><br>"
+                               f"<span style='color:#787b86;font-size:11px'>Version {self.version}</span>")
+        txt.setStyleSheet("background:transparent;")
+        hl.addWidget(txt, 1)
+        wa = QtWidgets.QWidgetAction(hm)
+        wa.setDefaultWidget(head)
+        wa.setEnabled(False)
+        hm.addAction(wa)
+        hm.addSeparator()
+        hm.addAction("Settings…\t" + theme.sc("Ctrl+,"), self.open_settings)
+        hm.addAction("Keyboard shortcuts\t" + theme.sc("Ctrl+/"), self.show_shortcuts)
+        hm.addAction("Quick search\t" + theme.sc("Ctrl+K"), self.quick_search)
+        hm.addAction("Check for updates…", self.open_updates)
+        hm.addAction("What’s new", self.show_whats_new)
+        hm.addSeparator()
+        for act in self.menuBar().actions():
+            if act.menu():
+                hm.addMenu(act.menu())
+        hm.addSeparator()
+        hm.addAction("Quit ChartLab\t" + theme.sc("Ctrl+Q"), self.close)
+        self.main_menu = hm
+        return hm
+
+    def show_whats_new(self):
+        """What this version brings (the card that shows once after an update)."""
+        from .whatsnew import WhatsNew, notes_for
+        if not notes_for(self.version):
+            self.statusBar().showMessage(f"ChartLab {self.version}", 3000)
+            return
+        WhatsNew(self, self.version).exec()
+        self.focus_chart()
+
+    def maybe_whats_new(self):
+        """Once after an update: what is new (not on a first install - nothing is new yet - and never twice)."""
+        st = self.settings
+        seen = str(st.value("seen_version", "") or "")
+        existing = st.contains("geometry") or st.contains("watchlist")
+        st.setValue("seen_version", self.version)
+        if seen == self.version or (not seen and not existing):
+            return False
+        from .whatsnew import notes_for
+        if not notes_for(self.version):
+            return False
+        self.show_whats_new()
+        return True
+
+    def show_shortcuts(self):
+        """Every keyboard shortcut, grouped and searchable (Ctrl+/ or Cmd+/)."""
+        from .tvui import ShortcutsDialog
+        ShortcutsDialog(self, self.quick_actions()).exec()
+        self.focus_chart()
+
     def _shortcuts(self):
         QtGui.QShortcut(QtGui.QKeySequence("Escape"), self, activated=self._escape)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+/"), self, activated=self.show_shortcuts)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self, activated=lambda: self.active.chart.layer.undo())
         for k in ("Ctrl+Shift+Z", "Ctrl+Y"):
             QtGui.QShortcut(QtGui.QKeySequence(k), self, activated=lambda: self.active.chart.layer.redo())
@@ -1776,21 +1971,25 @@ class MainWindow(QtWidgets.QMainWindow):
         add("Save chart image", "Chart", self.save_chart_image, "Ctrl+Alt+S")
         add("Remove all drawings", "Drawing tool", lambda: ch.layer.clear())
         add("Hide / show drawings", "Drawing tool", lambda: ch.layer.set_hidden(not ch.layer.hidden), "Ctrl+Alt+H")
-        for dock, text in ((self.watch_dock, "Watchlist"), (self.alerts_dock, "Alerts panel"),
+        for dock, text in ((self.watch_dock, "Watchlist"), (self.market_dock, "Market: NIFTY 50 movers & heatmap"),
+                           (self.alerts_dock, "Alerts panel"),
                            (self.strategy_dock, "Strategy editor"), (self.data_dock, "Data window"),
                            (self.chain_dock, "Option chain")):
             add(text, "Panel", lambda d=dock: self.show_right_panel(d), "Alt+D" if dock is self.data_dock else "",
                 dock.isVisible())
         add("Strategy Tester", "Panel", lambda: self.results_dock.setVisible(not self.results_dock.isVisible()), "",
             self.results_dock.isVisible())
-        add("Run strategy / backtest", "Strategy", self.run_backtest, "Cmd+Enter")
+        add("Run strategy / backtest", "Strategy", self.run_backtest, "Ctrl+Return")
         add("Remove strategy from chart", "Strategy", self.remove_strategy)
         add("Backtest settings", "Strategy", self.show_bt_settings)
         add("Open strategy file", "Strategy", self.open_strategy)
-        add("Save strategy file", "Strategy", self.save_strategy, "Cmd+S")
+        add("Save strategy file", "Strategy", self.save_strategy, "Ctrl+S")
         add("Manage broker accounts", "Accounts", self.manage_accounts)
         add("Run script on multiple accounts", "Accounts", self.run_on_accounts)
-        add("Open data file", "Data", self.open_data_file, "Cmd+O")
+        add("Open data file", "Data", self.open_data_file, "Ctrl+O")
+        add("Keyboard shortcuts", "App", self.show_shortcuts, "Ctrl+/")
+        add("What’s new in this version", "App", self.show_whats_new)
+        add("Check for updates", "App", self.open_updates)
         for lbl, fn in getattr(self, "_extra_actions", {}).items():
             add(lbl, "Other", fn)
         return A
@@ -2060,6 +2259,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _restore(self):
         st = self.settings
         self.watchlist.set_symbols(WatchlistWidget.loads(st.value("watchlist", "")))
+        if st.value("watch_sort", ""):
+            self.watchlist.set_sort(str(st.value("watch_sort", "")))
         self.symbol.setText(st.value("symbol", "RELIANCE"))
         self.range.setCurrentText(st.value("range", "2y"))
         iv = st.value("interval", "1d")
@@ -2211,11 +2412,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._autoload_extra(p, i)
             else:
                 p.hide()
-        saved = sizes.get(name)
-        if saved:
-            for sp, sz in zip([root] + root.findChildren(QtWidgets.QSplitter), saved):
-                if sum(sz) > 0 and len(sz) == sp.count():
-                    sp.setSizes(sz)
+        saved = sizes.get(name) or []
+        for k, sp in enumerate([root] + root.findChildren(QtWidgets.QSplitter)):
+            sz = saved[k] if k < len(saved) else None
+            if sz and sum(sz) > 0 and len(sz) == sp.count():
+                sp.setSizes(sz)                               # where the user left the dividers
+            else:                                             # TradingView: equal parts (the chart that was alone
+                sp.setSizes([1_000_000] * sp.count())         # is not kept wide and the new one squeezed)
         for p in self.panels:
             p.multi = n > 1
             p.set_active(p is self.active)
@@ -2670,6 +2873,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not sym:
             self.statusBar().showMessage("Type a symbol first")
             return
+        from . import indices as _ix
+        canon = _ix.canonical(sym)                     # 'NIFTY IT', 'CNXIT', '^CNXIT' -> NIFTYIT (every source knows it)
+        if not canon and ":" not in sym:
+            canon = datamod.RENAMED.get(sym.upper(), "")   # an old symbol: the one it trades under now (ZOMATO -> ETERNAL)
+        if canon and canon != sym:
+            sym = canon
+            self.symbol.setText(sym)
         self.load_into(self.active, src, sym, self._current_interval(), self.range.currentText())
 
     def load_into(self, panel, source, symbol, interval, rng, path=""):
@@ -2707,6 +2917,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.alerts.check(self._alert_key(panel), last, last, last)
         self._load_status(panel)
         self._sync_watch_price(panel)
+        self._feed_day_prev(panel)
         self.live_sync()
         self._feed_trade_price(panel)
         if panel is self.active:
@@ -2745,6 +2956,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._watch_timer = QtCore.QTimer(self)
         self._watch_timer.timeout.connect(self._watch_tick)
         self._watch_timer.start(30 * 1000)
+        self._watch_live_timer = QtCore.QTimer(self)               # every row's newest price (TradingView: live)
+        self._watch_live_timer.timeout.connect(self._watch_live_poll)
+        self._watch_live_timer.start(WATCH_LIVE_MS)
+        self.watch_dock.visibilityChanged.connect(lambda on: on and QtCore.QTimer.singleShot(
+            300, self._watch_live_poll))
         QtCore.QTimer.singleShot(2500, lambda: self._watch_tick(force=True))
 
     def _watch_tick(self, force: bool = False):
@@ -2771,9 +2987,73 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel.chart.axes[0].intraday:
             prev = df["Close"][idx.normalize() < idx[-1].normalize()]
             pc = float(prev.iloc[-1]) if len(prev) else None
-        else:
+        elif str(panel.params.get("interval", "")) == "1d":
             pc = float(df["Close"].iloc[-2])
+        else:                                      # a week's / month's bar before is not yesterday's close
+            pc = None
         self.watchlist.chart_price(sym, last, pc)
+
+    def _feed_day_prev(self, panel):
+        """A weekly / monthly chart has no 'yesterday' in its bars: the legend's day change takes the previous
+        close from the watchlist's daily quotes, or asks Yahoo once for this symbol."""
+        ch = panel.chart
+        if panel.df is None or panel.params.get("source") == "file":
+            return
+        sym = datamod.RENAMED.get(str(panel.params.get("symbol", "")).strip().upper(), "")
+        sym = sym or str(panel.params.get("symbol", "")).strip().upper()
+        prev = (self.watchlist.extra.get(sym) or {}).get("prev") or self._day_prevs.get(sym)
+        if prev:
+            if ch.day_prev != prev:
+                ch.day_prev = float(prev)
+                ch._refresh_header()
+            return
+        ch.day_prev = None
+        import os as _os
+        if (ch.day_prev_close() is not None or not sym or sym in self._day_prev_asked
+                or _os.environ.get("CHARTLAB_OFFLINE")):                 # (tests: no requests)
+            return
+        self._day_prev_asked.add(sym)
+        from .watchlist import QuoteWorker
+        job = QuoteWorker([sym], self)
+
+        def got(q, extra, sym=sym, job=job):
+            pv = ((extra or {}).get(sym) or {}).get("prev")
+            if pv:
+                self._day_prevs[sym] = float(pv)
+                for p in self.panels:
+                    if datamod.RENAMED.get(str(p.params.get("symbol", "")).strip().upper(),
+                                           str(p.params.get("symbol", "")).strip().upper()) == sym:
+                        p.chart.day_prev = float(pv)
+                        p.chart._refresh_header()
+            self._day_prev_jobs.discard(job)
+        job.done.connect(got)
+        job.failed.connect(lambda _m, job=job: self._day_prev_jobs.discard(job))
+        self._day_prev_jobs.add(job)
+        job.start()
+
+    def _watch_live_tick(self, sym: str, price: float):
+        """A live price reached a chart: the watchlist row of that symbol moves with it."""
+        wl = getattr(self, "watchlist", None)
+        if wl is None or not price:
+            return
+        key = datamod.normalize_symbol(str(sym))
+        for w in wl.symbols():
+            if datamod.normalize_symbol(w) == key:
+                wl.chart_price(w, float(price), None, live=True)
+
+    def _watch_live_poll(self, force: bool = False):
+        """Every watchlist row's newest price, every few seconds while the market is open and the list is on screen
+        (the charts' own symbols move with their live feed anyway)."""
+        import os as _os
+        from .live import market_open
+        if _os.environ.get("CHARTLAB_OFFLINE"):
+            return
+        if not force and (not self.isVisible() or self.isMinimized() or not self.watch_dock.isVisible()):
+            return
+        syms = self.watchlist.symbols()
+        allday = any(datamod.normalize_symbol(s).endswith(("-USD", "-USDT", "-INR")) for s in syms)
+        if force or market_open() or allday:
+            self.watchlist.poll_live()
 
     def set_auto_refresh(self, seconds: int):
         self.settings.setValue("auto_refresh", int(seconds))
@@ -3063,8 +3343,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 took += " from the saved copy, fetching fresh bars\u2026"
             elif getattr(panel, "fresh_ms", None):
                 took += f", fresh bars after {panel.fresh_ms / 1000:.1f} s"
+        note = ""
+        try:
+            ys = (panel.label or "").split(" \u00b7 ")[0].strip()
+            if datamod._thin_index(ys) is not None and str(panel.params.get("interval", "")) in ("1d", "1wk", "1mo"):
+                note = ("  |  Yahoo has no daily bars of this index: they are built from its hourly ones (the last two "
+                        "closes are the exchange's, older days can be a few points off; a broker account gives the "
+                        "exchange's own)")
+        except Exception:  # noqa: BLE001
+            pass
         self._quiet_status(                                     # (TradingView shows nothing when a chart loads)
-            f"{panel.chart.ticker()}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} \u2192 {df.index[-1]:%d %b %Y}{took}")
+            f"{panel.chart.ticker()}: {len(df):,} bars  |  {df.index[0]:%d %b %Y} \u2192 {df.index[-1]:%d %b %Y}{took}"
+            f"{note}")
 
     def _feed_trade_price(self, panel):
         if not hasattr(self, "trader") or panel.df is None or not len(panel.df):
@@ -3079,6 +3369,7 @@ class MainWindow(QtWidgets.QMainWindow):
         df = panel.df
         self._feed_trade_price(panel)
         self._sync_watch_price(panel)
+        self._feed_day_prev(panel)
         if panel is self.active and getattr(panel, "fresh_ms", None):
             self._load_status(panel)
             panel.fresh_ms = None
@@ -3111,7 +3402,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.add_log(f"[load {panel.params['symbol']}] {msg}")
             QtCore.QTimer.singleShot(300, lambda: self.manage_accounts())
             return
-        self.statusBar().showMessage(msg)
+        from .fx import human
+        self.statusBar().showMessage(human(msg), 9000)      # (in words a person reads; the log keeps the detail)
         self.add_log(f"[load {panel.params['symbol']}] {msg}")  # never a modal dialog: it would freeze the app
 
     # ------------------------------------------------------------------ strategy files
@@ -3504,6 +3796,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for lab in self.ov_cards.values():
             lab.setText(f"<span style='color:{theme.MUTED};font-size:12px'>{lab._title}</span><br>"
                         f"<span style='color:#5d606b;font-size:17px'>\u2014</span>")
+        if hasattr(self, "ov_stack"):
+            self.ov_stack.setCurrentWidget(self.ov_empty)
 
     def _fill_overview(self, res):
         mt = res.metrics
@@ -3535,6 +3829,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.equity_plot.plot(x, res.buy_hold.to_numpy(), pen=pg.mkPen("#5d606b", width=1.2), name="Buy & hold")
         self.equity_plot.plot(x, eq, pen=pg.mkPen("#089981", width=1.8), fillLevel=base,
                               brush=pg.mkBrush(8, 153, 129, 40), name="Strategy equity")
+        self.ov_stack.setCurrentWidget(self.equity_plot)
         self._fill_overview(res)
 
     def _trade_clicked(self, row, _col):
@@ -3548,6 +3843,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_connect_dialog(self):
         from .connect_dialog import ConnectDialog
         ConnectDialog(self).exec()
+
+
+class _MoneyAxis(pg.AxisItem):
+    """The equity curve's scale with thousands separators: '100,000', '95,000' (not '100000')."""
+
+    def tickStrings(self, values, scale, spacing):
+        out = []
+        for v in values:
+            x = v * scale
+            dec = 0 if spacing * scale >= 1 or abs(x) >= 1000 else 2
+            out.append(f"{x:,.{dec}f}".replace("-", "\u2212"))
+        return out
 
 
 def _setup_logging():
@@ -3695,6 +4002,7 @@ def main():
         QtCore.QTimer.singleShot(2500, win.watchlist.refresh)
     win.start_auto_update()
     win.start_update_checks()                     # (was only wired into the self-test before: never ran in the app)
+    QtCore.QTimer.singleShot(1800, win.maybe_whats_new)   # once after an update: what it brings
     rc = app.exec()
     quit_cleanly(win, rc)
 

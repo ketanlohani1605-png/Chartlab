@@ -27,39 +27,27 @@ DARK = ("QDialog{background:#1e1e1e;border:1px solid #2e2e2e;border-radius:10px;
 CHIPS = ["All", "Stocks", "Indices", "Options", "Crypto", "US"]
 
 # the names TradingView's legend shows (the exchange's own company names: 'Reliance Industries Limited')
-NAMES = {"NIFTY": "Nifty 50 Index", "BANKNIFTY": "Nifty Bank Index", "SENSEX": "S&P BSE Sensex", "FINNIFTY":
-         "Nifty Financial Services", "RELIANCE": "Reliance Industries Limited",
-         "TCS": "Tata Consultancy Services Limited", "HDFCBANK": "HDFC Bank Limited", "INFY": "Infosys Limited",
-         "ICICIBANK": "ICICI Bank Limited", "SBIN": "State Bank of India", "ITC": "ITC Limited",
-         "LT": "Larsen & Toubro Limited", "BHARTIARTL": "Bharti Airtel Limited", "TATAMOTORS": "Tata Motors Limited",
-         "TMPV": "Tata Motors Passenger Vehicles Limited", "TMCV": "Tata Motors Limited",
-         "TATASTEEL": "Tata Steel Limited", "AXISBANK": "Axis Bank Limited", "KOTAKBANK": "Kotak Mahindra Bank Limited",
-         "HINDUNILVR": "Hindustan Unilever Limited", "BAJFINANCE": "Bajaj Finance Limited",
-         "MARUTI": "Maruti Suzuki India Limited", "SUNPHARMA": "Sun Pharmaceutical Industries Limited",
-         "WIPRO": "Wipro Limited", "HCLTECH": "HCL Technologies Limited", "ADANIENT": "Adani Enterprises Limited",
-         "ADANIPORTS": "Adani Ports and Special Economic Zone Limited",
-         "ONGC": "Oil & Natural Gas Corporation Limited", "NTPC": "NTPC Limited",
-         "POWERGRID": "Power Grid Corporation of India Limited", "COALINDIA": "Coal India Limited",
-         "ASIANPAINT": "Asian Paints Limited", "ULTRACEMCO": "UltraTech Cement Limited", "TITAN": "Titan Company Limited",
-         "M&M": "Mahindra & Mahindra Limited", "JSWSTEEL": "JSW Steel Limited", "TECHM": "Tech Mahindra Limited",
-         "NESTLEIND": "Nestle India Limited", "DRREDDY": "Dr. Reddy's Laboratories Limited", "CIPLA": "Cipla Limited",
-         "EICHERMOT": "Eicher Motors Limited", "HEROMOTOCO": "Hero MotoCorp Limited",
-         "BPCL": "Bharat Petroleum Corporation Limited", "GRASIM": "Grasim Industries Limited", "AAPL": "Apple Inc.",
-         "MSFT": "Microsoft Corporation", "NVDA": "NVIDIA Corporation", "TSLA": "Tesla, Inc.",
+NAMES = {"AAPL": "Apple Inc.", "MSFT": "Microsoft Corporation", "NVDA": "NVIDIA Corporation", "TSLA": "Tesla, Inc.",
          "BTC-USD": "Bitcoin / US Dollar", "ETH-USD": "Ethereum / US Dollar"}
+# (NSE companies' names come from NSE's own list: chartlab/symbols.py)
 
 
 def symbol_name(sym: str) -> str:
-    """The description TradingView shows for a symbol: ChartLab's own list first, then every NSE stock's name."""
+    """The description TradingView shows for a symbol: an index's from the index table, ChartLab's own list, then
+    every NSE stock's name."""
     s = (sym or "").strip()
+    from . import indices as _ix
+    ixn = _ix.name_of(s)
+    if ixn:
+        return ixn
     tick = s.split(":")[-1].upper()
     if tick in NAMES or s.upper() in NAMES:
         return NAMES.get(tick, NAMES.get(s.upper(), ""))
     if ":" in s and not s.upper().startswith("NSE:"):
         return ""
     try:
-        from .symbols import name_of
-        return name_of(tick)
+        from .symbols import name_of, renamed
+        return name_of(tick) or name_of(renamed().get(tick, ""))   # an old symbol: the company it is now
     except Exception:  # noqa: BLE001
         return ""
 
@@ -81,9 +69,10 @@ def _kind(sym: str) -> str:
     s = sym.upper()
     if _opt(s):
         return "Options"
-    if "-USD" in s:
+    if s.endswith(("-USD", "-USDT", "-INR")):
         return "Crypto"
-    if s.split(":")[-1] in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY"):
+    from . import indices as _ix
+    if _ix.is_index(s):
         return "Indices"
     if s.startswith("US:"):
         return "US"
@@ -94,7 +83,8 @@ def _exch(sym: str) -> str:
     o = _opt(sym)
     if o:
         return "BSE" if o[0] in ("SENSEX", "BANKEX") else "NSE"
-    return "BSE" if sym.startswith("BSE:") else ("NASDAQ" if sym.startswith("US:") else ("CRYPTO" if "-USD" in sym else "NSE"))
+    from .watchlist import exchange_of
+    return exchange_of(sym)
 
 
 ROLE = QtCore.Qt.ItemDataRole.UserRole
@@ -194,6 +184,7 @@ class SymbolSearch(QtWidgets.QDialog):
         self.setWindowTitle("Symbol Search")
         self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
         self.setProperty("chromeScrim", True)                # TradingView dims the page behind this dialog (only)
+        self.setProperty("chromeOverlay", True)              # ... and a click on that dimmed page closes it
         # TradingView's own measures (its page, 1440 x 900): the card is 840 x 680 with a 20 px radius; the search
         # line 16 px at x = 52 in a 60 px band, icon 28 px at x = 20; chips 28 px high, radius 14, 4 px apart,
         # #f2f2f2 / black when chosen and #222 / #b8b8b8 otherwise; the list starts at y = 113; no dividing lines.
@@ -206,16 +197,20 @@ class SymbolSearch(QtWidgets.QDialog):
             " QPushButton#clear{background:transparent;border:1px solid transparent;border-radius:8px;padding:0 7px;"
             "color:#707070;font-size:14px;min-height:26px;max-height:26px;}"
             " QPushButton#clear:hover{color:#b8b8b8;background:#222222;}"
+            " QToolButton#searchClose{background:transparent;border:0;border-radius:8px;padding:0;}"
+            " QToolButton#searchClose:hover{background:#222222;}"
+            " QToolButton#searchClose:pressed{background:#2e2e2e;}"
             " QListWidget{background:transparent;border:0;outline:0;}"
             " QScrollBar:vertical{background:transparent;width:5px;margin:0;}"
             " QScrollBar::handle:vertical{background:#464646;border-radius:2px;min-height:24px;margin:0;}")
         ph = parent.height() if parent is not None else 900
         self.resize(840, max(420, min(680, ph - 180)))
         self.symbols, self.chosen, self.kind = list(dict.fromkeys(symbols)), None, "All"
-        try:                                                 # every NSE stock, found as you type (TradingView)
+        try:                                                 # every index and NSE stock, found as you type (TradingView)
+            from . import indices as _ix
             from .symbols import nse_symbols
             known = set(s.upper() for s in self.symbols)
-            self.universe = [s for s in nse_symbols() if s not in known]
+            self.universe = [s for s in _ix.all_symbols() + nse_symbols() if s not in known]
         except Exception:  # noqa: BLE001
             self.universe = []
         lay = QtWidgets.QVBoxLayout(self)
@@ -246,6 +241,19 @@ class SymbolSearch(QtWidgets.QDialog):
         self.edit.textChanged.connect(lambda t: clr.setVisible(bool(t)))
         self.clear_btn = clr
         top.addWidget(clr)
+        x = QtWidgets.QToolButton()                          # the close button every card has (33 px, top right)
+        x.setObjectName("searchClose")
+        x.setToolTip("Close  (Esc)")
+        x.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        x.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        x.setFixedSize(33, 33)
+        x.setIconSize(QtCore.QSize(22, 22))
+        x.setIcon(icons.get("close", "#b8b8b8", 22))
+        x.clicked.connect(self.reject)
+        self.close_btn = x
+        top.addSpacing(4)
+        top.addWidget(x)
+        top.setContentsMargins(20, 0, 14, 0)
         lay.addWidget(band)
         chips = QtWidgets.QWidget()
         chips.setFixedHeight(44)
@@ -310,14 +318,17 @@ class SymbolSearch(QtWidgets.QDialog):
         t = self.edit.text().strip().upper()
         self.lst.clear()
         scored = []
-        pool = self.symbols + (getattr(self, "universe", []) if t else [])   # all NSE stocks once you type
+        # all NSE stocks once you type; the whole list of indices under the Indices chip
+        pool = self.symbols + (getattr(self, "universe", []) if t or self.kind == "Indices" else [])
+        from . import indices as _ix
+        alias = _ix.canonical(t) if t else ""                # 'CNXIT', 'NIFTY IT' -> NIFTYIT
         for k, s in enumerate(pool):
             if self.kind != "All" and _kind(s) != self.kind:
                 continue
             tick = s.split(":")[-1].upper()
             if not t:
                 score = 3
-            elif tick == t or s.upper() == t:
+            elif tick == t or s.upper() == t or (alias and tick == alias):
                 score = 0
             elif tick.startswith(t):
                 score = 1
@@ -630,6 +641,8 @@ class QuickSearch(QtWidgets.QDialog):
         super().__init__(parent)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
+        self.setProperty("chromeOverlay", True)              # a click beside it closes it, like TradingView's
+        self.setProperty("chromeTop", 90)                    # ... and it sits near the top, not in the middle
         self.setStyleSheet(DARK)
         self.resize(640, 480)
         self.actions_ = actions
@@ -693,6 +706,218 @@ class QuickSearch(QtWidgets.QDialog):
         QtCore.QTimer.singleShot(0, fn)
 
 
+# shortcuts the action list does not carry (they act on the cursor or the app itself)
+SHORTCUT_EXTRAS = [
+    ("Undo", "Chart", "Ctrl+Z"),
+    ("Redo", "Chart", "Ctrl+Shift+Z"),
+    ("Buy at the cursor's price (1 share / 1 lot)", "Trading", "Alt+Shift+B"),
+    ("Sell at the cursor's price (1 share / 1 lot)", "Trading", "Alt+Shift+S"),
+    ("Order panel at the cursor's price", "Trading", "Shift+T"),
+    ("Stop a running script", "Strategy", "Ctrl+."),
+    ("Quick search", "App", "Ctrl+K"),
+    ("Keyboard shortcuts", "App", "Ctrl+/"),
+    ("Close a dialog · cancel a drawing", "App", "Esc"),
+    ("Quit ChartLab", "App", "Ctrl+Q"),
+]
+SHORTCUT_ORDER = ["Chart", "Price scale", "Drawing tool", "Trading", "Alerts", "Panel", "View", "Strategy", "Data",
+                  "App"]
+
+
+def keycaps(keys: str) -> list:
+    """'Alt+Shift+B' as the keys to press, each on its own cap: ['⌥', '⇧', 'B'] on a Mac, ['Alt', 'Shift', 'B']
+    elsewhere. 'type a letter' stays words."""
+    import sys
+    keys = (keys or "").replace("Cmd+", "Ctrl+").replace("Enter", "Return")
+    if not keys or " " in keys:
+        return [keys] if keys else []
+    if keys == "Esc":
+        return ["Esc"]
+    if sys.platform == "darwin":
+        from .theme import sc
+        nat = sc(keys)
+        caps, rest = [], nat
+        while rest and rest[0] in "\u2303\u2325\u21e7\u2318":     # ⌃ ⌥ ⇧ ⌘
+            caps.append(rest[0])
+            rest = rest[1:]
+        return caps + ([rest] if rest else [])
+    parts = keys.split("+")
+    if keys.endswith("++"):                                     # 'Ctrl++'
+        parts = keys[:-2].split("+") + ["+"]
+    return [p for p in parts if p] or [keys]
+
+
+class _KeysDelegate(QtWidgets.QStyledItemDelegate):
+    """A category heading, or 'what it does ............ [⌥][T]'."""
+
+    def sizeHint(self, option, index):
+        return QtCore.QSize(option.rect.width(), 34 if index.data(ROLE + 2) else 36)
+
+    def paint(self, p, option, index):
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        r = option.rect
+        al = QtCore.Qt.AlignmentFlag
+        f = QtGui.QFont(option.font)
+        head = index.data(ROLE + 2)
+        if head:
+            f.setPixelSize(11)
+            f.setWeight(QtGui.QFont.Weight.DemiBold)
+            f.setLetterSpacing(QtGui.QFont.SpacingType.AbsoluteSpacing, 0.6)
+            p.setFont(f)
+            p.setPen(QtGui.QColor("#787b86"))
+            p.drawText(r.adjusted(12, 10, -12, 0), al.AlignLeft | al.AlignVCenter, head.upper())
+            p.restore()
+            return
+        if option.state & QtWidgets.QStyle.StateFlag.State_MouseOver:
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor("#1c1c1c"))
+            p.drawRoundedRect(QtCore.QRectF(r).adjusted(2, 1, -2, -1), 7, 7)
+        title, caps = index.data(ROLE), index.data(ROLE + 1) or []
+        f.setPixelSize(14)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("#dbdbdb"))
+        # the caps from the right
+        fk = QtGui.QFont(option.font)
+        fk.setPixelSize(12)
+        fk.setWeight(QtGui.QFont.Weight.Medium)
+        fm = QtGui.QFontMetrics(fk)
+        x = r.right() - 12
+        boxes = []
+        for c in reversed(caps):
+            words = " " in c
+            w = fm.horizontalAdvance(c) + (0 if words else 14)
+            w = w if words else max(24, w)
+            boxes.append((QtCore.QRectF(x - w, r.center().y() - 11, w, 22), c, words))
+            x -= w + 5
+        p.drawText(QtCore.QRect(r.x() + 12, r.y(), max(40, int(x) - r.x() - 20), r.height()),
+                   al.AlignLeft | al.AlignVCenter,
+                   p.fontMetrics().elidedText(title, QtCore.Qt.TextElideMode.ElideRight, max(40, int(x) - r.x() - 20)))
+        p.setFont(fk)
+        for box, c, words in boxes:
+            if words:                                           # 'type a letter': just words, no cap
+                p.setPen(QtGui.QColor("#8c8c8c"))
+                p.drawText(box, al.AlignCenter, c)
+                continue
+            p.setPen(QtGui.QPen(QtGui.QColor("#3a3a3a"), 1))
+            p.setBrush(QtGui.QColor("#232323"))
+            p.drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+            p.setPen(QtGui.QColor("#e6e6e6"))
+            p.drawText(box.adjusted(0, -1, 0, -1), al.AlignCenter, c)
+        p.restore()
+
+
+class ShortcutsDialog(QtWidgets.QDialog):
+    """Every keyboard shortcut, grouped and searchable: 'Keyboard shortcuts' in the main menu, or Ctrl+/ (Cmd+/)."""
+
+    def __init__(self, parent, actions: list):
+        """actions: [(title, category, shortcut, callable, checked)] as Cmd/Ctrl+K has them."""
+        super().__init__(parent)
+        self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setProperty("chromeRadius", 12)
+        self.setProperty("chromeOverlay", True)                  # a click beside it closes it
+        self.setStyleSheet(DARK + " QDialog{border:0;border-radius:12px;background:#131313;}"
+                           " QToolButton{background:transparent;border:0;border-radius:8px;padding:4px;}"
+                           " QToolButton:hover{background:#222222;}"
+                           " QFrame#searchbox{border:1px solid #464646;border-radius:8px;background:transparent;}"
+                           " QFrame#searchbox:hover{border-color:#636363;}")
+        ph = parent.height() if parent is not None else 900
+        self.resize(640, max(400, min(620, ph - 160)))
+        self.rows = self.collect(actions)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(19, 0, 17, 12)
+        lay.setSpacing(0)
+        head = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Keyboard shortcuts")
+        title.setFixedHeight(60)
+        title.setStyleSheet("font-size:20px;font-weight:600;color:#b8b8b8;background:transparent;")
+        head.addWidget(title, 1)
+        self.close_btn = QtWidgets.QToolButton()
+        self.close_btn.setFixedSize(33, 33)
+        self.close_btn.setIconSize(QtCore.QSize(22, 22))
+        self.close_btn.setIcon(icons.get("close", "#b8b8b8", 22))
+        self.close_btn.setToolTip("Close  (Esc)")
+        self.close_btn.clicked.connect(self.reject)
+        head.addWidget(self.close_btn)
+        lay.addLayout(head)
+        box = QtWidgets.QFrame()
+        box.setObjectName("searchbox")
+        box.setFixedHeight(40)
+        top = QtWidgets.QHBoxLayout(box)
+        top.setContentsMargins(8, 0, 8, 0)
+        ic = QtWidgets.QLabel()
+        ic.setFixedSize(28, 28)
+        ic.setPixmap(icons.get("search", "#8c8c8c").pixmap(28, 28))
+        ic.setStyleSheet("border:0;background:transparent;")
+        top.addWidget(ic)
+        self.edit = QtWidgets.QLineEdit()
+        self.edit.setPlaceholderText("Search shortcuts")
+        self.edit.setStyleSheet("QLineEdit{background:transparent;border:0;font-size:16px;padding:0;color:#b8b8b8;}")
+        top.addWidget(self.edit, 1)
+        lay.addWidget(box)
+        lay.addSpacing(6)
+        self.lst = QtWidgets.QListWidget()
+        self.lst.setItemDelegate(_KeysDelegate(self.lst))
+        self.lst.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.lst.setMouseTracking(True)
+        self.lst.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.lst.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.lst.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.lst.setStyleSheet("QListWidget{background:transparent;border:0;outline:0;}")
+        lay.addWidget(self.lst, 1)
+        self.empty = QtWidgets.QLabel("No shortcut matches")
+        self.empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.empty.setStyleSheet("color:#787b86;font-size:14px;background:transparent;")
+        self.empty.hide()
+        lay.addWidget(self.empty, 1)
+        self.edit.textChanged.connect(self._fill)
+        self._fill()
+        QtCore.QTimer.singleShot(0, self.edit.setFocus)
+
+    @staticmethod
+    def collect(actions) -> list:
+        """[(category, title, keys)] for every action with a shortcut, plus the extras, each once, in a fixed order."""
+        seen, out = set(), []
+        for a in list(actions or []):
+            title, cat, keys = a[0], a[1], a[2]
+            if not keys or title in seen:
+                continue
+            seen.add(title)
+            out.append((cat, title, keys))
+        for title, cat, keys in SHORTCUT_EXTRAS:
+            if title not in seen:
+                seen.add(title)
+                out.append((cat, title, keys))
+        rank = {c: i for i, c in enumerate(SHORTCUT_ORDER)}
+        out.sort(key=lambda r: rank.get(r[0], len(rank)))          # (stable: the app's own order within a group)
+        return out
+
+    def _fill(self, *_):
+        words = self.edit.text().lower().split()
+        self.lst.clear()
+        cur = None
+        n = 0
+        for cat, title, keys in self.rows:
+            hay = f"{title} {cat} {keys}".lower()
+            if words and not all(w in hay for w in words):
+                continue
+            if cat != cur:
+                cur = cat
+                h = QtWidgets.QListWidgetItem()
+                h.setData(ROLE + 2, cat)
+                h.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                self.lst.addItem(h)
+            it = QtWidgets.QListWidgetItem()
+            it.setData(ROLE, title)
+            it.setData(ROLE + 1, keycaps(keys))
+            it.setToolTip(f"{title}  ·  {keys}")
+            self.lst.addItem(it)
+            n += 1
+        self.lst.setVisible(n > 0)
+        self.empty.setVisible(n == 0)
+        self.count = n
+
+
 class IndicatorsDialog(QtWidgets.QDialog):
     """TradingView's "Indicators, metrics & strategies": a search box, categories on the left, and a list where a
     click adds / removes an indicator (the dialog stays open so several can be added, like TradingView).
@@ -707,6 +932,7 @@ class IndicatorsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint)
         self.setProperty("chromeRadius", 12)                 # TradingView: this dialog's corners are 12 px
+        self.setProperty("chromeOverlay", True)              # a click beside it closes it (no dimming)
         # TradingView's measures: 815 x 619; title 20 px semi-bold #b8b8b8 at x = 19 in a 60 px band, close button
         # 33 x 33; the search field a bordered line under it; categories 39 px high, the chosen one #222 with
         # 8 px corners; no dividing lines anywhere.

@@ -1,5 +1,6 @@
 import os, sys, time
 os.environ["QT_QPA_PLATFORM"]="offscreen"; os.environ["CHARTLAB_HOME"]="/tmp/chartlab_test_data"
+os.environ["CHARTLAB_OFFLINE"]="1"          # (no live requests: one still in flight at the end aborted the test)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from PySide6 import QtCore, QtTest, QtWidgets
 app=QtWidgets.QApplication([]); QtCore.QCoreApplication.setOrganizationName("clt"); QtCore.QCoreApplication.setApplicationName("data_test")
@@ -153,3 +154,5 @@ d.close(); store.disable()
 store.cloud_folders, optstore.default_root = real_cf, real_def
 shutil.rmtree(home, ignore_errors=True)
 print("DATA OK")
+sys.stdout.flush()
+os._exit(0)

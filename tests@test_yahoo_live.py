@@ -21,6 +21,7 @@ from chartlab.mainwindow import MainWindow  # noqa: E402
 accounts.load_accounts = lambda: []
 live.YAHOO_EVERY = 0.05
 win = MainWindow(QtCore.QSettings(os.path.join(__import__("tempfile").mkdtemp(), "t.ini"), QtCore.QSettings.Format.IniFormat))
+win._chart_market_closed = lambda: False                     # (any hour: the badge tells the feed's state)
 win.show()
 app.processEvents()
 QtTest.QTest.qWait(300)

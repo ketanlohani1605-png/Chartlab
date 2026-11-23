@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import numpy as np
 import pandas as pd
-from PySide6 import QtCore, QtTest, QtWidgets
+from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 from chartlab import theme  # noqa: E402
@@ -153,10 +153,22 @@ assert vcol[0] in seen or vcol[1] in seen, "volume bars are not painted"
 ax = ch.price.getAxis("right")
 ch._place_last_tag()
 assert ax._blocked and all(b > a for a, b in ax._blocked)
-# the pill: TradingView's 128 px, the symbol on the left, the data-source button inside
+# the pill: as wide as the symbol needs (TradingView: 12 px + the name + 34 px; RELIANCE 128 px there), the symbol
+# on the left, the data-source button inside; a long name is never cut short, only one wider than the widest pill
 pill = w.sym_btn.parentWidget()
-assert pill.objectName() == "symbolpill" and pill.width() == 128 and w.dtype_btn.size() == QtCore.QSize(32, 28)
+_pf = QtGui.QFont(w.sym_btn.font()); _pf.setPixelSize(14); _pf.setWeight(QtGui.QFont.Weight.DemiBold)
+_pw = lambda t: 12 + QtGui.QFontMetrics(_pf).horizontalAdvance(t) + 34 + 2  # noqa: E731
+assert pill.objectName() == "symbolpill" and pill.width() == _pw("RELIANCE") and w.dtype_btn.size() == QtCore.QSize(32, 28)
+assert 110 <= pill.width() <= 150, pill.width()
 assert w.sym_btn.text() == "RELIANCE" and w.dtype_btn.menu() is w.src_menu
+w._set_pill_text("BANKNIFTY")
+assert w.sym_btn.text() == "BANKNIFTY" and pill.width() == _pw("BANKNIFTY") > _pw("RELIANCE")
+w._set_pill_text("NIFTY")
+assert w.sym_btn.text() == "NIFTY" and pill.width() == _pw("NIFTY") < _pw("RELIANCE")
+w._set_pill_text("BANKNIFTY 26 NOV 2026 CE 64500 WEEKLY")
+assert pill.width() == w.PILL_MAX and w.sym_btn.text().endswith("\u2026")
+w._set_pill_text("RELIANCE")
+assert pill.width() == _pw("RELIANCE")
 # a symbol that cannot be loaded does not stay in the pill
 w.symbol.setText("BH")
 w._on_load_failed(p, "No data returned for 'BH.NS' (1d, 2y). Check the symbol / internet.")

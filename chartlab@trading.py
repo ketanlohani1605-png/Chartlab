@@ -30,7 +30,7 @@ _CSS = (f"QDialog, QWidget#tpanel {{ background: #1e1e1e; }} QLabel {{ backgroun
         f"border-radius: 6px; padding: 6px 8px; min-height: 18px; color: #dbdbdb; }} "
         f"QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus {{ border-color: {theme.ACCENT}; }} "
         f"QDoubleSpinBox:disabled, QSpinBox:disabled {{ color: #555; }} "
-        f"QPushButton#seg {{ background: transparent; border: 0; border-bottom: 2px solid transparent; color: "
+        f"QPushButton#seg {{ background: transparent; border: 0; border-radius: 0; border-bottom: 2px solid transparent; color: "
         f"{theme.MUTED}; padding: 6px 10px; font-size: 13px; }} QPushButton#seg:checked {{ color: white; "
         f"border-bottom: 2px solid white; }} QPushButton#seg:hover {{ color: white; }} "
         f"QPushButton#chip {{ background: #262626; border: 1px solid #333; border-radius: 6px; padding: 5px 10px; "
@@ -425,6 +425,28 @@ class _SideButton(QtWidgets.QPushButton):
             f"padding: 4px; }} QPushButton:hover {{ border-color: {self.color}; }}")
 
 
+def ticket_kind(symbol: str, inst) -> tuple[str, str]:
+    """('Index', 'NSE') for the line under the ticket's title. The paper account trades an index (NIFTY) at its price
+    as if it were a share, but it is still an index; a crypto pair is crypto, not an NSE stock."""
+    kind = {"EQ": "Stock", "FUT": "Future", "CE": "Call option", "PE": "Put option", "IDX": "Index"}.get(
+        getattr(inst, "kind", ""), "")
+    exch = getattr(inst, "exchange", "") or ""
+    try:
+        from .watchlist import exchange_of
+        if exchange_of(symbol) == "CRYPTO":
+            return "Crypto", ""
+        if exchange_of(symbol) == "NASDAQ":
+            return "Stock", "US"
+        from .brokers.base import parse_symbol
+        sp = parse_symbol(symbol)
+        if sp.kind == "IDX" and kind == "Stock":
+            kind = "Index"
+            exch = sp.exchange or exch
+    except Exception:  # noqa: BLE001
+        pass
+    return kind, exch
+
+
 class OrderTicket(QtWidgets.QDialog):
     """The order panel. Everything it offers follows the chosen account's broker."""
 
@@ -655,8 +677,8 @@ class OrderTicket(QtWidgets.QDialog):
         lot = i.lot if i is not None and i.lot > 1 else 1
         if i is not None:
             self.title.setText(i.display)
-            kind = {"EQ": "Stock", "FUT": "Future", "CE": "Call option", "PE": "Put option", "IDX": "Index"}.get(i.kind, "")
-            self.sub.setText(f"{kind} · {i.exchange}" + (f" · lot {lot}" if lot > 1 else "") +
+            kind, exch = ticket_kind(self.symbol, i)
+            self.sub.setText(" · ".join(x for x in (kind, exch) if x) + (f" · lot {lot}" if lot > 1 else "") +
                              (f" · tick {i.tick:g}" if i.tick else ""))
             for box in (self.price, self.trig, self.tp, self.sl):
                 box.setSingleStep(i.tick or 0.05)
@@ -866,7 +888,9 @@ class TradingPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.mgr = mgr
         self.setObjectName("tpanel")
-        self.setStyleSheet(_CSS + " QTableWidget { background: #000; border: 0; gridline-color: #1a1a1a; } "
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)   # (not the window's #222 gutter)
+        self.setStyleSheet(_CSS + " QWidget#tpanel { background: #000; }"
+                           " QTableWidget { background: #000; border: 0; gridline-color: #1a1a1a; } "
                            "QHeaderView::section { background: #000; color: #787b86; border: 0; padding: 4px 6px; }")
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(10, 6, 10, 6)
@@ -890,7 +914,12 @@ class TradingPanel(QtWidgets.QWidget):
         self.close_all_btn.setToolTip("Close every open position at market")
         self.close_all_btn.clicked.connect(lambda: self.mgr.close_all(self))
         top.addWidget(self.close_all_btn)
-        ref = QtWidgets.QPushButton("⟳")
+        ref = QtWidgets.QPushButton()
+        try:
+            from . import icons
+            ref.setIcon(icons.get("refresh", "#b2b5be", 18))      # (the drawn icon: '⟳' renders tiny on some fonts)
+        except Exception:  # noqa: BLE001
+            ref.setText("\u27f3")
         ref.setToolTip("Refresh now")
         ref.setFixedWidth(34)
         ref.clicked.connect(self.mgr.refresh)
@@ -935,6 +964,14 @@ class TradingPanel(QtWidgets.QWidget):
         self.tabs.addTab(acct_scroll, "Account summary")
         self.tabs.addTab(self.notes, "Notifications log")
         v.addWidget(self.tabs, 1)
+        from .fx import EmptyHint                       # empty tables say what will be in them
+        self._hints = [
+            EmptyHint(self.pos, "No open positions. Buy / Sell on the chart or <b>+ New order</b> opens one; "
+                                "it is listed here with its live P&amp;L."),
+            EmptyHint(self.ords, "No orders here. Orders you place show up with their status as the broker "
+                                 "reports it."),
+            EmptyHint(self.hold, "No holdings in this account."),
+            EmptyHint(self.notes, "Fills, rejections and other order news appear here.")]
         mgr.updated.connect(self._fill)
         mgr.accountChanged.connect(self._accounts)
         mgr.notify.connect(self._note)

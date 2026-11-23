@@ -349,7 +349,8 @@ class AlertsPanel(QtWidgets.QWidget):
         new = QtWidgets.QPushButton("+  Create alert")
         new.setObjectName("primary")
         new.clicked.connect(self.newRequested)
-        clr = QtWidgets.QPushButton("Clear done")
+        clr = self.clear_btn = QtWidgets.QPushButton("Clear done")
+        clr.setToolTip("Remove the alerts that have fired or expired")
         clr.clicked.connect(mgr.clear_done)
         row.addWidget(new, 1)
         row.addWidget(clr)
@@ -378,9 +379,15 @@ class AlertsPanel(QtWidgets.QWidget):
         self.empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.empty.setWordWrap(True)
         v.addWidget(self.empty, 2)
-        v.addWidget(QtWidgets.QLabel(f"<span style='color:{theme.MUTED}'>Log</span>"))
+        self.log_head = QtWidgets.QLabel("")
+        self.log_head.setStyleSheet(f"color:{theme.MUTED};font-size:11px;font-weight:600;letter-spacing:0.6px;"
+                                    "padding:6px 2px 0 2px;")
+        v.addWidget(self.log_head)
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Alerts that fire are listed here, newest first.")
+        self.log.setStyleSheet("QPlainTextEdit{background:#0f0f0f;border:1px solid #1e1e1e;border-radius:6px;"
+                               "padding:6px;color:#d1d4dc;font-size:12px;}")
         v.addWidget(self.log, 1)
         mgr.changed.connect(self.refresh)
         self.refresh()
@@ -389,6 +396,9 @@ class AlertsPanel(QtWidgets.QWidget):
         al = self.mgr.alerts
         self.table.setVisible(bool(al))
         self.empty.setVisible(not al)
+        self.clear_btn.setEnabled(any(a["status"] not in ("active", "paused") for a in al))   # (what it removes)
+        n = len(self.mgr.history)
+        self.log_head.setText("LOG" + (f"  ·  {n}" if n else ""))
         self.table.setRowCount(len(al))
         colors = {"active": theme.UP, "triggered": "#ff9800", "paused": theme.MUTED, "expired": theme.MUTED}
         for r, a in enumerate(al):
@@ -447,9 +457,14 @@ class Toast(QtWidgets.QFrame):
         rail = parent.findChild(QtWidgets.QToolBar, "rightrail")
         right = (rail.mapTo(parent, QtCore.QPoint(0, 0)).x() if rail is not None and rail.isVisible()
                  else parent.width())
+        top = 64
+        cw = parent.centralWidget() if isinstance(parent, QtWidgets.QMainWindow) else None
+        if cw is not None and cw.isVisible() and cw.width() > self.width() + 40:
+            o = cw.mapTo(parent, QtCore.QPoint(0, 0))             # over the chart, not over an open side panel
+            right, top = o.x() + cw.width(), max(top, o.y() + 14)
         import shiboken6
         Toast._live = [t for t in Toast._live if shiboken6.isValid(t) and t.parent() is parent]
-        y = 64 + sum(t.height() + 10 for t in Toast._live)
+        y = top + sum(t.height() + 10 for t in Toast._live)
         Toast._live.append(self)
         end = QtCore.QPoint(right - self.width() - 16, y)
         self.move(end.x(), end.y() - 30)

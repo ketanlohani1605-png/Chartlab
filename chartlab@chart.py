@@ -256,10 +256,16 @@ class PriceAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
         """TradingView never lets a scale number peek out from under the last-price / volume label: a number that
         touches one of those labels is not drawn at all."""
         if self._blocked:
+            f = self.style.get("tickFont") or p.font()
+            fm = QtGui.QFontMetricsF(f)
             keep = []
             for spec in textSpecs:
                 r = spec[0]
-                top, bot = r.top() + 2.0, r.bottom() - 2.0          # the glyphs, not the line's leading
+                # the digits themselves: the line is centred in r, the digits from cap height to the baseline;
+                # a number whose digits come within 1 px of a label is not drawn (it peeked out from under it)
+                line_top = r.center().y() - fm.height() / 2.0
+                top = line_top + fm.ascent() - fm.capHeight() - 1.0
+                bot = line_top + fm.ascent() + 1.0
                 if not any(bot > a and top < b for a, b in self._blocked):
                     keep.append(spec)
             textSpecs = keep
@@ -2951,6 +2957,11 @@ class ChartWidget(QtWidgets.QWidget):
             self._set_plus_hot(False)
             self.plus_btn.hide()
             return
+        if not self._hovering:                           # the legend switches to the bar under the mouse
+            self._hovering = True
+            new_hover = True
+        else:
+            new_hover = False
         mp = hovered.vb.mapSceneToView(pos)
         over_plus = self._over_plus(self._cross_vp)
         self._set_plus_hot(over_plus)
@@ -2986,7 +2997,7 @@ class ChartWidget(QtWidgets.QWidget):
         bp = self._bottom_plot()
         t = self._time_at(i) if i >= 0 else None
         if t is not None:
-            if new_bar or bp.dtag.isHidden() or refresh:  # header / date tag only change when the bar changes
+            if new_bar or new_hover or bp.dtag.isHidden() or refresh:  # (header / date tag change with the bar)
                 if 0 <= i < n:
                     self._update_header(i)
                 elif new_bar:
@@ -3363,6 +3374,7 @@ class ChartWidget(QtWidgets.QWidget):
             p.dtag.hide()
         self.plus_btn.hide()
         self._hover_i = None
+        self._hovering = False
         self._cross_vp = self._cross_key = None
         if self.df is not None and self._n():
             self._update_header(self._n() - 1)
@@ -3499,11 +3511,11 @@ class ChartWidget(QtWidgets.QWidget):
     def ticker(self) -> str:
         """What you typed, not the data vendor's code: NIFTY for '^NSEI', RELIANCE for 'RELIANCE.NS'."""
         t = self._raw_symbol()
-        from . import data as _d
         u = t.upper()
-        for name, code in _d._INDEX.items():
-            if code == u:
-                return name
+        from . import indices as _ix
+        hit = _ix.by_yahoo(u)
+        if hit is not None:
+            return hit.sym
         for suf in (".NS", ".BO"):
             if u.endswith(suf):
                 return t[: -len(suf)]
@@ -3634,6 +3646,44 @@ class ChartWidget(QtWidgets.QWidget):
         pill = status_pill_html(self.market_status(), settings.get().get("bg", "#000000"))
         return f"&nbsp;&nbsp;{pill}" if pill else ""
 
+    _hovering = False                   # the crosshair is on the chart (the legend shows the bar under it)
+    day_prev: float | None = None       # the previous session's close from outside (a weekly chart has none)
+
+    def _is_index(self) -> bool:
+        try:
+            from . import indices as _ix
+            return _ix.is_index(self.ticker())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def day_prev_close(self) -> float | None:
+        """The close of the session before the newest bar's - TradingView's day change. Minute / hour bars: the
+        last bar of the previous day (Yahoo stamps the exchange's close into it); daily bars: the bar before;
+        weeks and months: day_prev, from the daily quotes."""
+        n = self._n()
+        if self.df is None or n == 0:
+            return None
+        idx = self.df.index
+        try:
+            if self.axes[0].intraday:
+                days = idx.normalize()
+                k = int(np.searchsorted(days.values, days.values[-1], side="left"))   # first bar of the last day
+                if k > 0:
+                    last_prev = float(self._closes[k - 1])
+                    dp = self.day_prev
+                    if dp and last_prev and abs(float(dp) / last_prev - 1.0) < 0.02 and self._is_index():
+                        # an index's minute bars can miss its official close by a little (Nifty Realty on 19 Nov
+                        # 2026: 922.80 in the last minute, 923.10 official): the exchange's close, as TradingView
+                        return float(dp)
+                    return last_prev
+                return float(self.day_prev) if self.day_prev else None
+            sec = float(np.median(np.diff(idx.values[-20:]).astype("timedelta64[s]").astype(float))) if n >= 2 else 86400.0
+        except Exception:  # noqa: BLE001 - an index without dates (a script's bars)
+            return float(self.day_prev) if self.day_prev else None
+        if sec <= 86400 * 1.5 and n >= 2:
+            return float(self._closes[-2])
+        return float(self.day_prev) if self.day_prev else None
+
     def _refresh_header(self):
         if self.df is not None and self._n():
             self._update_header(min(getattr(self, '_hdr_i', self._n() - 1), self._n() - 1))
@@ -3656,16 +3706,28 @@ class ChartWidget(QtWidgets.QWidget):
                  f"<span style='font-size:16px;color:{LEGEND_TEXT}'>{self.display_name()}</span>"
                  f"<span style='font-size:16px;color:{LEGEND_TEXT}'> \u00b7 {self.interval_tag()} \u00b7 {self.exchange_tag()}</span>"
                  f"{self._market_dot()}&nbsp;&nbsp;&nbsp;") if S["sl_title"] else ""
-        vals = (f"{v('O', r['Open'])}&nbsp;&nbsp;{v('H', r['High'])}&nbsp;&nbsp;{v('L', r['Low'])}&nbsp;&nbsp;{v('C', r['Close'])}"
-                if S["sl_values"] else "")
-        chgt = (f"&nbsp;&nbsp;<span style='color:{col}'>{self.fd(d, ref=c)} ({_signed(chg)}%)</span>"
-                if S["sl_change"] else "")
+        dp = None if self._hovering or i != self._n() - 1 else self.day_prev_close()
+        if dp:
+            # TradingView (measured, Nov 2026): with the mouse off the chart the values are the newest price and the
+            # change since the previous session's close, both in the day's colour; over the chart, the bar's O H L C
+            dd = c - dp
+            dcol = theme.UP if dd >= 0 else theme.DOWN
+            vals = f"<span style='color:{dcol}'>{fp(c)}</span>" if S["sl_values"] else ""
+            chgt = (f"&nbsp;&nbsp;<span style='color:{dcol}'>{self.fd(dd, ref=c)} ({_signed((c / dp - 1) * 100)}%)</span>"
+                    if S["sl_change"] else "")
+            short = vals
+        else:
+            vals = (f"{v('O', r['Open'])}&nbsp;&nbsp;{v('H', r['High'])}&nbsp;&nbsp;{v('L', r['Low'])}&nbsp;&nbsp;{v('C', r['Close'])}"
+                    if S["sl_values"] else "")
+            chgt = (f"&nbsp;&nbsp;<span style='color:{col}'>{self.fd(d, ref=c)} ({_signed(chg)}%)</span>"
+                    if S["sl_change"] else "")
+            short = f"{v('C', r['Close'])}" if S["sl_values"] else ""
         self.header.setText(title + vals + chgt)
         avail = int(self.price.vb.sceneBoundingRect().width()) - 24
         if avail > 50 and self.header.width() > avail:          # narrow pane: drop parts like TradingView
-            self.header.setText(title + (f"{v('C', r['Close'])}" if S["sl_values"] else "") + chgt)
+            self.header.setText(title + short + chgt)
             if self.header.width() > avail:
-                self.header.setText(title + (f"{v('C', r['Close'])}" if S["sl_values"] else ""))
+                self.header.setText(title + short)
             if self.header.width() > avail:
                 self.header.setText(title)
         self.header.setVisible(bool(title or vals or chgt))

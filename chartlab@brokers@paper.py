@@ -25,6 +25,24 @@ def _key(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).strip().upper())
 
 
+def _paper_lot(sp) -> int | None:
+    """NSE's lot for this contract's month (the nearest listed one when the symbol names no month)."""
+    try:
+        from ..symbols import fo_lot
+        month = None
+        e = sp.expiry
+        if isinstance(e, tuple) and len(e) >= 3 and e[2]:
+            today = dt.date.today()
+            y, m = e[1], int(e[2])
+            if not y:
+                y = today.year if m >= today.month else today.year + 1
+            y = int(y) + (2000 if int(y) < 100 else 0)
+            month = f"{y:04d}-{m:02d}"
+        return fo_lot(sp.name, month)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class Paper(Broker):
     id = "paper"
     name = "Paper trading"
@@ -253,8 +271,11 @@ class Paper(Broker):
             sp = parse_symbol(str(symbol))
         except ValueError as e:
             raise BrokerError(str(e)) from None
+        lot = 1
+        if sp.kind in ("FUT", "CE", "PE"):                   # a paper lot is the exchange's lot (NIFTY 65, not 1)
+            lot = _paper_lot(sp) or 1
         return Instrument(broker="paper", token=_key(symbol), exchange=sp.exchange or "NSE", tsym=_key(symbol),
-                          name=sp.name, kind="EQ" if sp.kind == "IDX" else sp.kind, lot=1, tick=0.05)
+                          name=sp.name, kind="EQ" if sp.kind == "IDX" else sp.kind, lot=lot, tick=0.05)
 
     def place(self, req: OrderRequest) -> str:
         if req.instrument is not None and req.instrument.kind == "IDX":

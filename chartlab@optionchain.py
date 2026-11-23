@@ -39,6 +39,7 @@ class OptionChain(QtWidgets.QWidget):
 
     def __init__(self, parent=None, account_fn=None):
         super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)   # (not the window's #222 gutter)
         self.account_fn = account_fn or (lambda: None)
         self.und, self.expiry = "NIFTY", None
         self.spot = 0.0
@@ -62,6 +63,7 @@ class OptionChain(QtWidgets.QWidget):
         self.und_box.setMinimumWidth(118)
         self.exp_box = QtWidgets.QComboBox()
         self.exp_box.setToolTip("Expiry")
+        self.exp_box.setPlaceholderText("Expiry")                 # (empty until the contracts are in)
         self.exp_box.setMinimumWidth(104)
         top.addWidget(self.und_box, 1)
         top.addWidget(self.exp_box, 1)
@@ -69,7 +71,7 @@ class OptionChain(QtWidgets.QWidget):
         self.info = QtWidgets.QLabel("")
         self.info.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.info.setWordWrap(True)
-        self.info.setStyleSheet(f"color:{theme.MUTED};font-size:12px;")
+        self.info.setStyleSheet(f"color:{theme.MUTED};font-size:12px;background:transparent;padding:2px 4px;")
         v.addWidget(self.info)
         self.tbl = QtWidgets.QTableWidget(0, len(COLS))
         self.tbl.setObjectName("optchain")
@@ -95,10 +97,16 @@ class OptionChain(QtWidgets.QWidget):
             "QHeaderView::section{background:transparent;color:#787b86;border:0;border-bottom:1px solid #2a2e39;"
             "font-size:11px;padding:4px 0;}")
         v.addWidget(self.tbl, 1)
-        self.connect_btn = QtWidgets.QPushButton("Connect a Dhan account…")
-        self.connect_btn.clicked.connect(self.needAccount)
-        self.connect_btn.hide()
-        v.addWidget(self.connect_btn)
+        # no broker yet: say where the prices come from and offer the one step, instead of an empty table
+        from .fx import Placeholder
+        self.no_acct = Placeholder(
+            "chain", "Connect Dhan for the option chain",
+            "Every strike's LTP, change and open interest, live, come from your Dhan account (its Data API). "
+            "Add the client id and access token once in Accounts.",
+            (("Connect a Dhan account…", lambda: self.needAccount.emit()),))
+        self.no_acct.hide()
+        v.addWidget(self.no_acct, 1)
+        self.connect_btn = self.no_acct.buttons[0]
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(self.REFRESH_MS)
         self.timer.timeout.connect(self.refresh)
@@ -158,12 +166,11 @@ class OptionChain(QtWidgets.QWidget):
         if self._meta_job is not None or not self.isVisible():
             return
         acct = self.account_fn()
-        self.connect_btn.setVisible(acct is None)
+        self._show_no_account(acct is None)
         if acct is None:
             self.tbl.setRowCount(0)
             self._rows, self._sids = [], {}
-            self.info.setText("Option prices come from your broker. Add your Dhan client id and access token "
-                              "and the chain appears here with live prices.")
+            self.info.setText("")
             return
         if self.exp_box.count() and self.expiry is not None:
             self.refresh()
@@ -182,6 +189,11 @@ class OptionChain(QtWidgets.QWidget):
         job.failed.connect(self._meta_failed)
         job.finished.connect(lambda: setattr(self, "_meta_job", None))
         job.start()
+
+    def _show_no_account(self, none: bool):
+        self.no_acct.setVisible(none)
+        for w in (self.tbl, self.info, self.exp_box):
+            w.setVisible(not none)
 
     def _meta_failed(self, msg):
         self.info.setText(f"<span style='color:{theme.DOWN}'>{msg[:220]}</span>")

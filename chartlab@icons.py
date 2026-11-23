@@ -537,6 +537,15 @@ def cloud(p, r, c):
     p.drawPath(path.simplified())
 
 
+def market(p, r, c):
+    """Market: a heatmap - tiles of different sizes in a frame."""
+    p.drawRoundedRect(QtCore.QRectF(4.5, 5.5, 15, 13), 2, 2)
+    p.drawLine(QtCore.QPointF(11.5, 5.5), QtCore.QPointF(11.5, 18.5))
+    p.drawLine(QtCore.QPointF(11.5, 12), QtCore.QPointF(19.5, 12))
+    p.drawLine(QtCore.QPointF(15.5, 12), QtCore.QPointF(15.5, 18.5))
+    p.drawLine(QtCore.QPointF(4.5, 10), QtCore.QPointF(11.5, 10))
+
+
 def update_icon(p, r, c):
     """Updates: an arrow coming down into a tray."""
     p.drawLine(QtCore.QPointF(12, 4.5), QtCore.QPointF(12, 14.5))
@@ -545,7 +554,7 @@ def update_icon(p, r, c):
 
 
 _DRAWERS = {n: f for n, f in globals().items() if callable(f) and n in (
-    "cloud", "update_icon",
+    "cloud", "update_icon", "market",
     "cross", "pause", "step", "close", "replay_icon", "bell", "cursor", "measure", "text", "trend", "ray", "hline", "vline", "rect", "fib", "magnet", "eraser", "trash",
     "watchlist", "code", "table", "candles_icon", "layout_icon", "layout_2h", "layout_2v", "layout_4", "fx", "play",
     "latest",

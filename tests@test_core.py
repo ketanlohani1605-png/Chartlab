@@ -27,8 +27,13 @@ def test_symbols():
     assert dm.normalize_symbol("M&M") == "M&M.NS"
     assert dm.normalize_symbol("BTC-USD") == "BTC-USD"
     assert dm.normalize_symbol("US:AAPL") == "AAPL"
-    assert dm.clamp_period("1m", "2y") == "5d"
+    assert dm.clamp_period("1m", "2y") == "29d"           # a month of 1-minute bars (Yahoo: 7 days per request)
+    assert dm.clamp_period("1m", "5d") == "5d"            # no further than asked
+    assert dm.clamp_period("5m", "2y") == "60d"           # (was "1mo")
+    assert dm.clamp_period("15m", "1mo") == "1mo"
+    assert dm.clamp_period("1h", "5y") == "2y"
     assert dm.clamp_period("1d", "2y") == "2y"
+    assert dm.period_days("60d") == 60 and dm.period_days("2y") == 730 and dm.period_days("x") == 0
 
 
 def test_csv_variants():

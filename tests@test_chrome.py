@@ -103,19 +103,26 @@ assert seen.get("settings")
 passed("settings")
 
 
-# ---- the symbol search: TradingView's card (840 wide, 20 px corners), and the only dialog with a dimmed backdrop
+# ---- the symbol search: TradingView's card (840 wide, 20 px corners) on a dimmed page - the dialog covers the
+# window, so a click on the dimmed page beside the card closes it (and so does its x)
 def search(m):
     seen["search"] = type(m).__name__
-    assert m.width() == 840 and m.property("chromeScrim") and m.findChild(chrome.Header) is None
+    card = chrome.glass().card_rect(m)
+    assert card is not None and card.width() == 840 and m.property("chromeScrim") and m.findChild(chrome.Header) is None
+    assert m.size() == win.size() and m.mapToGlobal(QtCore.QPoint(0, 0)) == win.mapToGlobal(QtCore.QPoint(0, 0))
+    assert m.windowFlags() & QtCore.Qt.WindowType.NoDropShadowWindowHint, "the card draws its own shadow"
     s = win.findChild(chrome.Scrim, "chromeScrim")
-    assert s is not None and s.isVisible() and s.geometry() == win.rect()
-    QtTest.QTest.qWait(260)
-    assert abs(s._a - 102) < 1, s._a
+    assert s is None or not s.isVisible(), "the overlay dims the page itself"
+    o = card.topLeft()
+    at = lambda wd: wd.mapTo(m, QtCore.QPoint(0, 0)) - o  # noqa: E731
     assert m.lst.itemDelegate().sizeHint(QtWidgets.QStyleOptionViewItem(), m.lst.model().index(0, 0)).height() == 58
     chips = m.chips
     assert chips[0].isChecked() and chips[0].height() == 28 and chips[1].x() - (chips[0].x() + chips[0].width()) == 4
-    assert chips[0].mapTo(m, QtCore.QPoint(0, 0)) == QtCore.QPoint(20, 68)
-    assert m.lst.mapTo(m, QtCore.QPoint(0, 0)).y() == 113 and m.edit.mapTo(m, QtCore.QPoint(0, 0)).x() == 52
+    assert at(chips[0]) == QtCore.QPoint(20, 68), at(chips[0])
+    assert at(m.lst).y() == 113 and at(m.edit).x() == 52
+    x = m.close_btn
+    assert x.isVisible() and x.size() == QtCore.QSize(33, 33)
+    assert card.right() - (x.mapTo(m, QtCore.QPoint(0, 0)).x() + x.width()) < 24, "top right of the card"
     # it opened on the letter typed on the chart: that letter is the start of the name, the next keys follow it
     assert m.edit.text() == "N" and not m.edit.hasSelectedText() and m.edit.cursorPosition() == 1
     QtTest.QTest.keyClicks(m.edit, "if")
@@ -124,16 +131,34 @@ def search(m):
     QtTest.QTest.keyClicks(m.edit, "rel")
     assert m.edit.text() == "REL" and m.clear_btn.isVisible() and not m.hint.isVisible()
     img = m.grab().toImage()
-    assert alpha(img, 1, 1) == 0 and alpha(img, 4, 4) == 0 and alpha(img, 420, 3) == 255
+    assert alpha(img, 5, 5) == 102, alpha(img, 5, 5)                     # the dimmed page: rgba(26,26,26,0.4)
+    assert alpha(img, card.left() + 1, card.top() + 1) < 102 + 40, "the card's round corner"
+    assert alpha(img, card.left() + 420, card.top() + 3) == 255
+    # a click inside the card does nothing; one beside it closes the dialog
+    QtTest.QTest.mouseClick(m, QtCore.Qt.MouseButton.LeftButton, pos=card.center() + QtCore.QPoint(0, 260))
+    assert m.isVisible()
+    QtTest.QTest.mouseClick(m, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(card.left() - 40, card.top() + 50))
+    assert not m.isVisible(), "a click on the dimmed page closes it"
 
 
 during(search, wait=900)
 win.open_symbol_search("N")
 assert seen.get("search") == "SymbolSearch"
-passed("symbol search")
 QtTest.QTest.qWait(300)
 s = win.findChild(chrome.Scrim, "chromeScrim")
-assert s is not None and not s.isVisible() and s.users == 0, "the window stayed dimmed"
+assert s is None or (not s.isVisible() and s.users == 0), "the window stayed dimmed"
+
+
+def search_x(m):                                       # ... and its x closes it
+    seen["search_x"] = True
+    QtTest.QTest.mouseClick(m.close_btn, QtCore.Qt.MouseButton.LeftButton)
+    assert not m.isVisible()
+
+
+during(search_x, wait=500)
+win.open_symbol_search("")
+assert seen.get("search_x")
+passed("symbol search")
 
 
 # ---- a dialog whose own first line repeats its title: the header carries it, once

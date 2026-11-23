@@ -790,6 +790,7 @@ class AccountsDialog(QtWidgets.QDialog):
             while lay.count():
                 it = lay.takeAt(0)
                 if it.widget():
+                    it.widget().hide()                         # gone at once, not when the loop gets to it
                     it.widget().deleteLater()
         self.inputs = {}
         c = self._cls()
