@@ -203,9 +203,30 @@ assert W._is_index_ticker("^NSEI") and not W._is_index_ticker("RELIANCE.NS")
 # ---------------------------------------------------------------- accounts: a removed field is gone at once
 from chartlab import accounts as A  # noqa: E402
 
-d = A.AccountsDialog(win)
+d = A.AccountsDialog(win, __import__("pathlib").Path(tempfile.mkdtemp()) / "acc.json")
 d.show()
 pump(100)
+# the broker is picked with chips (the combo box holds the value); each has its steps; the buttons stay in sight
+assert d.broker.isHidden() and set(d.chips) == set(A.BROKERS) and d.chips["dhan"].isChecked()
+assert "web.dhan.co" in d.card.text() and not d.login_btn.isVisible() and not d.redirect_row.isVisible(), \
+    "Dhan: client id + token; the browser login is under 'More ways to log in'"
+d.more.setChecked(True)
+assert d.login_btn.isVisible() and d.redirect_row.isVisible()
+d.more.setChecked(False)
+d.chips["zerodha"].click()
+assert d.broker.currentData() == "zerodha" and d.chips["zerodha"].isChecked() and not d.chips["dhan"].isChecked()
+assert "developers.kite.trade" in d.card.text() and d.login_btn.isVisible() and d.show_tok.isVisible()
+assert d.login_btn.text() == "Log in with Zerodha" and d.redirect_row.isVisible()
+d.broker.setCurrentIndex(d.broker.findData("paper"))            # (set from code: the chip follows)
+assert d.chips["paper"].isChecked() and not d.show_tok.isVisible() and not d.live_note.isVisible()
+assert not d.live.isVisible() and not d.tbtn.isVisible()
+foot = d.findChild(QtWidgets.QFrame, "foot")
+save_btn = next(b for b in foot.findChildren(QtWidgets.QPushButton) if b.text() == "Save")
+assert save_btn.isVisible() and not d.scroll.widget().isAncestorOf(save_btn), "Save is under the form, not in it"
+assert d.scroll.horizontalScrollBar().maximum() == 0, "the form fits the dialog's width"
+assert all(k in A.STEPS and len(A.STEPS[k]) == 3 and k in A.BROKER_COLOR for k in A.BROKERS)
+d.broker.setCurrentIndex(d.broker.findData("dhan"))
+pump(30)
 old = [d.fields_lay.itemAt(i).widget() for i in range(d.fields_lay.count())]
 assert old
 d.broker.setCurrentIndex(d.broker.findData("paper"))

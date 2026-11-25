@@ -309,6 +309,7 @@ class BandFill(pg.GraphicsObject):
         xs = idx[ok].astype(float) + self.offset
         u, lo = u[ok], lo[ok]
         p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)   # (its edges lie under the band's lines)
         P = QtCore.QPointF
         if self.brush_dn is None:
             pts = [P(a, b) for a, b in zip(xs.tolist(), u.tolist())]

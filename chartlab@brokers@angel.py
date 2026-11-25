@@ -64,7 +64,7 @@ class Angel(Broker):
                       "modify", "cancel", "positions", "holdings", "funds", "margin", "amo", "bracket"})
     fields = [("api_key", "API key", "text", True, "From smartapi.angelbroking.com -> My apps"),
               ("client_code", "Client code", "text", True, "Your Angel One login id"),
-              ("pin", "PIN", "pin", False, "Kept only on this Mac. Leave empty to type it at each login"),
+              ("pin", "PIN", "pin", False, "Kept only on this computer. Leave empty to type it at each login"),
               ("totp_secret", "TOTP key", "totp", False, "Optional: the key behind your authenticator, for one-click login"),
               ("access_token", "Session token", "secret", False, "Filled in by Log in")]
     products = ("INTRADAY", "DELIVERY", "MARGIN", "MTF")

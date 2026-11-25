@@ -492,6 +492,42 @@ def data_loaders(path: Path | None = None, include_failed: bool = True) -> list:
 
 
 # ---------------------------------------------------------------------- UI
+# each broker's own colour (its avatar in the list, its chip in the form) - told apart at a glance
+BROKER_COLOR = {"dhan": "#16a085", "zerodha": "#e8590c", "upstox": "#7048e8", "angel": "#1971c2", "fyers": "#2f9e44",
+                "paper": "#5c6370"}
+
+# a new account: the three steps, in the broker's own words (what the fields' hints point at)
+STEPS = {
+    "dhan": ("On web.dhan.co open DhanHQ Trading APIs and generate an access token",
+             "Paste your Client ID and the token here",
+             "Test connection, then Save"),
+    "zerodha": ("On developers.kite.trade create an app with the redirect URL shown below",
+                "Paste its API key and API secret here",
+                "Log in with Zerodha, then Save"),
+    "upstox": ("In Upstox's developer apps create an app with the redirect URL shown below",
+               "Paste its API key and secret here",
+               "Log in with Upstox, then Save"),
+    "angel": ("On smartapi.angelbroking.com create an app (My apps)",
+              "Paste its API key and your client code here",
+              "Log in with PIN + TOTP, then Save"),
+    "fyers": ("On myapi.fyers.in/dashboard create an app with the redirect URL below",
+              "Paste its App ID and secret key here",
+              "Log in with Fyers, then Save"),
+    "paper": ("Name the account", "Set the starting cash (or leave the default)",
+              "Save - then practise on the prices on your charts"),
+}
+
+
+def _steps_html(broker: str) -> str:
+    st = STEPS.get(broker)
+    if not st:
+        return ""
+    col = BROKER_COLOR.get(broker, "#2962ff")
+    rows = "".join(f"<tr><td style='color:{col};font-weight:700;padding:1px 8px 1px 0'>{k}</td>"
+                   f"<td style='color:#b2b5be;padding:1px 0'>{t}</td></tr>" for k, t in enumerate(st, 1))
+    return f"<table cellspacing='0' cellpadding='0'>{rows}</table>"
+
+
 class _AccountCard(QtWidgets.QStyledItemDelegate):
     def sizeHint(self, option, index):
         return QtCore.QSize(option.rect.width(), 62)
@@ -508,7 +544,7 @@ class _AccountCard(QtWidgets.QStyledItemDelegate):
         p.drawRoundedRect(r, 10, 10)
         av = QtCore.QRect(r.left() + 12, r.center().y() - 16, 32, 32)
         p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(QtGui.QColor(theme.ACCENT))
+        p.setBrush(QtGui.QColor(BROKER_COLOR.get(a.get("broker"), theme.ACCENT)))
         p.drawEllipse(av)
         f = QtGui.QFont(option.font)
         f.setBold(True)
@@ -534,6 +570,9 @@ class _AccountCard(QtWidgets.QStyledItemDelegate):
         p.setBrush(dc)
         p.drawEllipse(QtCore.QPoint(av.right() - 2, av.bottom() - 2), 6, 6)
         live = bool(a.get("live"))
+        if a.get("broker") == "paper":                         # a practice account: nothing to tell apart
+            p.restore()
+            return
         col = QtGui.QColor(theme.DOWN if live else "#787b86")
         badge = QtCore.QRect(r.right() - 64, r.center().y() - 10, 54, 20)
         fill = QtGui.QColor(col)
@@ -557,7 +596,7 @@ class AccountsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.path = path
         self.setWindowTitle("Broker accounts")
-        self.resize(900, 640)
+        self.resize(960, 660)
         self.setStyleSheet(f"QDialog {{ background: #1e1e1e; }} QLabel#h {{ font-size: 15px; font-weight: 700; color: white; }} "
                            f"QLabel#sub {{ color: {theme.MUTED}; font-size: 12px; }} QLabel#lbl {{ color: {theme.MUTED}; font-size: 11px; }} "
                            f"QLineEdit, QDoubleSpinBox, QComboBox {{ background: #121212; border: 1px solid #3a3a3a; "
@@ -565,8 +604,19 @@ class AccountsDialog(QtWidgets.QDialog):
                            f"QLineEdit:focus, QDoubleSpinBox:focus {{ border-color: {theme.ACCENT}; }} "
                            f"QPushButton#danger {{ background: transparent; color: {theme.DOWN}; }} "
                            f"QPushButton#danger:hover {{ background: rgba(242,54,69,40); }} "
-                           f"QPushButton#login {{ background: #2a2e39; border: 1px solid #434651; border-radius: 6px; "
-                           f"padding: 6px 12px; color: white; font-weight: 600; }} QPushButton#login:hover {{ border-color: {theme.ACCENT}; }}")
+                           f"QPushButton#login {{ background: {theme.ACCENT}; border: 0; border-radius: 8px; "
+                           f"padding: 8px 16px; color: white; font-weight: 600; }} "
+                           f"QPushButton#login:hover {{ background: #1e53e5; }} "
+                           f"QPushButton#login:disabled {{ background: #2a2e39; color: #787b86; }} "
+                           f"QLabel#sec {{ color: #dbdbdb; font-size: 13px; font-weight: 600; padding-top: 8px; }} "
+                           f"QPushButton#chip {{ background: #121212; border: 1px solid #3a3a3a; border-radius: 15px; "
+                           f"padding: 5px 10px 5px 6px; color: #b2b5be; }} QPushButton#chip:hover {{ border-color: #5d606b; }} "
+                           f"QPushButton#chip:checked {{ background: #262626; border-color: #dbdbdb; color: white; "
+                           f"font-weight: 600; }} "
+                           f"QFrame#foot {{ background: #1a1a1a; border-top: 1px solid #2a2a2a; }} "
+                           f"QFrame#foot QLabel {{ background: transparent; }} "
+                           f"QWidget#infobox {{ background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; }} "
+                           f"QWidget#infobox QLabel {{ background: transparent; }}")
         self.accts = load_accounts(path)
         self.editing = -1
         self.inputs: dict = {}
@@ -617,19 +667,21 @@ class AccountsDialog(QtWidgets.QDialog):
         lv.addLayout(many)
         root.addWidget(left)
 
-        scroll = QtWidgets.QScrollArea()
+        scroll = self.scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         right = QtWidgets.QWidget()
         scroll.setWidget(right)
         rv = QtWidgets.QVBoxLayout(right)
-        rv.setContentsMargins(28, 20, 28, 18)
+        rv.setContentsMargins(28, 20, 28, 14)
         rv.setSpacing(6)
         self.title = QtWidgets.QLabel("New account")
         self.title.setObjectName("h")
         rv.addWidget(self.title)
-        sub = QtWidgets.QLabel("Live prices, candles, the Trading Panel and scripts use these accounts. Saved only on "
-                               "this Mac (~/ChartLab/accounts.json, private to your user); sent only to the broker itself.")
+        sub = QtWidgets.QLabel("Charts, live prices and the Trading Panel use this account. Its details stay on this "
+                               "computer and go only to the broker itself.")
+        sub.setToolTip("Saved in ~/ChartLab/accounts.json, readable only by your user")
         sub.setObjectName("sub")
         sub.setWordWrap(True)
         rv.addWidget(sub)
@@ -654,8 +706,36 @@ class AccountsDialog(QtWidgets.QDialog):
         for k, tt in BROKERS.items():
             self.broker.addItem(tt, k)
         self.broker.currentIndexChanged.connect(lambda _i: self._build_fields())
+        self.broker.currentIndexChanged.connect(self._sync_chips)
         rv.addWidget(lab("Broker"))
+        self.broker.hide()                                   # (the value; picked with the chips below)
         rv.addWidget(self.broker)
+        chips = QtWidgets.QHBoxLayout()
+        chips.setSpacing(6)
+        self.chips = {}
+        self._chip_group = QtWidgets.QButtonGroup(self)
+        self._chip_group.setExclusive(True)
+        for k, tt in BROKERS.items():
+            b = QtWidgets.QPushButton("Paper" if k == "paper" else tt)
+            b.setToolTip(tt)
+            b.setObjectName("chip")
+            b.setCheckable(True)
+            b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            pm = QtGui.QPixmap(20, 20)
+            pm.fill(QtCore.Qt.GlobalColor.transparent)
+            qp = QtGui.QPainter(pm)
+            qp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            qp.setPen(QtCore.Qt.PenStyle.NoPen)
+            qp.setBrush(QtGui.QColor(BROKER_COLOR.get(k, theme.ACCENT)))
+            qp.drawEllipse(5, 5, 10, 10)
+            qp.end()
+            b.setIcon(QtGui.QIcon(pm))
+            b.clicked.connect(lambda _c=False, key=k: self.broker.setCurrentIndex(self.broker.findData(key)))
+            self._chip_group.addButton(b)
+            self.chips[k] = b
+            chips.addWidget(b)
+        chips.addStretch(1)
+        rv.addLayout(chips)
         rv.addSpacing(4)
         self.fields_box = QtWidgets.QWidget()
         self.fields_lay = QtWidgets.QVBoxLayout(self.fields_box)
@@ -677,8 +757,10 @@ class AccountsDialog(QtWidgets.QDialog):
         self.show_tok.toggled.connect(self._echo)
         rv.addWidget(self.show_tok)
         self.redirect_row = QtWidgets.QWidget()
+        self.redirect_row.setObjectName("infobox")
+        self.redirect_row.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         rr = QtWidgets.QHBoxLayout(self.redirect_row)
-        rr.setContentsMargins(0, 2, 0, 2)
+        rr.setContentsMargins(12, 6, 6, 6)
         self.redirect_lbl = QtWidgets.QLabel("")
         self.redirect_lbl.setObjectName("sub")
         self.redirect_lbl.setWordWrap(True)
@@ -710,28 +792,48 @@ class AccountsDialog(QtWidgets.QDialog):
         pr.addWidget(pb)
         self.paste_row.hide()
         rv.addWidget(self.paste_row)
-        rv.addSpacing(4)
+        sec = QtWidgets.QLabel("Orders")
+        sec.setObjectName("sec")
+        rv.addWidget(sec)
         self.mult = QtWidgets.QDoubleSpinBox()
         self.mult.setRange(0.1, 1000)
         self.mult.setDecimals(2)
         self.mult.setValue(1.0)
+        self.mult.setFixedWidth(110)
+        self.mult.lineEdit().setTextMargins(8, 0, 0, 0)
         self.mult.setToolTip("2 = double the quantity/lots a script or a broadcast order sends on this account")
-        rv.addWidget(lab("Quantity multiplier"))
-        rv.addWidget(self.mult)
-        rv.addSpacing(4)
+        mrow = QtWidgets.QHBoxLayout()
+        mrow.setSpacing(12)
+        mrow.addWidget(self.mult)
+        mnote = QtWidgets.QLabel("<b style='color:#b2b5be'>Quantity multiplier</b><br>2 doubles what a script or a "
+                                 "broadcast order sends on this account")
+        mnote.setObjectName("sub")
+        mnote.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        mnote.setWordWrap(True)
+        mrow.addWidget(mnote, 1)
+        rv.addLayout(mrow)
+        rv.addSpacing(6)
         self.live = QtWidgets.QCheckBox("  Live orders  -  REAL money")
         self.live.setStyleSheet(f"QCheckBox {{ color: {theme.DOWN}; font-weight: 600; }}")
         self.live.setToolTip("Off = paper: orders fill on ChartLab's paper broker, nothing reaches the broker")
         rv.addWidget(self.live)
-        note = QtWidgets.QLabel("Leave off to test safely: while it is off, orders on this account are paper orders.")
+        note = self.live_note = QtWidgets.QLabel("Leave off to test safely: while it is off, orders on this account "
+                                                 "are paper orders.")
         note.setObjectName("sub")
         note.setWordWrap(True)
         rv.addWidget(note)
         rv.addStretch(1)
+        # the buttons stay in sight: a footer under the form, not at the end of a long scroll
+        foot = QtWidgets.QFrame()
+        foot.setObjectName("foot")
+        fv = QtWidgets.QVBoxLayout(foot)
+        fv.setContentsMargins(28, 10, 28, 12)
+        fv.setSpacing(8)
         self.msg = QtWidgets.QLabel("")
         self.msg.setWordWrap(True)
         self.msg.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        rv.addWidget(self.msg)
+        self.msg.hide()
+        fv.addWidget(self.msg)
         btns = QtWidgets.QHBoxLayout()
         self.del_btn = d = QtWidgets.QPushButton("Delete")
         d.setObjectName("danger")
@@ -754,8 +856,13 @@ class AccountsDialog(QtWidgets.QDialog):
         sb.setDefault(True)
         sb.clicked.connect(self.save)
         btns.addWidget(sb)
-        rv.addLayout(btns)
-        root.addWidget(scroll, 1)
+        fv.addLayout(btns)
+        col = QtWidgets.QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        col.addWidget(scroll, 1)
+        col.addWidget(foot)
+        root.addLayout(col, 1)
         self._poll = QtCore.QTimer(self)
         self._poll.setInterval(300)
         self._poll.timeout.connect(self._check_catch)
@@ -819,10 +926,11 @@ class AccountsDialog(QtWidgets.QDialog):
         self.more.setVisible(extra)
         self.more_box.setVisible(extra and self.more.isChecked())
         caps = c.caps
-        self.login_btn.setVisible("login_oauth" in caps)
+        token_first = c.id == "dhan" and not self.more.isChecked()   # Dhan: a pasted token is the short way
+        self.login_btn.setVisible("login_oauth" in caps and not token_first)
         self.login_btn.setText(f"Log in with {c.name}")
         self.totp_btn.setVisible("login_totp" in caps and (c.id != "dhan" or self.more.isChecked()))
-        self.redirect_row.setVisible("login_oauth" in caps)
+        self.redirect_row.setVisible("login_oauth" in caps and not token_first)
         self.redirect_lbl.setText(f"In your {c.name} API app, set the redirect URL to <b>{self._redirect()}</b>")
         self.redirect_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.rbtn.setVisible("renew" in caps and self.editing >= 0)
@@ -830,18 +938,24 @@ class AccountsDialog(QtWidgets.QDialog):
         if c.id == "paper":
             self.live.setChecked(False)
         self.live.setVisible(c.id != "paper")
+        self.live_note.setVisible(c.id != "paper")             # (a practice account has no live switch to explain)
+        self.show_tok.setVisible(any(f[2] in ("secret", "pin", "totp") for f in c.fields))
+        self._sync_chips()
         if self.editing < 0:
-            hint = {"paper": "A practice account: set the starting cash and trade on the prices on your charts.",
-                    "dhan": "Fill in the Client ID and paste the access token (or use More ways to log in).",
-                    "angel": "Fill in the API key and client code, then Log in with PIN + TOTP.",
-                    }.get(c.id, f"Fill in the {c.name} app details, then Log in with {c.name}.")
-            self.card.setText(f"<span style='color:#787b86'>{hint}</span>")
+            self.card.setText(_steps_html(c.id))
+
+    def _sync_chips(self, *_a):
+        b = getattr(self, "chips", {}).get(self.broker.currentData())
+        if b is not None and not b.isChecked():
+            b.setChecked(True)
 
     def _more_toggled(self, on):
         self.more.setText("More ways to log in ▾" if on else "More ways to log in ▸")
         self.more_box.setVisible(on)
         self.totp_btn.setVisible("login_totp" in self._cls().caps and (self._cls().id != "dhan" or on))
         self.login_btn.setVisible("login_oauth" in self._cls().caps and (self._cls().id != "dhan" or on))
+        self.redirect_row.setVisible(self.login_btn.isVisibleTo(self) or
+                                     ("login_oauth" in self._cls().caps and (self._cls().id != "dhan" or on)))
 
     def _echo(self, on):
         c = self._cls()
@@ -896,6 +1010,7 @@ class AccountsDialog(QtWidgets.QDialog):
     def _say(self, text: str, ok: bool | None = None):
         col = theme.UP if ok else (theme.DOWN if ok is False else theme.MUTED)
         self.msg.setText(f"<span style='color:{col}'>{text}</span>")
+        self.msg.setVisible(bool(text))
 
     # ------------------------------------------------------------------ list
     def _fill(self, keep: str = ""):
@@ -1338,7 +1453,7 @@ class BulkAddDialog(QtWidgets.QDialog):
         h.setObjectName("h")
         v.addWidget(h)
         sub = QtWidgets.QLabel("One account per line:  <b>name, client id, access token</b>  (commas, tabs or spaces; a line "
-                               "copied from Excel works). The token stays on this Mac. Every account is added as "
+                               "copied from Excel works). The token stays on this computer. Every account is added as "
                                "<b>PAPER</b> - you switch on live orders yourself, one account at a time.")
         sub.setObjectName("sub")
         sub.setWordWrap(True)

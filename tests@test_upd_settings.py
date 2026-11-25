@@ -9,7 +9,7 @@ from chartlab.mainwindow import MainWindow
 win=MainWindow(QtCore.QSettings(os.path.join(__import__("tempfile").mkdtemp(), "t.ini"), QtCore.QSettings.Format.IniFormat)); win.show(); app.processEvents()
 updater.check=lambda cur, timeout=12.0: None
 d=cs.SettingsDialog(win, cs.SettingsDialog.UPDATES_TAB); d.show(); app.processEvents()
-assert d.stack.currentIndex()==4
+assert d.stack.currentIndex()==cs.SettingsDialog.UPDATES_TAB==5   # (Navigation is page 4)
 d.upd_check.click()
 for _ in range(60): app.processEvents(); QtTest.QTest.qWait(20)
 assert "newest version" in d.upd_state.text(), d.upd_state.text()

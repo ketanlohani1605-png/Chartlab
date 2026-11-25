@@ -1862,10 +1862,17 @@ class MainWindow(QtWidgets.QMainWindow):
         t = ev.type()
         if t == QtCore.QEvent.Type.KeyPress and self._route_key(ev, obj):
             return True
-        if t == QtCore.QEvent.Type.Polish and isinstance(obj, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
-            le = obj.findChild(QtWidgets.QLineEdit)        # Qt drops a spin box's left padding when its arrow
-            if le is not None and le.textMargins().left() == 0:   # buttons are hidden: indent the text like
-                le.setTextMargins(7, 0, 0, 0)                     # every other input field
+        if t == QtCore.QEvent.Type.Polish:
+            if isinstance(obj, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+                le = obj.findChild(QtWidgets.QLineEdit)        # Qt drops a spin box's left padding when its arrow
+                if le is not None and le.textMargins().left() == 0:   # buttons are hidden: indent the text like
+                    le.setTextMargins(7, 0, 0, 0)                     # every other input field
+            elif isinstance(obj, QtWidgets.QAbstractItemView):
+                # every list and table scrolls by the pixel: a trackpad glides through them instead of jumping a
+                # whole row at a time (Qt's default)
+                SM = QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel
+                obj.setVerticalScrollMode(SM)
+                obj.setHorizontalScrollMode(SM)
         return super().eventFilter(obj, ev)
 
     def _route_key(self, ev, target=None) -> bool:

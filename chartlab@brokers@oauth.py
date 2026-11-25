@@ -1,4 +1,4 @@
-"""Browser login: ChartLab opens the broker's login page and listens on this Mac (127.0.0.1 only) for the redirect
+"""Browser login: ChartLab opens the broker's login page and listens on this computer (127.0.0.1 only) for the redirect
 that carries the login result. Nothing is sent anywhere; the page the browser lands on just says it is done.
 
 The same redirect address must be saved in the broker's API app settings (ChartLab shows it with a Copy button):
@@ -34,7 +34,7 @@ def check_redirect(url: str) -> str:
     """'' when ChartLab can listen on this redirect address itself, else why not."""
     u = urllib.parse.urlsplit(url or "")
     if u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost"):
-        return ("ChartLab can only catch a redirect to http://127.0.0.1:<port>/... on this Mac. With another address, "
+        return ("ChartLab can only catch a redirect to http://127.0.0.1:<port>/... on this computer. With another address, "
                 "paste the page address you land on after logging in.")
     if not u.port:
         return "The redirect address needs a port, like http://127.0.0.1:8767/callback"

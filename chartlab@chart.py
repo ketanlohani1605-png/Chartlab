@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 
 import numpy as np
 import pandas as pd
@@ -21,8 +22,11 @@ from .gestures import TVViewBox
 # ~120/s, so crosshair and drags would skip. Qt already compresses moves when busy, so take every one.
 pg.setConfigOption("mouseRateLimit", 0)
 from .render import BandFill, CandleItem, DotsItem, HistItem, VolumeItem, vol_color
+from . import fastpaint
+fastpaint.install()                 # a crosshair move restrokes only the bits of each line it uncovered
 
 _QWIDGETSIZE_MAX = 16777215
+_TI_GEN = __import__("itertools").count(1)
 STYLES = ["candles", "hollow", "bars", "heikin", "line", "linemark", "step", "area", "baseline"]
 INDICATOR_KEYS = list(STD.KEYS)
 
@@ -369,6 +373,7 @@ class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
             T.update(newyear=newyear, newmonth=newmonth, newday=newday, year=y, month=mo,
                      day_id=np.cumsum(chg(d) | chg(mo) | chg(y)), cross={})
         self._weight = w
+        T["gen"] = next(_TI_GEN)                       # (a new table: label choices made for an older one are stale)
         self._ti = T
 
     def share_index(self, other):
@@ -397,6 +402,14 @@ class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
         if hi < lo:
             return []
         span = hi - lo
+        # panning at the same zoom: the labels were already chosen over a stretch wider than the screen (that is
+        # what keeps them in place) - reuse them while the screen stays inside it, instead of choosing again at
+        # every frame (it was the costliest part of the time scale)
+        ck = (round(k, 9), T.get("gen"), n, int(T.get("bar_min", 1)), self.intraday)
+        hit = getattr(self, "_tv_cache", None)
+        if hit is not None and hit[0] == ck and hit[1] <= lo and hi <= hit[2]:
+            lo_v, hi_v = minVal - 0.5, maxVal + 0.5
+            return [(max(k, 1.0), [float(v) for v in hit[3] if lo_v <= v <= hi_v])]
         # everything is worked out over a wider stretch than the screen, so the labels stay put while panning
         elo, ehi = max(lo - max(span, 300), 0), min(hi + max(span, 300), n - 1)
         chosen: list[int] = []
@@ -465,6 +478,9 @@ class DateAxis(_BoldLabelsMixin, _DotGridMixin, pg.AxisItem):
                 if not len(gaps) or np.mean(gaps >= k - 1e-9) >= 0.75:
                     place(c)
                     break
+        # (the edges of the stretch are not reused: a label there could still change with a wider stretch)
+        keep = max(span, 300) // 2
+        self._tv_cache = (ck, elo + keep if elo > 0 else 0, ehi - keep if ehi < n - 1 else n - 1, tuple(chosen))
         lo_v, hi_v = minVal - 0.5, maxVal + 0.5
         return [(max(k, 1.0), [float(v) for v in chosen if lo_v <= v <= hi_v])]
 
@@ -1221,6 +1237,7 @@ class ChartWidget(QtWidgets.QWidget):
         self._ind_timer.setSingleShot(True)
         self._ind_timer.setInterval(1000)
         self._ind_timer.timeout.connect(self._refresh_indicators)
+        self._drafting = False                               # the chart is being moved: quick drawing (_motion)
         self.replay = {"active": False, "picking": False, "playing": False, "speed": 1.0}
         self._enabled: set[str] = set()
         self._ind_order: list[str] = []      # the order indicators were added in (panes keep it)
@@ -1410,8 +1427,11 @@ class ChartWidget(QtWidgets.QWidget):
         p.getAxis("right").setWidth(72 if not self.axes[1:] else self.price.getAxis("right").width())
         S = settings.get()
         f = _scale_font(S)
+        for name in ("left", "top"):                          # (hidden, but they follow every move too)
+            p.getAxis(name).enableAutoSIPrefix(False)
         for name in ("bottom", "right"):
             ax = p.getAxis(name)
+            ax.enableAutoSIPrefix(False)                      # (no unit labels: it only re-laid text at every move)
             ax.setPen(pg.mkPen(S.get("bg", "#000000")))      # TradingView draws no line between chart and scales
             ax.setTextPen(pg.mkPen(S.get("text_color", AXIS_TEXT)))
             ax.setStyle(tickFont=f, tickLength=0,
@@ -1584,10 +1604,14 @@ class ChartWidget(QtWidgets.QWidget):
             if self._trackpad_scroll(ev):
                 return True
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.NativeGesture:
-            if ev.gestureType() == QtCore.Qt.NativeGestureType.ZoomNativeGesture:
-                pos = self.price.vb.mapSceneToView(self.glw.mapToScene(ev.position().toPoint()))
-                self.price.vb._stop_anim()
-                self.price.vb.zoom_x(float(np.exp(-ev.value() * 1.6)), pos.x())    # pinch: around the fingers
+            if ev.gestureType() == QtCore.Qt.NativeGestureType.ZoomNativeGesture and self.df is not None:
+                from .gestures import nav
+                if not nav().get("pinch", True):
+                    return True
+                vb = self.price.vb
+                pos = vb.mapSceneToView(self.glw.mapToScene(ev.position().toPoint()))
+                vb._stop_anim()
+                vb.queue(zoom=float(np.exp(-ev.value() * 1.6)), anchor=pos.x())   # pinch: around the fingers
                 return True
         if obj is self.glw.viewport() and ev.type() == QtCore.QEvent.Type.KeyPress:
             if self.handle_key(ev):
@@ -1596,8 +1620,21 @@ class ChartWidget(QtWidgets.QWidget):
 
     def _trackpad_scroll(self, ev) -> bool:
         """Two fingers on a trackpad, like TradingView on a Mac: sideways drags the chart 1:1 with the fingers
-        (macOS adds the glide after you let go), up / down zooms continuously. Pixel-exact and applied at once -
-        no stepping, no restarted animations. A real mouse wheel has no pixel delta and keeps its eased zoom."""
+        (macOS adds the glide after you let go), up / down zooms (Settings -> Navigation: or moves the chart, or
+        nothing). Pixel-exact, gathered and applied once per frame. A real mouse wheel has no pixel delta and keeps
+        its eased zoom.
+
+        One direction per swipe: the first few pixels decide whether it is a sideways or an up / down swipe and the
+        rest of that swipe (and its glide) keeps to it - a sideways swipe with the fingers drifting never zooms. The
+        glide after an up / down swipe is dropped: the zoom stops when the fingers lift."""
+        Ph = QtCore.Qt.ScrollPhase
+        phase = ev.phase()
+        now = time.monotonic()
+        tp = getattr(self, "_tp", None)
+        if tp is None or phase == Ph.ScrollBegin or (phase in (Ph.NoScrollPhase, Ph.ScrollUpdate)
+                                                     and now - tp["t"] > 0.25):
+            tp = self._tp = {"axis": None, "dx": 0.0, "dy": 0.0, "t": now}    # fingers down: a new swipe
+        tp["t"] = now
         pd_ = ev.pixelDelta()
         if pd_.isNull():
             return False
@@ -1605,26 +1642,43 @@ class ChartWidget(QtWidgets.QWidget):
         plot = next((p for p in self._plots() if p.isVisible() and p.vb.sceneBoundingRect().contains(pt)), None)
         if plot is None:
             return False                                   # over a scale: the normal handler scales that axis
-        vb = self.price.vb
         mods = ev.modifiers()
         if mods & QtCore.Qt.KeyboardModifier.ShiftModifier:
             return False
+        from .gestures import nav, zoom_power
+        S = nav()
+        vb = self.price.vb
+        ev.accept()
         vb._stop_anim()
         vb._vel = 0.0
+        dx, dy = float(pd_.x()), float(pd_.y())
+        if tp["axis"] is None:                             # still deciding: gather the first few pixels
+            tp["dx"] += dx
+            tp["dy"] += dy
+            if abs(tp["dx"]) + abs(tp["dy"]) < 4.0:
+                return True
+            tp["axis"] = "x" if abs(tp["dx"]) >= abs(tp["dy"]) else "y"
+            dx, dy = tp["dx"], tp["dy"]                    # what was held back is applied now
+        momentum = phase == Ph.ScrollMomentum
         (x0, x1) = vb.viewRange()[0]
         w = max(vb.width(), 1.0)
-        dx, dy = pd_.x(), pd_.y()
-        if abs(dx) >= abs(dy):                              # one direction at a time, whichever the fingers mean
-            dy = 0
-        else:
-            dx = 0
-        if dx:
-            vb.pan_x(-dx * (x1 - x0) / w)
-        if dy:
-            focused = bool(mods & (QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier))
-            anchor = vb.mapSceneToView(pt).x() if focused else min(x1, self.x_limit() + 2)
-            vb.zoom_x(float(np.exp(-dy / 240.0)), anchor)
-        ev.accept()
+        if tp["axis"] == "x":
+            if momentum and not S.get("momentum", True):
+                return True
+            if dx:
+                vb.queue(dx=-dx * (x1 - x0) / w)
+            return True
+        mode = S.get("trackpad_v", "zoom")
+        if momentum or not dy or mode == "off":
+            return True
+        if mode == "move":                                 # up / down moves the chart, like a drag
+            (y0, y1) = vb.viewRange()[1]
+            vb.queue(dy=dy * (y1 - y0) / max(vb.height(), 1.0))
+            return True
+        focused = bool(mods & (QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier))
+        at_cursor = focused != (S.get("zoom_anchor") == "cursor")
+        anchor = vb.mapSceneToView(pt).x() if at_cursor else vb.latest_anchor
+        vb.queue(zoom=float(np.exp(-dy / 240.0 * zoom_power(S))), anchor=anchor)
         return True
 
     # ------------------------------------------------------------------ replay (TradingView "Bar Replay")
@@ -1759,12 +1813,92 @@ class ChartWidget(QtWidgets.QWidget):
             self._refresh_crosshair()
         QtCore.QTimer.singleShot(0, run)
 
+    # ------------------------------------------------------------------ moving the chart smoothly
+    MOTION_MS = 160            # no movement for this long = the chart rests (full-quality frame)
+
+    def _settle_views(self):
+        """Right after a range change, every view's transform at once (see TVViewBox.setRange): one paint per
+        frame instead of two."""
+        for pl in [getattr(self, "price", None), getattr(self, "vol", None)] + \
+                [pn.plot for pn in getattr(self, "panes", [])]:
+            if pl is not None:
+                try:
+                    pl.vb.updateMatrix()
+                except RuntimeError:                     # (closing)
+                    pass
+
+    def _motion(self):
+        """The user is moving the chart (drag, swipe, wheel, pinch, a glide). Until it rests the indicator lines are
+        drawn with the quick pen - Qt strokes an anti-aliased line wider than one pixel about 20x slower (measured:
+        1.6 ms per line per frame on a Retina screen) - and the legend follows at most every 50 ms. At rest: one
+        full-quality frame."""
+        t = getattr(self, "_motion_timer", None)
+        if t is None:
+            t = self._motion_timer = QtCore.QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._motion_end)
+        t.start(self.MOTION_MS)
+        if not self._drafting:
+            self._drafting = True
+            self._set_draft(True)
+
+    def _motion_end(self):
+        if not self._drafting:
+            return
+        self._drafting = False
+        self._set_draft(False)
+        self._cross_key = None
+        self._refresh_crosshair()
+
+    def _line_items(self):
+        for items in self._ind_items.values():
+            for _pl, it in items:
+                yield it
+        for it, _name in self._strategy_items:
+            yield it
+
+    def _set_draft(self, on: bool):
+        for it in self._line_items():
+            if not isinstance(it, pg.PlotDataItem):
+                continue
+            try:
+                if on:
+                    pen = it.opts.get("pen")
+                    if pen is None:
+                        continue
+                    pen = pen if isinstance(pen, QtGui.QPen) else pg.mkPen(pen)
+                    if pen.style() == QtCore.Qt.PenStyle.NoPen or (pen.isCosmetic() and pen.widthF() <= 1.0):
+                        continue                                 # (already the quick kind)
+                    it._hq = (pen, it.opts.get("antialias"))
+                    q = QtGui.QPen(pen)
+                    if pen.widthF() <= 1.6:
+                        q.setWidthF(1.0)                         # one pixel: Qt's quick anti-aliased path
+                    else:
+                        it.opts["antialias"] = False             # a thick line keeps its width, drawn plainly
+                        it.curve.opts["segmentedLineMode"] = "off"
+                    it.setPen(q)
+                else:
+                    hq = getattr(it, "_hq", None)
+                    if hq is None:
+                        continue
+                    it._hq = None
+                    it.opts["antialias"] = hq[1]
+                    it.curve.opts["segmentedLineMode"] = "auto"
+                    it.setPen(hq[0])
+            except RuntimeError:                                 # (an item being removed)
+                continue
+
     def _refresh_crosshair(self, *_):
         """The chart moved under a still mouse (wheel / trackpad zoom, arrow keys, replay, a resize): keep the
         crosshair, its price / date labels and the legend on what is under the cursor now (TradingView does)."""
         vp = getattr(self, "_cross_vp", None)
         if vp is None or self.df is None or self._panning():
             return
+        if self._drafting:                                       # moving: the legend follows every 50 ms
+            now = time.monotonic()
+            if now - getattr(self, "_xh_at", 0.0) < 0.05:
+                return
+            self._xh_at = now
         (x0, x1), (y0, y1) = self.price.vb.viewRange()
         key = (vp.x(), vp.y(), x0, x1, y0, y1, self.glw.width(), self.glw.height())
         if key == getattr(self, "_cross_key", None):

@@ -27,6 +27,9 @@ DEFAULTS = {
     "bg": "#000000", "grid_v": True, "grid_h": True, "grid_color": "#303030",
     "crosshair": "#9c9c9c", "crosshair_style": "dashed", "watermark": "Hidden", "wm_color": "#787b86",
     "text_color": "#b8b8b8", "text_size": 12, "margin_top": 10, "margin_bottom": 8,
+    # Navigation: how the wheel, a trackpad and a drag move the chart
+    "wheel": "zoom", "zoom_anchor": "latest", "zoom_speed": "normal", "zoom_invert": False,
+    "trackpad_v": "zoom", "momentum": True, "pinch": True, "smooth": True, "kinetic": True,
 }
 
 _cur: dict = copy.deepcopy(DEFAULTS)
@@ -149,6 +152,7 @@ class SettingsDialog(QtWidgets.QDialog):
         from . import icons
         for name, ico, builder in (("Symbol", "candles_icon", self._symbol), ("Status line", "menu", self._status),
                                    ("Scales and lines", "measure", self._scales), ("Canvas", "rect", self._canvas),
+                                   ("Navigation", "cursor", self._navigation),
                                    ("Updates", "update_icon", self._updates), ("Data", "cloud", self._data)):
             self.tabs.addItem(QtWidgets.QListWidgetItem(icons.get(ico, "#dbdbdb"), "  " + name))
             page = QtWidgets.QWidget()
@@ -314,7 +318,38 @@ class SettingsDialog(QtWidgets.QDialog):
             u.setStyleSheet("color:#9598a1;")
             self._row(lay, lab, [self._spin(key, lo, hi), u])
 
-    UPDATES_TAB = 4
+    NAV_TAB = 4
+
+    def _navigation(self, lay):
+        """How the chart moves: the mouse wheel, a Mac trackpad, a drag (TradingView's defaults, each one changeable)."""
+        self._head(lay, "Mouse wheel")
+        self._row(lay, "Wheel", [self._combo("wheel", [("Zooms the chart", "zoom"), ("Scrolls through time", "pan")])])
+        self._row(lay, "Zoom keeps in place", [self._combo("zoom_anchor", [("The latest bar", "latest"),
+                                                                            ("The bar under the mouse", "cursor")])])
+        self._row(lay, "Zoom speed", [self._combo("zoom_speed", [("Slow", "slow"), ("Normal", "normal"),
+                                                                 ("Fast", "fast")])])
+        self._check(lay, "zoom_invert", "Reverse the zoom direction")
+        hint = QtWidgets.QLabel(f"{theme.sc('Ctrl')}+wheel zooms around the other point; Shift+wheel scrolls through "
+                                "time.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#9598a1;")
+        lay.addWidget(hint)
+        self._head(lay, "Trackpad")
+        self._row(lay, "Two fingers up / down", [self._combo("trackpad_v", [("Zoom", "zoom"),
+                                                                            ("Move the chart up / down", "move"),
+                                                                            ("Nothing", "off")])])
+        self._check(lay, "pinch", "Pinch to zoom")
+        self._check(lay, "momentum", "Keep gliding after a sideways swipe")
+        hint2 = QtWidgets.QLabel("Two fingers sideways always scroll through time, exactly with the fingers. One "
+                                 "direction per swipe: a sideways swipe never zooms by accident.")
+        hint2.setWordWrap(True)
+        hint2.setStyleSheet("color:#9598a1;")
+        lay.addWidget(hint2)
+        self._head(lay, "Motion")
+        self._check(lay, "smooth", "Smooth zoom and jumps")
+        self._check(lay, "kinetic", "Keep gliding after a quick drag")
+
+    UPDATES_TAB = 5
 
     def _updates(self, lay):
         """The app's version and its updates, in Settings (TradingView Desktop keeps them with the app's settings)."""
@@ -360,7 +395,7 @@ class SettingsDialog(QtWidgets.QDialog):
         else:
             self.upd_check.setEnabled(False)
 
-    DATA_TAB = 5
+    DATA_TAB = 6
 
     def _data(self, lay):
         """What ChartLab does by itself: fresh broker logins, and the data store - where it lives (a cloud drive

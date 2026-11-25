@@ -45,7 +45,7 @@ class Fyers(Broker):
     fields = [("app_id", "App ID", "text", True, "Like XB12345-100, from myapi.fyers.in/dashboard"),
               ("api_secret", "Secret key", "secret", True, ""),
               ("redirect_uri", "Redirect URL", "url", True, "Must match the app; ChartLab listens on it"),
-              ("pin", "PIN", "pin", False, "Optional, kept only on this Mac: renews the login without the browser"),
+              ("pin", "PIN", "pin", False, "Optional, kept only on this computer: renews the login without the browser"),
               ("access_token", "Access token", "secret", False, "Filled in by 'Log in with Fyers'")]
     products = ("INTRADAY", "DELIVERY", "MARGIN", "MTF")
     exchanges = ("NSE", "BSE", "NFO", "BFO", "MCX")

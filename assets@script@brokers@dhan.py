@@ -43,7 +43,7 @@ class Dhan(Broker):
               ("access_token", "Access token", "secret", False, "From web.dhan.co -> DhanHQ Trading APIs, or Log in"),
               ("app_id", "API key", "text", False, "Optional: for 'Log in with Dhan' in the browser"),
               ("app_secret", "API secret", "secret", False, "Optional, with the API key"),
-              ("pin", "PIN", "pin", False, "Optional, kept only on this Mac: log in with PIN + TOTP"),
+              ("pin", "PIN", "pin", False, "Optional, kept only on this computer: log in with PIN + TOTP"),
               ("totp_secret", "TOTP key", "totp", False, "Optional: the key behind your authenticator")]
     products = ("INTRADAY", "DELIVERY", "MARGIN", "MTF")
     exchanges = ("NSE", "BSE", "NFO", "BFO", "MCX")

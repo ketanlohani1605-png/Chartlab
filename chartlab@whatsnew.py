@@ -8,6 +8,20 @@ from . import icons, theme
 
 # version -> [(icon, title, one line: what it is and where to find it)]
 NOTES = {
+    "0.37.1": [
+        ("zoom", "Smoother chart",
+         "Dragging, zooming and the crosshair are about twice as quick with indicators on: each move is drawn once, "
+         "lines are drawn the quick way while the chart moves and in full as soon as it rests."),
+        ("cursor", "Trackpad and wheel, your way",
+         "A sideways swipe only scrolls, an up / down swipe only zooms, and the zoom stops when the fingers lift. "
+         "Settings → Navigation: what the wheel does, the zoom point, speed and direction, pinch, gliding."),
+        ("lock", "Broker accounts, redone",
+         "Pick the broker with one click, follow its three steps, and Save / Test connection stay in sight under the "
+         "form. Each broker has its own colour in the list."),
+        ("layout_icon", "Smaller things",
+         "Dhan asks only for the Client ID and token (browser login is under More ways to log in); a practice "
+         "account shows only what it uses."),
+    ],
     "0.37.0": [
         ("market", "Market panel",
          "NIFTY 50 gainers, losers, a heatmap of all fifty and every sector (IT, Bank, Auto, Pharma, Metal ...), "
@@ -41,8 +55,24 @@ NOTES = {
 }
 
 
+def _key(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return ()
+
+
 def notes_for(version: str) -> list:
-    return list(NOTES.get(str(version), []))
+    """This version's notes, then the earlier ones of the same series (0.37.1 also tells what 0.37.0 brought: an
+    update often skips a small release)."""
+    k = _key(version)
+    if str(version) not in NOTES or len(k) < 2:
+        return list(NOTES.get(str(version), []))
+    out = []
+    for v in sorted(NOTES, key=_key, reverse=True):
+        if _key(v)[:2] == k[:2] and _key(v) <= k:
+            out += NOTES[v]
+    return out
 
 
 class WhatsNew(QtWidgets.QDialog):
